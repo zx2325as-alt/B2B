@@ -87,3 +87,17 @@ database:
 user:
   default_profile_id: "guest" # 匿名用户登录时的默认身份 ID
 
+character_formatter:
+  template: |
+    姓名：{name}
+    年龄：{age} | 职业：{occupation} | 身份：{role}
+    性格：{personality}
+    背景：{background}
+    弱点：{weakness}
+  
+  defaults:
+    unknown: "未知"
+
+  # Core Structured Fields for Profile Template
+  core_template_fields: ["沟通模式", "决策风格", "核心诉求", "情绪基线", "可信度"]
+

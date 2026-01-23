@@ -53,12 +53,20 @@ if "feedback_map" not in st.session_state:
 # ==========================================
 def create_or_update_session():
     """
-    同步前端会话状态到后端。
+    同步前端会话状态到后端 (Sync Session State).
     
-    功能:
-    1. 如果已有 session_id，调用 PUT 更新当前绑定的角色和场景。
-    2. 如果没有 session_id，调用 POST 创建新会话。
-    3. 处理会话过期(404)情况，自动重建会话。
+    核心逻辑:
+    1. **数据准备**: 收集当前的用户ID、选定的角色ID、选定的场景ID。
+    2. **状态检查**: 检查 `st.session_state` 中是否已存在 `session_id`。
+    3. **更新 (PUT)**: 若存在 session_id，则调用 PUT 接口更新后端的会话上下文（例如切换了角色或场景）。
+       - 如果后端返回 404 (会话过期)，则自动重置并尝试新建。
+    4. **创建 (POST)**: 若不存在 session_id，则调用 POST 接口新建会话。
+    5. **错误处理**: 捕获网络异常并提示用户。
+    
+    Trigger:
+    - 页面加载时 (如果 session_id 为空)
+    - 用户在侧边栏切换场景 (Scenario) 时
+    - 用户在侧边栏切换发言角色 (Character) 时
     """
     try:
         payload = {
@@ -67,20 +75,21 @@ def create_or_update_session():
             "scenario_id": st.session_state.current_scenario_id
         }
         
-        # If we already have a session_id, we UPDATE it (PUT)
+        # Branch 1: 已有 Session ID -> 尝试更新 (UPDATE)
         if st.session_state.session_id:
             res = requests.put(f"{API_URL}/sessions/{st.session_state.session_id}", params=payload)
             if res.status_code == 200:
                 pass # st.toast(f"会话上下文已更新") - Hidden as requested
             else:
+                # 特殊处理: 会话过期 (404 Not Found)
                 if res.status_code == 404:
                      # st.warning("会话过期，创建新会话...") - Hidden as requested
                      st.session_state.session_id = None # Reset to force create
-                     create_or_update_session() # Recursive call
+                     create_or_update_session() # Recursive call to Create
                 else:
                     st.error(f"会话更新失败: {res.text}")
         
-        # If no session_id, we CREATE one (POST)
+        # Branch 2: 无 Session ID -> 创建新会话 (CREATE)
         else:
             res = requests.post(f"{API_URL}/sessions", params=payload)
             if res.status_code == 200:
@@ -109,7 +118,7 @@ with st.sidebar:
     # 2. Context Management
     st.subheader("📍 上下文管理")
     
-    # Fetch Scenarios
+    # --- 场景选择 (Scenario Selection) ---
     try:
         scenarios_res = requests.get(f"{API_URL}/scenarios/")
         scenarios = scenarios_res.json() if scenarios_res.status_code == 200 else []
@@ -122,21 +131,24 @@ with st.sidebar:
             key="scenario_selector"
         )
         
+        # 监听场景切换 (Handle Change)
         if selected_scenario_name:
             new_scen_id = scenario_map[selected_scenario_name]
+            # 仅当值确实改变时才更新，避免不必要的请求
             if new_scen_id != st.session_state.current_scenario_id:
                 st.session_state.current_scenario_id = new_scen_id
-                create_or_update_session()
+                create_or_update_session() # 同步到后端
                 
     except Exception as e:
         st.error(f"场景加载失败: {e}")
 
-    # Fetch Characters
+    # --- 角色/发言人选择 (Character Selection) ---
     try:
         chars_res = requests.get(f"{API_URL}/characters/")
         chars = chars_res.json() if chars_res.status_code == 200 else []
         char_map = {c["name"]: c["id"] for c in chars}
         
+        # 构造选项列表: 包含 "我 (User)" 和所有 API 返回的角色
         # Add "Me / User" option
         char_options = ["我 (User)"] + list(char_map.keys())
         
@@ -147,6 +159,7 @@ with st.sidebar:
             key="char_selector"
         )
         
+        # 监听角色切换 (Handle Change)
         if selected_option:
             if selected_option == "我 (User)":
                 st.session_state.current_character_id = None
@@ -158,7 +171,7 @@ with st.sidebar:
                 
             # Update session context (if needed, though session usually binds to a target character context, 
             # here we might want to keep the session alive but change the 'active speaker' context)
-            create_or_update_session()
+            create_or_update_session() # 同步到后端
             
             # Hide the toast notification as requested
             # st.toast(f"已切换到 {current_speaker_name}")
@@ -170,10 +183,10 @@ with st.sidebar:
     st.divider()
 
     # 3. Current Context Display (Fixed)
-    st.subheader("📊 当前上下文")
-    st.caption(f"Session ID: {st.session_state.session_id}")
+    # st.subheader("📊 当前上下文")
+    # st.caption(f"Session ID: {st.session_state.session_id}")
     
-    # Relationship Graph
+    # --- 实时关系图谱 (Real-time Relationship Graph) ---
     if st.session_state.current_character_id:
         try:
             # Fetch relationships for current character
@@ -182,20 +195,22 @@ with st.sidebar:
                 rels = rel_res.json()
                 if rels:
                     st.markdown("**🔗 关系图谱**")
-                    graph = graphviz.Digraph()
-                    graph.attr(rankdir='LR', size='8,5')
-                    graph.attr('node', shape='box', style='filled', color='lightblue')
                     
-                    # Root node
+                    # 使用 Graphviz 渲染有向图
+                    graph = graphviz.Digraph()
+                    graph.attr(rankdir='LR', size='8,5') # 左到右布局
+                    graph.attr('node', shape='box', style='filled', color='lightblue') # 默认节点样式
+                    
+                    # Root node (Current Speaker)
                     root_name = current_speaker_name if st.session_state.current_character_id else "我"
-                    graph.node(root_name, shape='ellipse', color='gold')
+                    graph.node(root_name, shape='ellipse', color='gold') # 当前角色高亮
                     
                     for r in rels:
                         # Determine target name (simplified, ideally need to fetch name if only ID)
                         # The API usually returns basic relationship info. 
                         # Assuming we have target_id, let's try to map it if possible or just show type
                         target_id = r['target_id'] if r['source_id'] == st.session_state.current_character_id else r['source_id']
-                        # Find name in local map
+                        # Find name in local map (从本地缓存的 char_map 中查找名字)
                         target_name = next((name for name, cid in char_map.items() if cid == target_id), f"ID:{target_id}")
                         
                         details_text = str(r.get('details') or "")
@@ -253,7 +268,7 @@ with st.sidebar:
 # ==========================================
 # 主对话区域 (Main Chat Area)
 # ==========================================
-# 显示聊天记录
+# --- 1. 显示历史聊天记录 (Render Chat History) ---
 for message in st.session_state.messages:
     if message["role"] == "user":
         speaker = message.get("speaker", "User")
@@ -265,18 +280,93 @@ for message in st.session_state.messages:
         with st.chat_message("assistant", avatar="🕵️‍♂️"):
             st.markdown(message["content"])
             
-            # Display Structured Analysis (History)
+            # --- 1.1 显示结构化分析结果 (Render Structured Analysis) ---
+            # 只有当 'details' 字段存在且包含 'reasoning' 时才显示
             if "details" in message and message["details"].get("reasoning"):
                 reasoning = message["details"]["reasoning"]
                 if isinstance(reasoning, dict):
-                    # 1. Primary Analysis
+                    # A. 核心意图分析 (Primary Analysis)
                     pa = reasoning.get("primary_analysis")
                     if pa:
                         st.markdown("---")
                         # st.caption(f"🎯 深度解码 ({pa.get('speaker', '未知')})")
                         st.info(f"**🕵️ 意图**：{pa.get('intent_analysis')}\n\n**🔍 潜台词**：{pa.get('subtext')}\n\n**🧠 心理**：{pa.get('psychological_profile')}")
+
+                        # --- B. 反馈交互 UI (Feedback UI) ---
+                        log_id = message.get("details", {}).get("log_id")
+                        char_id = message.get("details", {}).get("character_id")
+                        
+                        if log_id and char_id:
+                            fb_key = f"char_fb_{log_id}"
+                            if fb_key not in st.session_state:
+                                st.session_state[fb_key] = "pending"
+                                
+                            current_fb_state = st.session_state[fb_key]
+                            
+                            # 状态 1: 待反馈 (Pending)
+                            if current_fb_state == "pending":
+                                st.caption("角色画像准确吗？")
+                                c1, c2 = st.columns([1, 4])
+                                with c1:
+                                    if st.button("✅", key=f"yes_{log_id}", help="准确"):
+                                        try:
+                                            requests.post(f"{API_URL}/characters/{char_id}/feedback", json={
+                                                "session_id": st.session_state.session_id,
+                                                "is_accurate": True
+                                            })
+                                            st.session_state[fb_key] = "done_yes"
+                                            st.rerun()
+                                        except:
+                                            st.error("失败")
+                                with c2:
+                                    if st.button("❌", key=f"no_{log_id}", help="不准确"):
+                                        st.session_state[fb_key] = "providing_reason"
+                                        st.rerun()
+                                        
+                            # 状态 2: 填写不准确原因 (Providing Reason)
+                            elif current_fb_state == "providing_reason":
+                                with st.container(border=True):
+                                    st.markdown("**❌ 请指出不准确之处**")
+                                    reason = st.selectbox("原因分类", ["情绪判断错误", "意图分析偏差", "遗漏关键特征", "性格不符", "其他"], key=f"reason_{log_id}")
+                                    comment = st.text_input("补充说明", key=f"comment_{log_id}")
+                                    
+                                    col_sub, col_can = st.columns([1, 1])
+                                    if col_sub.button("提交", key=f"submit_{log_id}"):
+                                        try:
+                                            # Capture context
+                                            # idx isn't directly available here in for-loop easily unless enumerated, 
+                                            # but we can rely on log_id or just skip context for now if complex.
+                                            # Simplified: just send basic info
+                                            context_snapshot = {
+                                                "analysis_basis": reasoning,
+                                                "bot_response": message["content"]
+                                            }
+                                            
+                                            requests.post(f"{API_URL}/characters/{char_id}/feedback", json={
+                                                "session_id": st.session_state.session_id,
+                                                "log_id": log_id,
+                                                "is_accurate": False,
+                                                "reason_category": reason,
+                                                "comment": comment,
+                                                "context_data": context_snapshot
+                                            })
+                                            st.session_state[fb_key] = "done_no"
+                                            st.success("已记录")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"失败: {e}")
+                                    
+                                    if col_can.button("取消", key=f"cancel_{log_id}"):
+                                        st.session_state[fb_key] = "pending"
+                                        st.rerun()
+                                        
+                            # 状态 3: 已反馈 (Done)
+                            elif current_fb_state == "done_yes":
+                                st.caption("✅ 已反馈(准确)")
+                            elif current_fb_state == "done_no":
+                                st.caption("✅ 已反馈(不准确)")
                     
-                    # 2. Audience Analysis
+                    # C. 全景反应推演 (Audience Analysis)
                     aa = reasoning.get("audience_analysis", [])
                     if aa:
                         st.markdown("#### 👥 全景反应推演")
@@ -289,7 +379,7 @@ for message in st.session_state.messages:
                                     st.caption(f"💭 {char_react.get('likely_thought')}")
                                     st.caption(f"⚡ {char_react.get('likely_reaction')}")
             
-            # 3. Feedback System
+            # --- 1.2 对话质量评分系统 (Quality Rating) ---
             log_id = message.get("details", {}).get("log_id")
             if log_id:
                 # Initialize feedback state for this log if new
@@ -345,13 +435,13 @@ if prompt := st.chat_input("请输入发言内容..."):
              
     speaker_name = current_speaker_name
     
-    # 1. 显示用户消息
+    # --- 2. 预处理用户输入 (Pre-process Input) ---
     st.session_state.messages.append({"role": "user", "content": prompt, "speaker": speaker_name})
     with st.chat_message("user", avatar="🧑‍💻" if speaker_name == "我" else "🗣️"):
         st.write(f"**{speaker_name}** 说：")
         st.markdown(prompt)
 
-    # 2. 调用 API
+    # --- 3. 调用 API 并处理流式响应 (Call API & Handle Streaming) ---
     try:
         # Construct text with speaker info for backend analysis
         # Format: "【Speaker Name】说：Content"
@@ -385,9 +475,9 @@ if prompt := st.chat_input("请输入发言内容..."):
             current_log_id = None
             
             # ==========================================
-            # 流式响应处理 (Streaming Response Handling)
+            # 流式响应处理循环 (Streaming Response Loop)
             # ==========================================
-            # We use stream=True for requests
+            # We use stream=True for requests to consume NDJSON (Newline Delimited JSON)
             with requests.post(f"{API_URL}/chat", json=payload, stream=True) as response:
                 if response.status_code == 200:
                     for line in response.iter_lines():
@@ -395,25 +485,25 @@ if prompt := st.chat_input("请输入发言内容..."):
                             try:
                                 chunk = json.loads(line.decode('utf-8'))
                                 
-                                # Chunk Type: Meta (Log ID)
+                                # Type A: 元数据 (Meta) - 获取 Log ID
                                 if chunk.get("type") == "meta":
                                     current_log_id = chunk.get("log_id")
                                 
-                                # Chunk 1: Analysis (Silent)
+                                # Type B: 思考过程流 (Streaming) - 暂不直接展示，可用于调试
                                 elif chunk.get("type") == "streaming":
                                     analysis_data = chunk
                                     # Do NOT show NLU/Scenario details as requested
                                         
-                                # Chunk 2: Final Response
+                                # Type C: 最终响应 (Final Response) - 包含回复文本和完整分析
                                 elif chunk.get("response"):
                                     full_response = chunk.get("response")
                                     reasoning = chunk.get("reasoning")
                                     
-                                    # Update Main Message with Thinking Process
+                                    # 3.1 更新主回复区域 (Update Main Text)
                                     if full_response:
                                          message_placeholder.markdown(full_response)
                                     
-                                    # Append Structured Analysis BELOW the main text
+                                    # 3.2 渲染结构化分析结果 (Render Structured Analysis)
                                     if reasoning and isinstance(reasoning, dict):
                                         # 1. Primary Analysis
                                         pa = reasoning.get("primary_analysis")
@@ -443,7 +533,7 @@ if prompt := st.chat_input("请输入发言内容..."):
                 else:
                     st.error(f"API请求失败: {response.text}")
 
-            # Update Session State History
+            # --- 4. 更新会话状态 (Update Session State) ---
             if full_response:
                 latency_label = "已思考 (完成)" 
                 
@@ -452,7 +542,8 @@ if prompt := st.chat_input("请输入发言内容..."):
                     "nlu": analysis_data.get("nlu_analysis"),
                     "scenario": analysis_data.get("scenario"),
                     "context": analysis_data.get("context_used"),
-                    "log_id": current_log_id
+                    "log_id": current_log_id,
+                    "character_id": st.session_state.current_character_id
                 }
                 
                 st.session_state.messages.append({

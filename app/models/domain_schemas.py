@@ -63,6 +63,8 @@ class RelationshipBase(BaseModel):
     target_id: int
     relation_type: str
     details: Dict[str, Any] = {}
+    strength: Optional[int] = 5
+    sentiment: Optional[int] = 0
 
 class RelationshipCreate(RelationshipBase):
     pass
@@ -70,6 +72,8 @@ class RelationshipCreate(RelationshipBase):
 class RelationshipUpdate(BaseModel):
     relation_type: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
+    strength: Optional[int] = None
+    sentiment: Optional[int] = None
 
 class RelationshipResponse(RelationshipBase):
     id: int

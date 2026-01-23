@@ -102,6 +102,51 @@ class Relationship(Base):
     source = relationship("Character", foreign_keys=[source_id], back_populates="relationships_as_source")
     target = relationship("Character", foreign_keys=[target_id], back_populates="relationships_as_target")
 
+    # New fields for Dynamic Relationships
+    strength = Column(Integer, default=5) # 1-10
+    sentiment = Column(Integer, default=0) # -5 to +5
+    last_updated = Column(DateTime(timezone=True), onupdate=func.now())
+
+class CharacterObservation(Base):
+    """
+    Stores pending observations extracted from dialogue analysis.
+    Needs user approval to be merged into Character.dynamic_profile.
+    """
+    __tablename__ = "character_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    character_id = Column(Integer, ForeignKey("characters.id"))
+    session_id = Column(String, index=True)
+    
+    content = Column(JSON) # The observation content (e.g., {"trait": "Impatient", "evidence": "..."})
+    confidence = Column(Float, default=0.0)
+    
+    status = Column(String, default="pending") # pending, approved, rejected, merged
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    character = relationship("Character")
+
+class CharacterFeedback(Base):
+    """
+    Stores specific feedback on character accuracy.
+    """
+    __tablename__ = "character_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+    character_id = Column(Integer, ForeignKey("characters.id"))
+    session_id = Column(String, index=True)
+    log_id = Column(Integer, nullable=True)
+    
+    is_accurate = Column(Integer) # 1=Yes, 0=No
+    reason_category = Column(String, nullable=True) # e.g., "Wrong Emotion", "Missed Intent"
+    comment = Column(Text, nullable=True)
+    context_data = Column(JSON, nullable=True) # Snapshot of context & analysis
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    character = relationship("Character")
+
 class CharacterVersion(Base):
     """To track history of character changes"""
     __tablename__ = "character_versions"
@@ -111,6 +156,7 @@ class CharacterVersion(Base):
     version = Column(Integer)
     attributes_snapshot = Column(JSON)
     traits_snapshot = Column(JSON)
+    dynamic_profile_snapshot = Column(JSON) # Snapshot of dynamic profile
     change_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

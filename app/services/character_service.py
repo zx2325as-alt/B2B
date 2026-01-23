@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 from app.models.sql_models import Character, CharacterVersion, Relationship
 from app.models.domain_schemas import CharacterCreate, CharacterUpdate, RelationshipCreate
 
@@ -109,7 +110,7 @@ class CharacterService:
             return True
         return False
         
-    def update_relationship(self, db: Session, relationship_id: int, details: dict, relation_type: str = None):
+    def update_relationship(self, db: Session, relationship_id: int, details: dict = None, relation_type: str = None, strength: int = None, sentiment: int = None):
         """更新关系详情或类型"""
         db_rel = db.query(Relationship).filter(Relationship.id == relationship_id).first()
         if not db_rel:
@@ -117,11 +118,61 @@ class CharacterService:
         
         if relation_type:
             db_rel.relation_type = relation_type
-        if details:
+        if details is not None:
             db_rel.details = details
+        if strength is not None:
+            db_rel.strength = strength
+        if sentiment is not None:
+            db_rel.sentiment = sentiment
             
         db.commit()
         db.refresh(db_rel)
         return db_rel
+
+    def update_relationship_state(self, db: Session, source_name: str, target_name: str, strength_delta: int, sentiment_delta: int):
+        """
+        Dynamically update relationship strength and sentiment based on names.
+        Creates relationship if it doesn't exist.
+        """
+        # 1. Find characters
+        source = db.query(Character).filter(Character.name == source_name).first()
+        target = db.query(Character).filter(Character.name == target_name).first()
+        
+        if not source or not target:
+            return None
+            
+        # 2. Find Relationship
+        # Check both directions or just one? Usually relationships are directed graph edges here?
+        # Model has source_id and target_id.
+        rel = db.query(Relationship).filter(
+            Relationship.source_id == source.id,
+            Relationship.target_id == target.id
+        ).first()
+        
+        if not rel:
+            # Create new if not exists
+            rel = Relationship(
+                source_id=source.id,
+                target_id=target.id,
+                relation_type="Unknown",
+                strength=5,
+                sentiment=0
+            )
+            db.add(rel)
+        
+        # 3. Update values
+        # Clamp values: Strength 1-10, Sentiment -5 to 5
+        if strength_delta:
+            new_strength = (rel.strength or 5) + strength_delta
+            rel.strength = max(1, min(10, new_strength))
+            
+        if sentiment_delta:
+            new_sentiment = (rel.sentiment or 0) + sentiment_delta
+            rel.sentiment = max(-5, min(5, new_sentiment))
+            
+        rel.last_updated = func.now()
+        db.commit()
+        db.refresh(rel)
+        return rel
 
 character_service = CharacterService()

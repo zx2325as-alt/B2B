@@ -58,7 +58,9 @@ def update_relationship(relationship_id: int, relation: RelationshipUpdate, db: 
         db, 
         relationship_id=relationship_id, 
         details=relation.details, 
-        relation_type=relation.relation_type
+        relation_type=relation.relation_type,
+        strength=relation.strength,
+        sentiment=relation.sentiment
     )
     if not db_rel:
         raise HTTPException(status_code=404, detail="Relationship not found")

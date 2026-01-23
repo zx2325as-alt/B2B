@@ -93,6 +93,8 @@ if "analysis_result" in st.session_state:
             mood = item.get("mood") or item.get("emotions", [])
             if isinstance(mood, list): mood = ", ".join(mood)
             
+            profile_update = item.get("profile_update", {})
+
             # Use index in expander key to avoid duplicate ID errors
             with st.expander(f"🎭 {char_name} 归档面板", expanded=False):
                 col1, col2 = st.columns(2)
@@ -102,41 +104,146 @@ if "analysis_result" in st.session_state:
                 with col2:
                     st.markdown(f"**😊 情绪**: {mood}")
                 
+                # Six Dimensions Display
+                if profile_update:
+                    st.divider()
+                    st.markdown("#### 🧬 深度画像归档 (Deep Profile Archiving)")
+                    st.caption("以下是从对话中提取的六维深度数据，点击归档将同步至人物档案。")
+                    
+                    # 6 Dimensions Tabs
+                    tab_names = [
+                        "1️⃣ 基础属性", "2️⃣ 表层行为", "3️⃣ 情绪特征", 
+                        "4️⃣ 认知决策", "5️⃣ 人格特质", "6️⃣ 核心本质"
+                    ]
+                    tabs = st.tabs(tab_names)
+                    
+                    # Helper to display dimension data
+                    def display_dim(tab, key, label):
+                        with tab:
+                            data_obj = profile_update.get(key, {})
+                            desc = data_obj.get("desc", f"{label}更新")
+                            content = data_obj.get("data", {})
+                            
+                            st.markdown(f"**{desc}**")
+                            if content:
+                                st.json(content)
+                            else:
+                                st.info("本轮对话未提取到相关新信息。")
+                            return content
+
+                    d1_data = display_dim(tabs[0], "basic_attributes", "基础属性")
+                    d2_data = display_dim(tabs[1], "surface_behavior", "表层行为")
+                    d3_data = display_dim(tabs[2], "emotional_traits", "情绪特征")
+                    d4_data = display_dim(tabs[3], "cognitive_decision", "认知决策")
+                    d5_data = display_dim(tabs[4], "personality_traits", "人格特质")
+                    d6_data = display_dim(tabs[5], "core_essence", "核心本质")
+
                 # Archiving Action
                 # Find the character ID if it exists in our DB
                 char_obj = char_options.get(char_name)
+                
+                st.markdown("---")
                 if char_obj:
                     btn_key = f"archive_btn_{char_obj['id']}_{i}"
                     if st.button(f"📥 归档到 {char_name}", key=btn_key):
                         # Logic to update character profile
-                        new_profile = char_obj.get("dynamic_profile", {}) or {}
+                        # 1. Prepare Base Data
+                        current_dyn = char_obj.get("dynamic_profile", {}) or {}
+                        current_attrs = char_obj.get("attributes", {}) or {}
+                        current_traits = char_obj.get("traits", {}) or {}
                         
-                        # Append to background
-                        current_bg = new_profile.get("background", "")
-                        
-                        # Richer archive content
-                        archive_content = f"""
-                        \n--- [深度分析归档 {text_input[:10]}...] ---
-                        【意图】{deep_intent}
-                        【策略】{strategies}
-                        【情绪】{mood}
-                        【小结】{overall_summary}
-                        """
-                        new_profile["background"] = (current_bg or "") + archive_content
-                        
-                        # Merge personality tags (simple append for now)
-                        # current_tags = new_profile.get("personality_tags", []) ...
+                        # 2. Merge Updates (Strategy: Update if exists in extraction)
+                        # D1: Basic -> Attributes
+                        if profile_update and d1_data:
+                            current_attrs.update(d1_data)
                             
-                        # Update Request
+                        # D2: Surface -> Dynamic
+                        if profile_update and d2_data:
+                            if d2_data.get("communication_style"): current_dyn["communication_style"] = d2_data["communication_style"]
+                            if d2_data.get("behavior_habits"): current_dyn["behavior_habits"] = d2_data["behavior_habits"]
+                            # Merge others
+                            for k, v in d2_data.items():
+                                if k not in ["communication_style", "behavior_habits"]:
+                                    current_dyn[k] = v
+
+                        # D3: Emotional -> Dynamic
+                        if profile_update and d3_data:
+                            if d3_data.get("emotional_baseline"): current_dyn["emotional_baseline"] = d3_data["emotional_baseline"]
+                            
+                        # D4: Cognitive -> Dynamic
+                        if profile_update and d4_data:
+                            if d4_data.get("decision_style"): current_dyn["decision_style"] = d4_data["decision_style"]
+                            if d4_data.get("thinking_mode"): current_dyn["thinking_mode"] = d4_data["thinking_mode"]
+
+                        # D5: Personality -> Traits
+                        if profile_update and d5_data:
+                            current_traits.update(d5_data)
+                            
+                        # D6: Core -> Dynamic
+                        if profile_update and d6_data:
+                            if d6_data.get("core_drivers"): 
+                                # Merge lists strictly to avoid duplicates
+                                exist_drivers = set(current_dyn.get("core_drivers", []))
+                                new_drivers = d6_data["core_drivers"]
+                                if isinstance(new_drivers, list):
+                                    exist_drivers.update(new_drivers)
+                                    current_dyn["core_drivers"] = list(exist_drivers)
+                            
+                            if d6_data.get("inferred_core_needs"):
+                                exist_needs = set(current_dyn.get("inferred_core_needs", []))
+                                new_needs = d6_data["inferred_core_needs"]
+                                if isinstance(new_needs, list):
+                                    exist_needs.update(new_needs)
+                                    current_dyn["inferred_core_needs"] = list(exist_needs)
+
+                        # 3. Add Timeline Events (Character Arc - Deeds)
+                        character_deeds = profile_update.get("character_deeds", [])
+                        
+                        # If no structured deeds, try legacy summary
+                        if not character_deeds:
+                            timeline_summary = profile_update.get("timeline_summary")
+                            if not timeline_summary:
+                                timeline_summary = overall_summary[:50] + "..." if overall_summary else "对话分析归档"
+                            character_deeds = [{"event": timeline_summary, "timestamp": datetime.now().strftime("%Y-%m-%d")}]
+
+                        # Sort deeds by timestamp desc (as requested)
+                        # Note: Server appends, so we add them in reverse order of occurrence? 
+                        # Actually user wants "Time Reverse Order" display, but storage is chronological usually.
+                        # We will store them as they come. The display logic handles sorting.
+                        
+                        count_events = 0
+                        for deed in character_deeds:
+                            evt_content = deed.get("event")
+                            evt_time = deed.get("timestamp") or datetime.now().strftime("%Y-%m-%d")
+                            
+                            event_payload = {
+                                "summary": f"[{evt_time}] {evt_content}",
+                                "intent": deep_intent,
+                                "strategy": strategies,
+                                "session_id": "manual_analysis"
+                            }
+                            try:
+                                requests.post(f"{API_URL}/characters/{char_obj['id']}/events", json=event_payload)
+                                count_events += 1
+                            except Exception as e:
+                                st.warning(f"时间线添加失败: {e}")
+                        
+                        if count_events > 0:
+                            st.toast(f"✅ 已添加 {count_events} 条人物事迹到弧光！")
+
+                        # 4. Construct Payload
                         update_payload = {
-                            "dynamic_profile": new_profile,
-                            "version_note": "来自深度对话分析(Thinking-Driven)的归档"
+                            "attributes": current_attrs,
+                            "traits": current_traits,
+                            "dynamic_profile": current_dyn,
+                            "version_note": "来自深度对话分析(六维画像归档)"
                         }
                         
                         try:
                             up_res = requests.put(f"{API_URL}/characters/{char_obj['id']}", json=update_payload)
                             if up_res.status_code == 200:
-                                st.toast(f"✅ 已成功更新 {char_name} 的档案！")
+                                st.toast(f"✅ 已成功更新 {char_name} 的六维档案！")
+                                st.success("归档成功！请前往后台看板查看最新画像。")
                             else:
                                 st.error(f"更新失败: {up_res.text}")
                         except Exception as e:

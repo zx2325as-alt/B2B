@@ -25,3 +25,11 @@ class GenerationOutput(BaseModel):
     content: str = Field(..., description="生成的回复内容")
     format_type: str = Field(..., description="回复的格式类型 (text/json/markdown)")
     references: List[str] = Field(default=[], description="参考的文档或知识来源")
+
+class CharacterFeedbackInput(BaseModel):
+    session_id: str = Field(..., description="相关的会话ID")
+    log_id: Optional[int] = Field(None, description="关联的对话日志ID")
+    is_accurate: bool = Field(..., description="角色画像是否准确")
+    reason_category: Optional[str] = Field(None, description="不准确的原因分类")
+    comment: Optional[str] = Field(None, description="具体反馈评论")
+    context_data: Optional[Dict[str, Any]] = Field(None, description="对话上下文与分析依据快照")
