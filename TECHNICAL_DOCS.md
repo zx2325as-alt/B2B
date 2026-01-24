@@ -112,7 +112,7 @@ curl -X POST "http://localhost:8000/api/v1/characters/1/summarize?session_id=uui
 curl -X POST "http://localhost:8000/api/v1/chat/105/rate?rating=4&feedback=分析很精准"
 ```
 
-## 5. 部署与运行 (Deployment)1111
+## 5. 部署与运行 (Deployment)22
 1. **环境依赖**: Python 3.10+, PyTorch (可选), FastAPI, Streamlit, SQLAlchemy.
 2. **启动后端**: `uvicorn app.main:app --reload`
 3. **启动前端**: `streamlit run app/web/chat_ui.py`
