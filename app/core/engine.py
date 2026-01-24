@@ -5,30 +5,11 @@ from app.utils.logger import logger
 from app.core.config import settings
 
 class NLUEngine:
-    DEFAULT_SYSTEM_PROMPT = """
-    你是 BtB 系统的“意图路由中枢”。
-    
-    你的核心任务是判断用户的输入是：
-    1. **CHAT**: 想和你（顾问）讨论、咨询、闲聊。
-    2. **ANALYSIS**: 扔给你一段对话文本（通常包含引号、多个人物），要求你进行分析。
-    3. **SYSTEM_OP**: 要求修改配置、查询记忆、存入信息等。
-    
-    输出 JSON:
-    {
-        "intent": "chat | analysis | system_op",
-        "sub_intent": "string (optional)",
-        "emotion": "string",
-        "reasoning": "string",
-        "slots": { "key": "value" },
-        "implicit_hint": "string",
-        "need_clarification": boolean,
-        "clarification_question": "string (optional)"
-    }
-    """
-
     def __init__(self):
         nlu_config = settings.PROMPTS.get("nlu", {})
-        self.system_prompt = nlu_config.get("system_prompt", self.DEFAULT_SYSTEM_PROMPT)
+        # Default fallback if config fails
+        fallback = "你是意图识别助手。请输出 JSON 包含 intent (chat/analysis/system_op), emotion, reasoning。"
+        self.system_prompt = nlu_config.get("system_prompt", fallback)
         self.temperature = nlu_config.get("temperature", 0.2)
 
     async def analyze(self, input_data: DialogueInput) -> NLUOutput:

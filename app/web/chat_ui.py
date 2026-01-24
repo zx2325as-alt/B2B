@@ -175,6 +175,25 @@ with st.sidebar:
             
             # Hide the toast notification as requested
             # st.toast(f"已切换到 {current_speaker_name}")
+
+        # --- 参与者选择 (Participants Selection) ---
+        # Select multiple characters involved in the conversation context
+        # Default includes "我" and potentially the selected speaker if not "我"
+        participants_options = ["我"] + list(char_map.keys())
+        
+        # Determine default: "我" + current speaker (if not me)
+        default_participants = ["我"]
+        # If current speaker is a character, add them to default if not already present
+        # But 'selected_option' uses "Name" or "我 (User)"
+        # We want simple names for participants list usually, or IDs. 
+        # The API expects strings (names) based on my schemas.py change.
+        
+        selected_participants = st.multiselect(
+            "选择对话参与者 (Participants)",
+            options=participants_options,
+            default=default_participants,
+            key="participants_selector"
+        )
                 
     except Exception as e:
         st.error(f"角色加载失败: {e}")
@@ -454,7 +473,8 @@ if prompt := st.chat_input("请输入发言内容..."):
             "session_id": st.session_state.session_id, 
             "history": st.session_state.history,
             "scenario_id": st.session_state.current_scenario_id,
-            "character_id": st.session_state.current_character_id
+            "character_id": st.session_state.current_character_id,
+            "participants": selected_participants
         }
         
         with st.chat_message("assistant", avatar="🕵️‍♂️"):

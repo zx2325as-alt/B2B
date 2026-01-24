@@ -9,6 +9,7 @@ class DialogueInput(BaseModel):
     scenario_id: Optional[int] = Field(None, description="强制指定的场景ID")
     character_id: Optional[int] = Field(None, description="指定的对话角色ID")
     character_name: Optional[str] = Field(None, description="角色名称(用于上下文辅助)")
+    participants: List[str] = Field(default=["我"], description="对话参与者列表")
 
 class NLUOutput(BaseModel):
     intent: str = Field(..., description="用户的主要意图")

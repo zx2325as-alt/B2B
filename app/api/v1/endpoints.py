@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 from app.core.database import get_db
 from app.models.schemas import DialogueInput, NLUOutput, CharacterFeedbackInput
-from app.models.sql_models import DialogueLog, Relationship, Scenario, ConversationSession, CharacterFeedback, CharacterVersion
+from app.models.sql_models import DialogueLog, Relationship, Scenario, ConversationSession, CharacterFeedback, CharacterVersion, AnalysisLog
 from app.core.engine import nlu_engine
 from app.services.knowledge import knowledge_service
 from app.services.user_profile import user_service
@@ -205,11 +205,11 @@ async def chat(
     customized_system_role = ctx_data.get('customized_system_role')
     
     # Force Local Scenario Override (Development Feature - 仅用于开发调试)
-    local_scenario_path = r"e:\python\conda\PyTorch01\BtB\scenarios\hr_assistant.yaml"
-    local_scenario = load_local_scenario(local_scenario_path)
-    if local_scenario:
-         current_scenario = local_scenario
-         logger.info(f"Using local scenario override: {local_scenario.name}")
+    # local_scenario_path = r"e:\python\conda\PyTorch01\BtB\scenarios\hr_assistant.yaml"
+    # local_scenario = load_local_scenario(local_scenario_path)
+    # if local_scenario:
+    #      current_scenario = local_scenario
+    #      logger.info(f"Using local scenario override: {local_scenario.name}")
 
     # --- 3. Intent Routing (意图路由 - 可选) ---
     # 可以在此处理系统指令 (System Ops)，目前主要由 NLU 结果驱动
@@ -264,9 +264,18 @@ async def chat(
                     else:
                         # Fallback: 如果没有 thinking_process，尝试构建一个分析摘要
                         pa = parsed_resp.get("primary_analysis", {})
-                        speaker = pa.get("speaker", "未知")
-                        intent = pa.get("intent_analysis", "分析中...")
-                        final_response_text = f"**【{speaker}】意图分析**\n{intent}"
+                        if pa and isinstance(pa, dict) and pa.get("intent_analysis"):
+                            speaker = pa.get("speaker", "未知")
+                            intent = pa.get("intent_analysis", "分析中...")
+                            final_response_text = f"**【{speaker}】意图分析**\n{intent}"
+                        elif parsed_resp.get("response"):
+                            final_response_text = parsed_resp.get("response")
+                        elif parsed_resp.get("content"):
+                             final_response_text = parsed_resp.get("content")
+                        else:
+                             # If we really can't find a standard field, just try to show something useful
+                             # or if it is empty, keep it empty string (handled later?)
+                             final_response_text = str(parsed_resp) if parsed_resp else "（无有效回复内容）"
                     
                     # 2. 提取推理内容 (Extract Reasoning)
                     # 用于前端的 "Details" 展开栏或结构化展示
@@ -472,45 +481,15 @@ async def summarize_character(
         dialogue_text += f"Assistant: {log.bot_response}\n---\n"
         
     # 3. 构建 Prompt 并调用 LLM (Call LLM for Summary)
-    system_prompt = f"""
-你是一个角色档案管理员。请根据以下对话记录，提取并总结角色【{char_obj.name}】的最新特征。
-请将 Dynamic Profile 转化为高度结构化的 JSON 对象，使其成为系统的“角色知识图谱”节点。
-
-当前档案 (仅供参考):
-{json.dumps(char_obj.dynamic_profile, ensure_ascii=False)}
-
-【输出格式要求】
-请返回一个 JSON 对象，必须包含 "Dynamic Profile" 键，其值为包含以下字段的对象：
-1. "core_drivers": list[str] // 核心诉求，标签化
-2. "behavior_pattern": str // 核心行为模式
-3. "emotional_baseline": str // 情绪基线
-4. "communication_style": str // 沟通风格
-5. "recent_key_events": list[str] // 近期关键事件（建议格式：YYYY-MM-DD: 事件描述）
-6. "relationship_summary": dict[str, list[str]] // 关系摘要，格式：{{ "关系类型": ["角色名 (ID)"] }}
-7. "inferred_core_needs": list[str] // 推断出的深层需求
-
-【示例】
-{{
-  "Dynamic Profile": {{
-    "core_drivers": ["寻求安全认可", "渴望专业成长"],
-    "behavior_pattern": "情感渗透式融入",
-    "emotional_baseline": "高敏感、高共情、低防御",
-    "communication_style": "具象化、符号化",
-    "recent_key_events": [
-      "2026-01-23: 首日入职，误将客户要求的雏菊画为满天星...",
-      "2026-01-23: 通过分享糖果成功与同事建立连接..."
-    ],
-    "relationship_summary": {{
-      "密友": ["小语 (ID:2)"],
-      "职场导师": ["带我的姐姐 (待创建ID)"]
-    }},
-    "inferred_core_needs": [
-      "在保持自我的前提下获得环境接纳",
-      "将情感联结转化为专业上的认可"
-    ]
-  }}
-}}
-"""
+    # Load config from settings
+    config = settings.PROMPTS.get("character_summary", {})
+    prompt_template = config.get("prompt", "")
+    
+    # Use template from config
+    system_prompt = prompt_template.format(
+        character_name=char_obj.name,
+        current_profile=json.dumps(char_obj.dynamic_profile, ensure_ascii=False)
+    )
     
     messages = [
         {"role": "system", "content": system_prompt},
@@ -632,6 +611,7 @@ class AnalysisRequest(BaseModel):
     character_names: List[str] = Field(default=[], description="已知角色名称列表 (用于辅助识别)")
     mode: Optional[str] = Field("deep", description="分析模式: deep (深度分析) | quick (快速摘要)")
     session_id: Optional[str] = Field(None, description="会话ID，用于关联观察记录")
+    history_context: Optional[List[dict]] = Field(default=[], description="历史分析记录上下文")
 
 @router.post("/analysis/conversation", summary="分析长对话")
 async def analyze_conversation_endpoint(
@@ -648,6 +628,7 @@ async def analyze_conversation_endpoint(
         - `quick`: 快速摘要，仅提取核心话题和情绪概况。
         - `deep`: 深度分析，识别每个角色的关键点、潜在动机、心理状态，并生成可视化的关系图数据。
     4. **事件生成**: 在深度模式下，会自动提取并在数据库中生成“观察建议”(Observations)，供管理员审核。
+    5. **综合分析**: 结合历史记录进行连贯性分析。
     
     Args:
         request (AnalysisRequest): 请求体，包含文本、角色名列表和分析模式。
@@ -670,12 +651,79 @@ async def analyze_conversation_endpoint(
         else:
             # 深度模式：调用 LLM 进行全面剖析，并传入 DB Session 以便自动保存“观察建议”
             # Pass db session to allow auto-generation of character events/observations
-            result = await extraction_service.deep_analyze(request.text, request.character_names, db=db)
+            result = await extraction_service.deep_analyze(
+                request.text, 
+                request.character_names, 
+                db=db,
+                history_context=request.history_context
+            )
+            
+        # --- Persistence (Save to Database) ---
+        try:
+            structured_data = result.get("structured_data", {})
+            summary = structured_data.get("summary", "")
+            # If summary is missing in structured data, try to extract from markdown or use first few chars
+            if not summary and "markdown_report" in result:
+                 summary = result["markdown_report"][:200] + "..."
+            
+            new_log = AnalysisLog(
+                session_id=request.session_id,
+                text_content=request.text,
+                character_names=request.character_names,
+                summary=summary,
+                markdown_report=result.get("markdown_report", ""),
+                structured_data=structured_data
+            )
+            db.add(new_log)
+            db.commit()
+            db.refresh(new_log)
+            
+            # Append ID to result so frontend knows it is saved
+            result["log_id"] = new_log.id
+            
+        except Exception as e:
+            logger.error(f"Failed to save AnalysisLog: {e}")
+            # Do not fail the request if saving fails, just log it
             
         return result
     except Exception as e:
         logger.error(f"Analysis endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import Query
+from sqlalchemy import or_, cast, String
+
+@router.get("/analysis/history", summary="获取长对话历史分析记录")
+def get_analysis_history(
+    character_names: Optional[List[str]] = Query(None),
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """
+    获取历史分析记录 (Get Analysis History).
+    
+    Args:
+        character_names: 筛选包含特定角色的记录
+        limit: 返回条数 (若为 -1，则返回全部)
+    """
+    query = db.query(AnalysisLog).order_by(AnalysisLog.created_at.desc())
+    
+    if character_names:
+        # 使用数据库级筛选优化性能 (Database-level filtering)
+        # 针对 JSON 类型的兼容性处理: 将 JSON 字段转换为字符串进行模糊匹配
+        # 假设存储格式为 ["Name1", "Name2"]，匹配 "Name1"
+        conditions = []
+        for name in character_names:
+            # 注意: 简单的 LIKE 匹配可能会有误判 (e.g. "Ann" matches "Anna")
+            # 但在大多数情况下对于全名匹配是足够的，且比全表扫描+内存过滤高效得多
+            conditions.append(cast(AnalysisLog.character_names, String).like(f'%"{name}"%'))
+        
+        if conditions:
+            query = query.filter(or_(*conditions))
+            
+    if limit > 0:
+        return query.limit(limit).all()
+    return query.all()
 
 from app.services.character_observation_service import character_observation_service
 

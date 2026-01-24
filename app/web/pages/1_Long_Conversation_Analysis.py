@@ -1,9 +1,31 @@
 import streamlit as st
 import requests
 import json
+import os
+import datetime
 from app.core.config import settings
 
 API_URL = settings.API_URL
+
+def load_history_from_api(character_names=None):
+    """
+    Load analysis history from backend API.
+    """
+    try:
+        # User requested "Comprehensive analysis with reference to historical records"
+        # and "Containing character's all history, not just recent three".
+        # So we request ALL records (-1).
+        params = {"limit": -1} 
+        if character_names:
+            params["character_names"] = character_names
+            
+        res = requests.get(f"{API_URL}/analysis/history", params=params)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        # st.error(f"Failed to load history: {e}")
+        pass
+    return []
 
 st.set_page_config(page_title="长对话分析", page_icon="📜", layout="wide")
 
@@ -22,15 +44,27 @@ except Exception as e:
 
 # Multi-select for characters involved in the text
 char_options = {c["name"]: c for c in characters}
+all_options = ["我"] + list(char_options.keys())
 selected_char_names = st.sidebar.multiselect(
     "选择文本中包含的角色 (Select Characters)",
-    options=list(char_options.keys())
+    options=all_options,
+    default=["我"]
 )
 
 # Main Area: Text Input
 st.subheader("📝 输入长对话内容 (Input Conversation)")
 st.caption("支持粘贴大段对话记录、小说片段或工作日志。系统将自动区分角色并分析重点。")
-text_input = st.text_area("在此粘贴内容...", height=300)
+
+# File Uploader
+uploaded_file = st.file_uploader("或上传文件 (.txt, .md)", type=["txt", "md"])
+file_content = ""
+if uploaded_file is not None:
+    try:
+        file_content = uploaded_file.read().decode("utf-8")
+    except Exception as e:
+        st.error(f"文件读取失败: {e}")
+
+text_input = st.text_area("在此粘贴内容...", value=file_content, height=300)
 
 if st.button("开始分析 (Start Analysis)", type="primary"):
     if not text_input:
@@ -38,16 +72,31 @@ if st.button("开始分析 (Start Analysis)", type="primary"):
     else:
         with st.spinner("正在分析中 (Analyzing)..."):
             try:
+                # Load recent history for context
+                history_records = load_history_from_api(selected_char_names)
+                
+                # Take recent summaries for context
+                recent_history = [
+                    {"timestamp": r.get("created_at"), "summary": r.get("summary")} 
+                    for r in history_records
+                ]
+
                 payload = {
                     "text": text_input,
-                    "character_names": selected_char_names
+                    "character_names": selected_char_names,
+                    "history_context": recent_history
                 }
                 res = requests.post(f"{API_URL}/analysis/conversation", json=payload)
                 
                 if res.status_code == 200:
                     analysis_result = res.json()
                     st.session_state.analysis_result = analysis_result
-                    st.success("分析完成！")
+                    
+                    # Persistence is now handled by the backend (saved to DB)
+                    if "log_id" in analysis_result:
+                         st.success(f"分析完成并已保存记录 (ID: {analysis_result['log_id']})！")
+                    else:
+                         st.success("分析完成！")
                 else:
                     st.error(f"分析失败: {res.text}")
             except Exception as e:

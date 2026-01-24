@@ -214,6 +214,23 @@ deep_analysis:
       If new information is found, return it as a JSON object.
       If no new info, return empty JSON {{}}.
 
+  # [角色总结与同步]
+  character_summary:
+    temperature: 0.5
+    prompt: |
+      你是一个角色档案管理员。请根据以下对话记录，提取并总结角色【{character_name}】的最新特征。
+      请将 Dynamic Profile 转化为高度结构化的 JSON 对象，使其成为系统的“角色知识图谱”节点。
+
+      当前档案 (仅供参考):
+      {current_profile}
+
+      【输出格式要求】
+      请返回一个 JSON 对象，必须包含 "Dynamic Profile" 键，其值为包含以下字段的对象：
+      1. "core_drivers": list[str] // 核心诉求，标签化
+      2. "behavior_pattern": str // 核心行为模式
+      3. "emotional_baseline": str // 情绪基线
+      4. "communication_style": str // 沟通风格
+
 # ==========================================
 # 2. 对话服务 (Dialogue Service)
 # ==========================================
@@ -221,6 +238,9 @@ deep_analysis:
 dialogue:
   temperature: 0.7
   
+  # 默认系统角色设定 (当场景未指定时使用)
+  default_system_role: "你是一位战略顾问，协助用户分析局势。"
+
   # 动态角色注入前缀
   default_role_prefix: "你正在以 [战略顾问] 的身份，协助用户分析 [{scenario_name}] 中的局势。"
   
@@ -279,20 +299,21 @@ character_formatter:
     unknown: "未知"
 
 # ==========================================
-# 5. 场景库配置 (Scenario Library)
+# 5. UI 常量与配置 (UI Constants)
 # ==========================================
-# 简化场景，聚焦于一个通用分析场景
-scenarios:
-  - name: "通用深度分析"
-    domain: "Deep Analysis"
-    description: "通用场景，适用于分析任何对话文本。"
-    system_role: |
-      你是一位战略顾问。你的目标是帮助用户看透对话背后的本质。
-    prompt_template: |
-      【用户输入】
-      {current_input}
-      
-      【参考资料】
-      {context_docs}
-      
-      请进行深度分析。
+ui:
+  common_relations: [
+    "朋友", "敌人", "同事", "家人", "恋人", 
+    "陌生人", "主仆", "对手", "师徒", "盟友",
+    "邻居", "亲戚", "同学", "伴侣", "仇人",
+    "上下级", "债权人-债务人", "偶像-粉丝", "守护者-被守护者", "暧昧"
+  ]
+  
+# ==========================================
+# 6. 系统消息 (System Messages)
+# ==========================================
+system_messages:
+  errors:
+    llm_connection_failed:
+      analysis: "连接失败"
+      final_translation: "抱歉，我现在无法连接到智能大脑。(LLM Connection Error)"

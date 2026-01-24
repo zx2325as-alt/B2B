@@ -141,7 +141,7 @@ class ExtractionService:
             except Exception as e:
                 logger.error(f"Failed to process relationship updates: {e}")
 
-    async def deep_analyze(self, text: str, character_names: List[str], db: Session = None, session_id: str = None) -> Dict[str, Any]:
+    async def deep_analyze(self, text: str, character_names: List[str], db: Session = None, session_id: str = None, history_context: List[dict] = None) -> Dict[str, Any]:
         """
         深度对话分析 (Deep Analysis).
         
@@ -158,6 +158,7 @@ class ExtractionService:
             character_names (list): 已知角色名列表 (辅助 LLM 识别)
             db (Session, optional): 数据库会话 (用于持久化副作用)
             session_id (str, optional): 会话ID
+            history_context (list, optional): 历史分析摘要列表，用于综合分析
             
         Returns:
             dict: { "markdown_report": str, "structured_data": dict, ... }
@@ -169,10 +170,21 @@ class ExtractionService:
         prompt_template = config.get("prompt", "")
         temperature = config.get("temperature", 0.4)
         
+        # Inject History Context if available
+        history_text = ""
+        if history_context:
+            history_text = "\n\n【历史分析摘要 (History Context)】:\n"
+            for i, record in enumerate(history_context):
+                ts = record.get("timestamp", "Unknown Time")
+                summary = record.get("summary", "No summary")
+                history_text += f"Records[{i+1}] ({ts}): {summary}\n"
+            history_text += "\n请结合上述历史上下文，对本次对话进行更深入的连贯性分析。\n"
+
         prompt = prompt_template.format(
-            text=text,
+            text=history_text + text,
             character_names=", ".join(character_names)
         )
+
         
         # Call LLM - NO JSON ENFORCEMENT for mixed output (Markdown + JSON)
         # 我们允许 LLM 自由输出 Markdown 文本，并在其中嵌入 ```json 代码块

@@ -70,6 +70,26 @@ class DialogueLog(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class AnalysisLog(Base):
+    """
+    Log for Long Conversation Analysis (replacing local JSON file).
+    """
+    __tablename__ = "analysis_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True, nullable=True) # Optional link to a session
+    
+    # Content
+    text_content = Column(Text) # The raw input text
+    character_names = Column(JSON, default=[]) # List of involved characters
+    
+    # Results
+    summary = Column(Text, nullable=True) # Short summary
+    markdown_report = Column(Text, nullable=True) # Full Markdown report
+    structured_data = Column(JSON, default={}) # The JSON output from LLM
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 class Character(Base):
     __tablename__ = "characters"
 
@@ -198,24 +218,15 @@ class EvolutionCase(Base):
 
 class CharacterEvent(Base):
     """
-    Represents a significant event in the character's timeline.
-    Derived from analysis sessions.
+    Auto-generated events from analysis for timeline.
     """
     __tablename__ = "character_events"
-
+    
     id = Column(Integer, primary_key=True, index=True)
     character_id = Column(Integer, ForeignKey("characters.id"))
     
-    event_date = Column(DateTime(timezone=True), server_default=func.now()) # Or extracted date
-    summary = Column(Text) # Short description of the event
-    intent = Column(String, nullable=True) # Character's intent at this moment
-    strategy = Column(String, nullable=True) # Strategy used
+    event_time = Column(String) # YYYY-MM-DD
+    description = Column(Text)
+    source_log_id = Column(Integer, nullable=True)
     
-    source_session_id = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    character = relationship("Character", back_populates="events")
-
-# Add relationship to Character
-Character.events = relationship("CharacterEvent", back_populates="character", order_by="desc(CharacterEvent.event_date)")
-

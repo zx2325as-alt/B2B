@@ -484,39 +484,42 @@ with tab2:
         
         # 模板下载 (Download Template)
         template_json = {
-            "name": "New Character",
-            "description": "Character Description",
-            "attributes": {
-                "age": 25, 
-                "role": "user", 
-                "occupation": "engineer",
-                "identity_tags": ["tag1"],
-                "growth_experiences": ["exp1"],
-                "objective_boundaries": ["bound1"]
-            },
-            "traits": {
-                "personality": "friendly", 
-                "tone": "formal",
-                "core_personality": "optimistic",
-                "trait_tendency": "openness",
-                "three_views": "pragmatic",
-                "consistency": "high"
-            },
-            "dynamic_profile": {
-                "core_drivers": ["driver1"],
-                "inferred_core_needs": ["need1"],
-                "behavior_habits": "habit1", 
-                "emotional_baseline": "stable",
-                "communication_style": "direct",
-                "recent_key_events": ["event1"],
-                "motivation_source": "internal",
-                "behavior_bottom_line": "integrity"
-            }
+            "characters": [
+                {
+                    "name": "Alice (示例角色)",
+                    "description": "Character Description",
+                    "attributes": {
+                        "age": 25, 
+                        "role": "user", 
+                        "occupation": "engineer"
+                    },
+                    "traits": {
+                        "personality": "friendly"
+                    },
+                    "dynamic_profile": {
+                        "core_drivers": ["driver1"]
+                    }
+                },
+                {
+                    "name": "Bob (示例角色)",
+                    "attributes": {"age": 30}
+                }
+            ],
+            "relationships": [
+                {
+                    "source": "Alice (示例角色)",
+                    "target": "Bob (示例角色)",
+                    "relation": "Friend",
+                    "strength": 7,
+                    "sentiment": 2,
+                    "details": {"context": "同事"}
+                }
+            ]
         }
         c_act4.download_button(
             label="📥 模版",
             data=json.dumps(template_json, indent=4, ensure_ascii=False),
-            file_name="character_template.json",
+            file_name="import_template.json",
             mime="application/json",
             use_container_width=True
         )
@@ -525,32 +528,35 @@ with tab2:
         # 2.4 导入功能 (Import Functionality)
         # ==========================================
         with st.expander("📤 导入角色 (Import JSON)"):
+            st.info("支持导入单个角色对象、角色列表，或包含 characters/relationships 的完整包。")
             uploaded_file = st.file_uploader("选择 JSON 文件", type=["json"])
             if uploaded_file is not None:
                 try:
                     data = json.load(uploaded_file)
-                    # --- 批量导入 (Batch Import) ---
-                    if isinstance(data, list):
-                        if st.button("确认导入列表"):
-                            count = 0
-                            for item in data:
-                                try:
-                                    requests.post(f"{API_URL}/characters/", json=item)
-                                    count += 1
-                                except: pass
-                            st.success(f"导入完成: {count} 个")
-                            st.rerun()
-                    # --- 单体导入 (Single Import) ---
-                    elif isinstance(data, dict):
-                        if st.button("确认导入单个"):
-                            res = requests.post(f"{API_URL}/characters/", json=data)
+                    
+                    # Preview
+                    if isinstance(data, dict) and "characters" in data:
+                        st.write(f"预览: {len(data.get('characters', []))} 个角色, {len(data.get('relationships', []))} 条关系")
+                    elif isinstance(data, list):
+                        st.write(f"预览: {len(data)} 个角色")
+                    
+                    if st.button("🚀 确认导入"):
+                        try:
+                            res = requests.post(f"{API_URL}/characters/import", json=data)
                             if res.status_code == 200:
-                                st.success("导入成功")
-                                st.rerun()
+                                result = res.json()
+                                st.success(f"导入完成! 角色: {result.get('characters')}, 关系: {result.get('relationships')}")
+                                if result.get("errors"):
+                                    with st.expander("查看错误详情"):
+                                        st.json(result["errors"])
+                                # st.rerun() # 让用户看到结果后再刷新
                             else:
-                                st.error(f"失败: {res.text}")
+                                st.error(f"导入失败: {res.text}")
+                        except Exception as e:
+                            st.error(f"请求异常: {e}")
+                            
                 except Exception as e:
-                    st.error(f"解析错误: {e}")
+                    st.error(f"JSON 解析错误: {e}")
 
         
         # ==========================================
@@ -921,7 +927,17 @@ with tab3:
         
     char_map = {c["id"]: c["name"] for c in chars}
     char_options = {c["name"]: c["id"] for c in chars}
-    COMMON_RELATIONS = ["Friend", "Enemy", "Colleague", "Family", "Lover", "Stranger", "Master-Servant", "Rival"]
+    
+    # Load from config
+    from app.core.config import settings
+    COMMON_RELATIONS = settings.PROMPTS.get("ui", {}).get("common_relations", [])
+    if not COMMON_RELATIONS:
+        COMMON_RELATIONS = [
+            "朋友", "敌人", "同事", "家人", "恋人", 
+            "陌生人", "主仆", "对手", "师徒", "盟友",
+            "邻居", "亲戚", "同学", "伴侣", "仇人",
+            "上下级", "债权人-债务人", "偶像-粉丝", "守护者-被守护者", "暧昧"
+        ]
 
     # --- 2. 页面布局 (Layout) ---
     # 左: 影响力地图 (Map) | 中: 编辑表单 (Edit) | 右: 关系列表 (List)
@@ -1131,7 +1147,8 @@ with tab3:
                 target_name = st.selectbox("目标角色 (Target)", options=list(char_options.keys()), index=t_index, key="rel_target")
                 
             # 关系类型 (Relationship Type)
-            current_type = rel_data.get("relation_type", "Friend") if is_edit else "Friend"
+            default_rel = COMMON_RELATIONS[0] if COMMON_RELATIONS else "Friend"
+            current_type = rel_data.get("relation_type", default_rel) if is_edit else default_rel
             type_index = COMMON_RELATIONS.index(current_type) if current_type in COMMON_RELATIONS else 0
             
             rel_type = st.selectbox("关系类型", options=COMMON_RELATIONS + ["Other"], index=type_index)
@@ -1202,7 +1219,7 @@ with tab3:
                     t_name = char_map.get(rel["target_id"], f"ID:{rel['target_id']}")
                     
                     c1.markdown(f"**{s_name}** ↔️ **{t_name}**")
-                    c1.caption(f"{rel['relation_type']} | Strength: {rel['strength']}")
+                    c1.caption(f"{rel['relation_type']} | 强度: {rel.get('strength', 5)} | 情感: {rel.get('sentiment', 0)}")
                     
                     if c2.button("✏️", key=f"edit_rel_{rel['id']}"):
                         st.session_state.edit_rel_data = rel

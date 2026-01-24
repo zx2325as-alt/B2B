@@ -117,7 +117,8 @@ class DialogueService:
             else:
                  # 统一使用配置中的角色设定，不再拼接 role_prefix/suffix
                  # 如果 scenario 有 system_role，优先使用，否则使用默认的顾问角色
-                 system_role = scenario.system_role if (scenario and scenario.system_role) else "你是一位战略顾问，协助用户分析局势。"
+                 default_role = config.get("default_system_role", "你是一位战略顾问，协助用户分析局势。")
+                 system_role = scenario.system_role if (scenario and scenario.system_role) else default_role
             
             # 组装完整 Prompt
             # 如果配置中有 fallback_prompt，则使用它；否则使用简单的默认格式
@@ -148,9 +149,10 @@ class DialogueService:
         )
         
         if not response:
+            error_msgs = settings.PROMPTS.get("system_messages", {}).get("errors", {}).get("llm_connection_failed", {})
             return json.dumps({
-                "analysis": "连接失败",
-                "final_translation": "抱歉，我现在无法连接到智能大脑。(LLM Connection Error)"
+                "analysis": error_msgs.get("analysis", "连接失败"),
+                "final_translation": error_msgs.get("final_translation", "抱歉，我现在无法连接到智能大脑。(LLM Connection Error)")
             }, ensure_ascii=False)
 
         return response

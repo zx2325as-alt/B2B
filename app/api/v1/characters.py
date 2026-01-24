@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Union, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -72,6 +72,17 @@ def delete_relationship(relationship_id: int, db: Session = Depends(get_db)):
     if not success:
         raise HTTPException(status_code=404, detail="Relationship not found")
     return {"status": "success", "message": f"Relationship {relationship_id} deleted"}
+
+@router.post("/import", summary="批量导入角色和关系")
+def import_characters(data: Union[List[Dict[str, Any]], Dict[str, Any]], db: Session = Depends(get_db)):
+    """
+    批量导入角色和关系 (Batch Import)
+    
+    Accepts:
+    1. A list of characters (legacy support).
+    2. A dict with keys "characters" and "relationships".
+    """
+    return character_service.import_data(db, data)
 
 @router.get("/{character_id}/relationships", response_model=List[RelationshipResponse])
 def get_character_relationships(character_id: int, db: Session = Depends(get_db)):
