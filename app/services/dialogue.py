@@ -50,6 +50,34 @@ class DialogueService:
         scenario_name = scenario.name if scenario else "深度对话理解中枢"
         
         # 拼接上下文文档
+        # RAG Semantic Retrieval
+        try:
+            # Construct filters
+            rag_filters = {}
+            if character:
+                 rag_filters["character_id"] = str(character.id)
+            
+            # Use settings for top_k
+            top_k = getattr(settings, "RAG_SIMILARITY_TOP_K", 3)
+            
+            # Use Hybrid Retrieval (BM25 + Semantic)
+            rag_results = await knowledge_service.retrieve_hybrid(user_input, top_k=top_k, filters=rag_filters if rag_filters else None)
+            
+            if rag_results:
+                rag_context = []
+                for item in rag_results:
+                    content = item.get("content", "")
+                    meta = item.get("metadata", {})
+                    timestamp = meta.get("timestamp", "")
+                    # Add timestamp to context if available
+                    prefix = f"[{timestamp}] " if timestamp else ""
+                    rag_context.append(f"[相关历史记忆]: {prefix}{content}")
+                
+                context_docs.extend(rag_context)
+                logger.info(f"DialogueService: Retrieved {len(rag_results)} RAG documents.")
+        except Exception as e:
+            logger.warning(f"DialogueService: RAG retrieval failed: {e}")
+
         context_str = "\n".join(context_docs)
         
         # 格式化 NLU 信息

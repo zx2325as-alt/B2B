@@ -24,6 +24,15 @@
 - **自适应输出**：系统根据用户打分自动调整分析的详细程度（1分简化，5分详尽）。
 - **档案同步**：一键总结对话信息，自动更新至角色档案库。
 
+### 2.5 实时语音全链路分析 (Real-time Voice Analysis) **(New)**
+- **低延迟重叠处理 (Overlap Processing)**: 采用生产者-消费者 (Producer-Consumer) 架构，实现录音与分析的并行处理。将切片时长优化至 3秒，配合异步队列，实现 <3秒 的端到端响应延迟，保证对话识别的连续性，不漏字、不卡顿。
+- **多模态融合 (Multi-modal Fusion)**: 
+    - **声纹识别**: 自动提取 MFCC 声纹指纹，通过余弦相似度进行说话人识别 (Speaker ID)。
+    - **角色同步**: 支持将声纹与系统角色 (Character) 绑定，实现“闻其声知其人”。
+    - **声学特征**: 实时提取音高 (Pitch)、能量 (Energy)、语速 (Duration) 等副语言特征，辅助情绪判断。
+- **实时纠错 (Real-time Correction)**: 提供 UI 交互界面，允许用户在对话过程中实时修正识别错误的文本，修正结果即时同步至历史记录与上下文。
+- **断点续传与持久化**: 采用 JSONL 文件存储分析历史，支持页面刷新后数据自动恢复，确保长会话数据不丢失。
+
 ## 3. 技术架构 (Architecture)
 
 ### 3.1 总体架构
@@ -36,6 +45,8 @@ graph TD
     Service <--> Context[上下文管理器 (ContextManager)]
     Service <--> LLM[大模型接口 (LLM Interface)]
     Service <--> DB[(SQLite Database)]
+    Client -- Audio Stream --> AudioService[音频服务]
+    AudioService -- STT/SER --> Whisper/Wav2Vec2
 ```
 
 ### 3.2 关键模块
@@ -54,6 +65,9 @@ graph TD
     - 负责调用 LLM。根据 ContextManager 提供的信息，选择合适的 Prompt 模板，生成 JSON 格式的分析结果。
 - **CharacterService (character_service.py)**：
     - 处理角色的增删改查及动态档案的更新。
+- **AudioService (audio_service.py)** **(Updated)**:
+    - 集成 `faster-whisper` (STT), `edge-tts` (TTS), `transformers` (SER), `librosa` (Feature Extraction)。
+    - 提供本地化的多模态处理能力。
 
 #### C. 数据存储 (app/models/sql_models.py)
 - 使用 SQLAlchemy ORM。
@@ -80,10 +94,14 @@ graph TD
     - 输入：`text` (包含 "Role说：..."), `session_id`.
     - 输出：`thinking_process` (思考过程), `primary_analysis` (主分析), `audience_analysis` (观众反应).
 
-### 4.4 反馈系统
+### 4.4 语音服务 (Audio Services)
+- `POST /audio/transcribe`: 上传音频文件，返回文本、情绪、声纹ID及声学特征。
+- `POST /audio/synthesize`: 文本转语音 (TTS)。
+
+### 4.5 反馈系统
 - `POST /feedback`: **(新增)** 提交对某次回复的打分与评论。
 
-### 4.5 调用示例 (Usage Examples)
+### 4.6 调用示例 (Usage Examples)
 
 #### A. 发起对话 (Start Chat)
 ```bash
@@ -98,21 +116,3 @@ curl -X POST "http://localhost:8000/api/v1/chat" \
          }'
 ```
 > **注意**: 响应为 `application/x-ndjson` 流式格式，需按行解析 JSON。
-
-#### B. 同步角色档案 (Sync Profile)
-```bash
-# character_id=1, session_id可选
-curl -X POST "http://localhost:8000/api/v1/characters/1/summarize?session_id=uuid-session-001"
-```
-> **返回**: 包含版本号 (`version`) 和更新后的摘要字段 (`summary`).
-
-#### C. 提交反馈 (Submit Feedback)
-```bash
-# log_id=105, rating=4 (1-5)
-curl -X POST "http://localhost:8000/api/v1/chat/105/rate?rating=4&feedback=分析很精准"
-```
-
-## 5. 部署与运行 (Deployment)22
-1. **环境依赖**: Python 3.10+, PyTorch (可选), FastAPI, Streamlit, SQLAlchemy.
-2. **启动后端**: `uvicorn app.main:app --reload`
-3. **启动前端**: `streamlit run app/web/chat_ui.py`

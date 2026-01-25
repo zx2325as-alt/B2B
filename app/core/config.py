@@ -44,6 +44,16 @@ class Settings:
         self.RAG_SIMILARITY_TOP_K = rag_config.get("similarity_top_k", 3)
         self.RAG_CHUNK_SIZE = rag_config.get("chunk_size", 512)
 
+        # Audio
+        audio_config = self._config.get("audio") or {}
+        self.AUDIO_STT_MODEL_SIZE = audio_config.get("stt_model_size", "medium")
+        self.AUDIO_STT_DEVICE = audio_config.get("stt_device", "cpu")
+        self.AUDIO_STT_COMPUTE_TYPE = audio_config.get("stt_compute_type", "int8")
+        self.AUDIO_TTS_ENABLED = audio_config.get("tts_enabled", True)
+        self.AUDIO_TTS_VOICE = audio_config.get("tts_voice", "zh-CN-XiaoxiaoNeural")
+        self.AUDIO_SER_ENABLED = audio_config.get("ser_enabled", True)
+        self.AUDIO_SER_MODEL = audio_config.get("ser_model", "superb/wav2vec2-base-superb-er")
+
         # Database
         db_config = self._config.get("database") or {}
         self.DATABASE_URL = db_config.get("url") or f"sqlite:///{self.DATA_DIR}/btb.db"

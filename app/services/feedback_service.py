@@ -100,6 +100,6 @@ class FeedbackService:
         """
         Get events for a character, ordered by date desc.
         """
-        return db.query(CharacterEvent).filter(CharacterEvent.character_id == character_id).order_by(CharacterEvent.event_date.desc()).limit(limit).all()
+        return db.query(CharacterEvent).filter(CharacterEvent.character_id == character_id).order_by(CharacterEvent.created_at.desc()).limit(limit).all()
 
 feedback_service = FeedbackService()

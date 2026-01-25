@@ -8,6 +8,7 @@ from app.api.v1.endpoints import router as api_v1_router
 from app.api.v1.scenarios import router as scenarios_router
 from app.api.v1.characters import router as characters_router
 from app.api.v1.feedback import router as feedback_router
+from app.api.v1.audio import router as audio_router
 from app.services.scenario_service import scenario_service
 from app.core.middleware import ProcessTimeMiddleware
 
@@ -32,6 +33,7 @@ app.add_middleware(ProcessTimeMiddleware)
 app.include_router(api_v1_router, prefix="/api/v1", tags=["Chat"])
 app.include_router(scenarios_router, prefix="/api/v1/scenarios", tags=["Scenarios"])
 app.include_router(characters_router, prefix="/api/v1/characters", tags=["Characters"])
+app.include_router(audio_router, prefix="/api/v1", tags=["Audio"])
 app.include_router(feedback_router, prefix="/api/v1", tags=["Feedback"])
 
 @app.on_event("startup")

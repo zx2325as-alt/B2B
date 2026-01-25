@@ -32,6 +32,10 @@ deep_analysis:
       
       【你的任务】
       请不要急于输出表格。先像一位老练的分析师一样，在草稿纸上进行深度推演。
+      请特别关注【多角色互动】：
+      1. 对于每一个在场的角色（参见【已知角色】），都要推演其【内心独白(Inner OS)】和【情绪反应】。
+      2. 结合可能提供的【声学特征】（如音高、能量）来修正你对情绪的判断。
+      
       请按照以下结构进行输出（Markdown + JSON）：
       
       ## 🧠 我的分析推演过程
@@ -55,8 +59,10 @@ deep_analysis:
           "character_analysis": [
               {{
                   "name": "角色名",
+                  "inner_os": "【关键】角色的内心独白(Inner Thought/OS)，用第一人称描述此刻的真实想法",
+                  "emotional_reaction": "【关键】角色的情绪反应 (如：惊讶、压抑的愤怒、假装镇定)",
                   "deep_intent": "真实动机",
-                  "mood": "情绪状态",
+                  "mood": "情绪状态 (词语)",
                   "strategy": "使用策略",
                   "profile_update": {{
                       "basic_attributes": {{ 

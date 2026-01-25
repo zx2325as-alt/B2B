@@ -1,0 +1,24 @@
+==========================================
+Test Report - 周日 2026/01/25 14:57:42.85
+==========================================
+
+2026-01-25 14:57:47 | INFO     | app.services.voice_profile:_load_profiles:29 - Loaded 1 voice profiles.
+test_analysis_conversation_deep (test_api_analysis.TestAnalysisAPI)
+Test deep analysis mode with multi-role ... ok
+test_analysis_conversation_quick (test_api_analysis.TestAnalysisAPI)
+Test quick analysis mode ... ok
+test_extract_paralinguistic_features (test_audio_features.TestAudioFeatures)
+Test extraction of pitch, energy, duration ... 2026-01-25 14:58:11 | INFO     | app.services.voice_profile:_load_profiles:29 - Loaded 1 voice profiles.
+ok
+test_voice_fingerprint (test_audio_features.TestAudioFeatures)
+Test voice fingerprint generation ... 2026-01-25 14:58:13 | INFO     | app.services.voice_profile:_load_profiles:29 - Loaded 1 voice profiles.
+ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 26.084s
+
+OK
+Skipping API test (Server not running)
+Skipping API test (Server not running)
+Extracted features: {'energy': 0.3502415120601654, 'pitch': 439.28021240234375, 'duration': 1.0}
+Fingerprint generated successfully

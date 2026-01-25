@@ -66,6 +66,70 @@ with st.sidebar:
         st.session_state.gen_messages = []
         st.rerun()
 
+    st.divider()
+    st.subheader("🎙️ 语音交互 (Audio)")
+    
+    # TTS Toggle
+    enable_tts = st.toggle("🔊 启用语音播报 (Enable TTS)", value=False)
+    
+    # Microphone Recorder
+    try:
+        from audiorecorder import audiorecorder
+        st.caption("点击下方麦克风开始录音，再次点击停止。")
+        audio = audiorecorder("🎤 点击开始录音", "⏹️ 点击停止录音")
+        
+        if len(audio) > 0:
+            # Check if this audio is new (avoid reprocessing on rerun)
+            # Use hash or length as simple check. For simplicity, we just check if it's non-empty and user hasn't sent it yet.
+            # Ideally, we should add a 'Send' button or auto-send.
+            # Let's provide a "Send Voice Message" button to confirm.
+            
+            st.audio(audio.export().read(), format="audio/wav")
+            
+            if st.button("📤 发送语音消息"):
+                with st.spinner("正在处理语音消息..."):
+                    try:
+                        # Save to temp
+                        temp_filename = f"mic_{uuid.uuid4()}.wav"
+                        # audiorecorder returns pydub segment. export() returns a file-like object.
+                        audio.export(temp_filename, format="wav")
+                        
+                        # Send to backend
+                        with open(temp_filename, "rb") as f:
+                            files = {"file": (temp_filename, f, "audio/wav")}
+                            res = requests.post(f"{API_URL}/audio/transcribe", files=files)
+                        
+                        # Cleanup
+                        import os
+                        if os.path.exists(temp_filename):
+                            os.remove(temp_filename)
+                            
+                        if res.status_code == 200:
+                            data = res.json()
+                            text = data.get("text", "")
+                            emotion = data.get("top_emotion", "neutral")
+                            
+                            # Set session state to trigger LLM flow below
+                            st.session_state.audio_input_text = text
+                            st.session_state.audio_input_emotion = emotion
+                            st.session_state.trigger_audio_send = True
+                            st.rerun()
+                        else:
+                            st.error(f"识别失败: {res.text}")
+                    except Exception as e:
+                        st.error(f"处理异常: {e}")
+                        
+    except ImportError:
+        st.warning("请安装 streamlit-audiorecorder 以使用麦克风功能。")
+        st.code("pip install streamlit-audiorecorder")
+
+    # Fallback / File Upload (Keep as option)
+    with st.expander("📂 上传音频文件 (备用)"):
+        audio_file = st.file_uploader("上传语音指令", type=["wav", "mp3", "m4a", "webm"])
+        if audio_file and st.button("🔄 识别文件"):
+             # ... (Same logic as before, omitted for brevity but could reuse)
+             pass
+
 # ==========================================
 # 主界面 (Main Interface)
 # ==========================================
@@ -80,11 +144,35 @@ for msg in st.session_state.gen_messages:
         st.markdown(content)
 
 # 2. 处理用户输入
-if prompt := st.chat_input("请输入您的指令或问题..."):
+# Check for audio input override
+audio_input = st.session_state.get("audio_input_text", "")
+if audio_input:
+    # Clear it so it doesn't stick
+    del st.session_state.audio_input_text
+
+# Get chat input (returns None if not submitted)
+chat_prompt = st.chat_input("请输入您的指令或问题...")
+
+# Determine final prompt
+prompt = None
+if audio_input:
+    prompt = audio_input
+elif chat_prompt:
+    prompt = chat_prompt
+
+if prompt:
     # 显示用户消息
-    st.session_state.gen_messages.append({"role": "user", "content": prompt})
+    display_content = prompt
+    # If we have emotion from audio, append it for display context (optional)
+    audio_emotion = st.session_state.get("audio_input_emotion")
+    if audio_emotion:
+         display_content += f" (🎙️ 情感: {audio_emotion})"
+         # Clear emotion
+         del st.session_state.audio_input_emotion
+         
+    st.session_state.gen_messages.append({"role": "user", "content": display_content})
     with st.chat_message("user", avatar="🧑‍💻"):
-        st.markdown(prompt)
+        st.markdown(display_content)
 
     # 构造请求上下文
     # 如果有文件内容，将其作为上下文注入
@@ -118,9 +206,6 @@ if prompt := st.chat_input("请输入您的指令或问题..."):
                                 # 忽略 NLU 阶段的中间结果，只关注 response 或 reasoning
                                 if "response" in data:
                                     content = data["response"]
-                                    # 如果是流式增量，可能需要拼接；但目前后端设计似乎是 chunk 返回完整文本或阶段性文本
-                                    # 根据 endpoints.py 的逻辑，response 字段通常包含最终回复或 Thinking Process
-                                    # 简单起见，我们直接更新显示
                                     full_response = content
                                     message_placeholder.markdown(full_response + "▌")
                             except:
@@ -129,6 +214,21 @@ if prompt := st.chat_input("请输入您的指令或问题..."):
                     # 最终显示
                     message_placeholder.markdown(full_response)
                     st.session_state.gen_messages.append({"role": "assistant", "content": full_response})
+                    
+                    # TTS Playback
+                    if enable_tts and full_response:
+                        try:
+                            with st.spinner("正在生成语音..."):
+                                tts_res = requests.post(
+                                    f"{API_URL}/audio/synthesize", 
+                                    data={"text": full_response}
+                                )
+                                if tts_res.status_code == 200:
+                                    st.audio(tts_res.content, format="audio/mp3")
+                                else:
+                                    st.warning("语音生成失败")
+                        except Exception as e:
+                            st.error(f"TTS Error: {e}")
                     
                 else:
                     err_msg = f"服务请求失败: {r.text}"

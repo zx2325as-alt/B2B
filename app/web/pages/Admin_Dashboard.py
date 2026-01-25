@@ -8,6 +8,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 from app.core.config import settings
+from app.utils.history_utils import HistoryService
+from app.services.voice_profile import VoiceProfileService
+import datetime
 
 # ==========================================
 # 配置与初始化 (Configuration & Initialization)
@@ -168,124 +171,273 @@ with tab5:
 # Tab 4: 核心监控 (Monitoring)
 # ==========================================
 with tab4:
+    st.markdown("### 📊 全局核心监控 (Global Monitoring)")
+    
+    # Source Selection
+    monitor_source = st.radio(
+        "选择监控数据源", 
+        ["💬 聊天对话日志 (Chat Logs)", "🎙️ 实时语音日志 (Realtime Voice Logs)"],
+        horizontal=True
+    )
+    
     col_header, col_btn = st.columns([8, 2])
     with col_btn:
-        if st.button("🔄 刷新数据 (Sync)", key="refresh_eval_logs"):
+        if st.button("🔄 刷新数据 (Sync)", key="refresh_monitor"):
             st.rerun()
 
-    st.markdown("在此监控系统核心指标，并对历史对话进行人工评分。")
-    
-    # 1. 筛选器 (Filters)
-    col_f1, col_f2 = st.columns(2)
-    
-    # 获取场景列表用于筛选
-    filter_scenario_id = None
-    try:
-        scenarios_res = requests.get(f"{API_URL}/scenarios/")
-        if scenarios_res.status_code == 200:
-            scenarios = scenarios_res.json()
-            scenario_options = {"全部": None}
-            for s in scenarios:
-                scenario_options[s["name"]] = s["id"]
-            
-            with col_f1:
-                selected_s = st.selectbox("按场景筛选", options=list(scenario_options.keys()))
-                filter_scenario_id = scenario_options[selected_s]
-    except:
-        pass
+    # -------------------------------------------------------
+    # A. 聊天对话日志 (Chat Logs)
+    # -------------------------------------------------------
+    if "Chat Logs" in monitor_source:
+        st.markdown("在此监控系统核心指标，并对历史对话进行人工评分。")
         
-    # 获取角色列表用于筛选
-    filter_character_id = None
-    try:
-        chars_res = requests.get(f"{API_URL}/characters/")
-        if chars_res.status_code == 200:
-            chars = chars_res.json()
-            char_options = {"全部": None}
-            for c in chars:
-                char_options[c["name"]] = c["id"]
+        # 1. 筛选器 (Filters)
+        col_f1, col_f2 = st.columns(2)
+        
+        # 获取场景列表用于筛选
+        filter_scenario_id = None
+        try:
+            scenarios_res = requests.get(f"{API_URL}/scenarios/")
+            if scenarios_res.status_code == 200:
+                scenarios = scenarios_res.json()
+                scenario_options = {"全部": None}
+                for s in scenarios:
+                    scenario_options[s["name"]] = s["id"]
                 
-            with col_f2:
-                selected_c = st.selectbox("按人物筛选", options=list(char_options.keys()))
-                filter_character_id = char_options[selected_c]
-    except:
-        pass
-
-    # 2. 获取并显示日志 (Fetch Logs)
-    try:
-        params = {"limit": 50} # Increased limit for better metrics
-        if filter_scenario_id:
-            params["scenario_id"] = filter_scenario_id
-        if filter_character_id:
-            params["character_id"] = filter_character_id
+                with col_f1:
+                    selected_s = st.selectbox("按场景筛选", options=list(scenario_options.keys()))
+                    filter_scenario_id = scenario_options[selected_s]
+        except:
+            pass
             
-        logs_res = requests.get(f"{API_URL}/logs", params=params)
-        if logs_res.status_code == 200:
-            logs = logs_res.json()
-            
-            # --- Metrics Dashboard ---
-            if logs:
-                df = pd.DataFrame(logs)
-                # Ensure columns exist
-                if 'rating' not in df.columns: df['rating'] = 0
-                if 'latency_ms' not in df.columns: df['latency_ms'] = 0
-                
-                # Calculate metrics
-                avg_rating = df[df['rating'] > 0]['rating'].mean()
-                if pd.isna(avg_rating): avg_rating = 0.0
-                
-                avg_latency = df['latency_ms'].mean()
-                
-                st.markdown("### 📈 核心指标 (Core Metrics)")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("平均评分 (Quality)", f"{avg_rating:.1f}/5.0", help="仅统计已评分的对话")
-                m2.metric("平均延迟 (Performance)", f"{avg_latency:.0f} ms")
-                m3.metric("近期对话量 (Volume)", len(logs))
-                st.divider()
+        # 获取角色列表用于筛选
+        filter_character_id = None
+        try:
+            chars_res = requests.get(f"{API_URL}/characters/")
+            if chars_res.status_code == 200:
+                chars = chars_res.json()
+                char_options = {"全部": None}
+                for c in chars:
+                    char_options[c["name"]] = c["id"]
+                    
+                with col_f2:
+                    selected_c = st.selectbox("按人物筛选", options=list(char_options.keys()))
+                    filter_character_id = char_options[selected_c]
+        except:
+            pass
 
-            if not logs:
-                st.info("暂无对话日志。")
+        # 2. 获取并显示日志 (Fetch Logs)
+        try:
+            params = {"limit": 50} # Increased limit for better metrics
+            if filter_scenario_id:
+                params["scenario_id"] = filter_scenario_id
+            if filter_character_id:
+                params["character_id"] = filter_character_id
+                
+            logs_res = requests.get(f"{API_URL}/logs", params=params)
+            if logs_res.status_code == 200:
+                logs = logs_res.json()
+                
+                # --- Metrics Dashboard ---
+                if logs:
+                    df = pd.DataFrame(logs)
+                    # Ensure columns exist
+                    if 'rating' not in df.columns: df['rating'] = 0
+                    if 'latency_ms' not in df.columns: df['latency_ms'] = 0
+                    
+                    # Calculate metrics
+                    avg_rating = df[df['rating'] > 0]['rating'].mean()
+                    if pd.isna(avg_rating): avg_rating = 0.0
+                    
+                    avg_latency = df['latency_ms'].mean()
+                    
+                    st.markdown("### 📈 核心指标 (Core Metrics)")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("平均评分 (Quality)", f"{avg_rating:.1f}/5.0", help="仅统计已评分的对话")
+                    m2.metric("平均延迟 (Performance)", f"{avg_latency:.0f} ms")
+                    m3.metric("近期对话量 (Volume)", len(logs))
+                    st.divider()
+
+                if not logs:
+                    st.info("暂无对话日志。")
+                else:
+                    st.subheader("📝 对话日志详情")
+                    for log in logs:
+                        # 显示每条日志的详情
+                        with st.expander(f"[{log['created_at']}] User: {log['user_input'][:20]}..."):
+                            col1, col2 = st.columns([2, 1])
+                            with col1:
+                                st.markdown("**User Input:**")
+                                st.info(log['user_input'])
+                                st.markdown("**Bot Response:**")
+                                st.success(log['bot_response'])
+                                if log.get('reasoning_content'):
+                                    st.markdown("**🤔 Reasoning (CoT):**")
+                                    st.warning(log['reasoning_content'])
+                                
+                                st.json({
+                                    "Latency": f"{log['latency_ms']:.2f}ms",
+                                    "Scenario ID": log['scenario_id'],
+                                    "Rating": log['rating']
+                                })
+                                
+                            with col2:
+                                st.markdown("### 人工评分")
+                                # 评分表单
+                                with st.form(f"rate_{log['id']}"):
+                                    new_rating = st.slider("评分 (1-5)", 1, 5, value=log['rating'] or 3)
+                                    feedback = st.text_area("反馈意见", value=log['feedback_text'] or "")
+                                    if st.form_submit_button("提交评分"):
+                                        try:
+                                            rate_res = requests.post(
+                                                f"{API_URL}/chat/{log['id']}/rate", 
+                                                params={"rating": new_rating, "feedback": feedback}
+                                            )
+                                            if rate_res.status_code == 200:
+                                                st.success("已更新！")
+                                                st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error: {e}")
             else:
-                st.subheader("📝 对话日志详情")
-                for log in logs:
-                    # 显示每条日志的详情
-                    with st.expander(f"[{log['created_at']}] User: {log['user_input'][:20]}..."):
-                        col1, col2 = st.columns([2, 1])
-                        with col1:
-                            st.markdown("**User Input:**")
-                            st.info(log['user_input'])
-                            st.markdown("**Bot Response:**")
-                            st.success(log['bot_response'])
-                            if log.get('reasoning_content'):
-                                st.markdown("**🤔 Reasoning (CoT):**")
-                                st.warning(log['reasoning_content'])
-                            
-                            st.json({
-                                "Latency": f"{log['latency_ms']:.2f}ms",
-                                "Scenario ID": log['scenario_id'],
-                                "Rating": log['rating']
-                            })
-                            
-                        with col2:
-                            st.markdown("### 人工评分")
-                            # 评分表单
-                            with st.form(f"rate_{log['id']}"):
-                                new_rating = st.slider("评分 (1-5)", 1, 5, value=log['rating'] or 3)
-                                feedback = st.text_area("反馈意见", value=log['feedback_text'] or "")
-                                if st.form_submit_button("提交评分"):
-                                    try:
-                                        rate_res = requests.post(
-                                            f"{API_URL}/chat/{log['id']}/rate", 
-                                            params={"rating": new_rating, "feedback": feedback}
-                                        )
-                                        if rate_res.status_code == 200:
-                                            st.success("已更新！")
-                                            st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Error: {e}")
+                st.error("无法获取日志。")
+        except Exception as e:
+            st.error(f"连接错误: {e}")
+            
+    # -------------------------------------------------------
+    # B. 实时语音日志 (Realtime Voice Logs)
+    # -------------------------------------------------------
+    else:
+        st.info("正在监控实时语音分析流...")
+        
+        # Load Logs
+        voice_logs = HistoryService.load_history(limit=50)
+        
+        if not voice_logs:
+            st.warning("暂无语音日志。")
         else:
-            st.error("无法获取日志。")
-    except Exception as e:
-        st.error(f"连接错误: {e}")
+            # Metrics
+            total_logs = len(voice_logs)
+            rated_logs = [l for l in voice_logs if l.get("rating", 0) > 0]
+            avg_rating = sum([l["rating"] for l in rated_logs]) / len(rated_logs) if rated_logs else 0.0
+            
+            m1, m2 = st.columns(2)
+            m1.metric("总记录数", total_logs)
+            m2.metric("平均评分", f"{avg_rating:.1f} ⭐")
+            
+            st.divider()
+            
+            # Display Logs (Reverse Order)
+            for i, log in enumerate(reversed(voice_logs)):
+                # Unique Key Base
+                log_id = log.get("id", f"log_{i}")
+                
+                with st.expander(f"[{log.get('timestamp')}] {log.get('speaker')} (Emotion: {log.get('emotion')})", expanded=(i==0)):
+                    
+                    # 1. Basic Info & Correction
+                    c_info, c_edit = st.columns([1, 1])
+                    
+                    with c_info:
+                        st.markdown(f"**识别内容**: {log.get('text')}")
+                        st.caption(f"Latency: {log.get('latency')} | ID: {log_id}")
+                        
+                    with c_edit:
+                        # Correction UI
+                        new_text = st.text_input("修正内容", value=log.get("text"), key=f"mon_edit_{log_id}")
+                        if new_text != log.get("text"):
+                            if st.button("💾 保存修正", key=f"mon_save_{log_id}"):
+                                if HistoryService.update_log_text(log_id, new_text):
+                                    # Sync to backend feedback
+                                    try:
+                                        payload = {
+                                            "session_id": "monitor_correction",
+                                            "user_input": new_text,
+                                            "model_output": json.dumps(log.get("analysis", {})),
+                                            "rating": log.get("rating", 0),
+                                            "comment": f"Correction from: {log.get('text')}"
+                                        }
+                                        requests.post(f"{API_URL}/feedback/feedback", json=payload, timeout=5)
+                                    except: pass
+                                    st.success("已更新！")
+                                    st.rerun()
+
+                    # 2. Rating UI
+                    current_rating = log.get("rating", 0)
+                    rating = st.slider("评分", 0, 5, current_rating, key=f"mon_rate_{log_id}")
+                    if rating != current_rating:
+                        # Update File
+                        HistoryService.update_log_text(log_id, log.get("text"), rating)
+                        # Sync Backend
+                        try:
+                            payload = {
+                                "session_id": "monitor_rating",
+                                "user_input": log.get("text"),
+                                "model_output": json.dumps(log.get("analysis", {})),
+                                "rating": rating,
+                                "comment": "Monitor Rating"
+                            }
+                            requests.post(f"{API_URL}/feedback/feedback", json=payload, timeout=5)
+                            st.toast(f"评分已同步: {rating}")
+                        except: pass
+                        
+                    # 3. Deep Analysis Inspection (Reuse Logic)
+                    analysis = log.get("analysis", {})
+                    if analysis:
+                        st.divider()
+                        st.markdown("#### 🧠 深度对话理解 (Deep Understanding)")
+                        
+                        # Markdown Report
+                        if "markdown_report" in analysis:
+                            with st.expander("查看思考过程 (Thinking Process)"):
+                                st.markdown(analysis["markdown_report"])
+                        
+                        # Structured Data
+                        structured = analysis.get("structured_data", {})
+                        char_analysis_list = structured.get("character_analysis", [])
+                        
+                        if char_analysis_list:
+                             # Reuse display logic
+                             st.caption("检测到的角色分析数据：")
+                             
+                             for j, item in enumerate(char_analysis_list):
+                                char_name = item.get("name", "Unknown")
+                                deep_intent = item.get("deep_intent", "N/A")
+                                strategies = item.get("strategy", [])
+                                if isinstance(strategies, list): strategies = ", ".join(strategies)
+                                mood = item.get("mood", [])
+                                if isinstance(mood, list): mood = ", ".join(mood)
+                                
+                                st.markdown(f"**🎭 {char_name}**")
+                                c1, c2 = st.columns(2)
+                                c1.info(f"意图: {deep_intent}")
+                                c2.info(f"情绪: {mood}")
+                                st.markdown(f"策略: {strategies}")
+                                
+                                # Profile Update (6 Dimensions)
+                                profile_update = item.get("profile_update", {})
+                                if profile_update:
+                                    tab_names = [
+                                        "1️⃣ 基础属性", "2️⃣ 表层行为", "3️⃣ 情绪特征", 
+                                        "4️⃣ 认知决策", "5️⃣ 人格特质", "6️⃣ 核心本质"
+                                    ]
+                                    tabs = st.tabs(tab_names)
+                                    
+                                    # Helper
+                                    def display_dim_mon(tab, key, label):
+                                        with tab:
+                                            data_obj = profile_update.get(key, {})
+                                            desc = data_obj.get("desc", label)
+                                            content = data_obj.get("data", {})
+                                            if content:
+                                                st.json(content)
+                                            else:
+                                                st.caption("无更新")
+                                    
+                                    display_dim_mon(tabs[0], "basic_attributes", "基础属性")
+                                    display_dim_mon(tabs[1], "surface_behavior", "表层行为")
+                                    display_dim_mon(tabs[2], "emotional_traits", "情绪特征")
+                                    display_dim_mon(tabs[3], "cognitive_decision", "认知决策")
+                                    display_dim_mon(tabs[4], "personality_traits", "人格特质")
+                                    display_dim_mon(tabs[5], "core_essence", "核心本质")
 
 # ==========================================
 # Tab 1: 场景管理 (Scenario Management)
@@ -420,7 +572,57 @@ with tab2:
                     with c2:
                         traits_val = json.dumps(char_data.get("traits", {"personality": "friendly", "tone": "formal"}), ensure_ascii=False, indent=2)
                         traits = st.text_area("性格特征 (Traits)", value=traits_val, height=200)
+                    
+                    st.markdown("#### 🔹 动态档案 JSON (Dynamic Profile)")
+                    dyn_prof_val = json.dumps(dyn_profile_data, ensure_ascii=False, indent=2)
+                    dyn_profile_json_input = st.text_area("完整动态档案 (Dynamic Profile JSON)", value=dyn_prof_val, height=300, help="在此处修改将覆盖上方表单中的对应字段")
                 
+                # --- 声纹绑定 (Voice Binding) ---
+                st.divider()
+                st.markdown("#### 🔊 声纹绑定 (Voice Binding)")
+                
+                # Helper to get voice profiles
+                vp_service = VoiceProfileService()
+                all_profiles = vp_service.get_all_speakers()
+                
+                # Find current bound profile
+                current_voice_id = None
+                current_voice_info = "无 (None)"
+                char_name_curr = char_data.get("name", "")
+                
+                for p in all_profiles:
+                    if p["name"] == char_name_curr and char_name_curr:
+                        current_voice_id = p["id"]
+                        current_voice_info = f"{p['name']} (ID: {p['id']})"
+                        break
+                
+                st.info(f"当前关联声纹: {current_voice_info}")
+                
+                # Options
+                voice_options = ["-- 不关联 (Unbind) --"]
+                voice_map = {"-- 不关联 (Unbind) --": "-- 不关联 (Unbind) --"}
+                
+                if current_voice_id:
+                     voice_options.append(current_voice_id)
+                     voice_map[current_voice_id] = f"当前: {current_voice_info}"
+                     
+                for p in all_profiles:
+                    # Show Unknowns or potential candidates
+                    if "Unknown" in p["name"] or "speaker" in p["id"]:
+                        if p["id"] != current_voice_id:
+                             voice_options.append(p["id"])
+                             voice_map[p["id"]] = f"{p['name']} ({p['id']})"
+                
+                # Remove duplicates if any
+                voice_options = list(dict.fromkeys(voice_options))
+                
+                selected_voice = st.selectbox(
+                    "选择声纹进行关联 (Select Voice to Bind)", 
+                    options=voice_options,
+                    format_func=lambda x: voice_map.get(x, x),
+                    index=voice_options.index(current_voice_id) if current_voice_id in voice_options else 0
+                )
+
                 cols_btn = st.columns([1, 1])
                 submitted = cols_btn[0].form_submit_button("💾 保存提交")
                 
@@ -430,25 +632,54 @@ with tab2:
                         traits_json = json.loads(traits)
                         rels_json = json.loads(rels)
                         
-                        # 构建动态档案对象
-                        new_dyn_profile = {
-                            "core_drivers": [x.strip() for x in drivers.split('\n') if x.strip()],
-                            "inferred_core_needs": [x.strip() for x in needs.split('\n') if x.strip()],
-                            "behavior_pattern": behavior,
-                            "emotional_baseline": emotion,
-                            "communication_style": comm_style,
-                            "recent_key_events": [x.strip() for x in events.split('\n') if x.strip()],
-                            "relationship_summary": rels_json
-                        }
-                        # 合并其他未在 UI 显示的字段
-                        for k, v in dyn_profile_data.items():
-                            if k not in new_dyn_profile: new_dyn_profile[k] = v
+                        # 1. Determine priority: JSON vs Form
+                        # Check if JSON input was modified by user
+                        json_modified = False
+                        base_dyn_profile = {}
+                        
+                        try:
+                            current_json_obj = json.loads(dyn_profile_json_input)
+                            # Get original for comparison
+                            orig_dyn_profile = char_data.get("dynamic_profile") or {}
+                            
+                            # Simple comparison (serialize both to ensure format matches)
+                            if json.dumps(current_json_obj, sort_keys=True) != json.dumps(orig_dyn_profile, sort_keys=True):
+                                json_modified = True
+                                base_dyn_profile = current_json_obj
+                            else:
+                                base_dyn_profile = orig_dyn_profile.copy()
+                        except:
+                            # JSON parse error, fall back to empty or original
+                            base_dyn_profile = char_data.get("dynamic_profile", {}).copy()
+                        
+                        # 2. Apply Form Overrides ONLY if JSON was NOT modified
+                        # If user modified JSON, we assume they want full control and ignore partial form inputs
+                        # (unless we want to enforce form inputs on top? Better to trust JSON edit)
+                        if not json_modified:
+                            if drivers.strip():
+                                base_dyn_profile["core_drivers"] = [x.strip() for x in drivers.split('\n') if x.strip()]
+                            if needs.strip():
+                                base_dyn_profile["inferred_core_needs"] = [x.strip() for x in needs.split('\n') if x.strip()]
+                            if behavior.strip():
+                                base_dyn_profile["behavior_pattern"] = behavior
+                            if emotion.strip():
+                                base_dyn_profile["emotional_baseline"] = emotion
+                            if comm_style.strip():
+                                base_dyn_profile["communication_style"] = comm_style
+                            if events.strip():
+                                base_dyn_profile["recent_key_events"] = [x.strip() for x in events.split('\n') if x.strip()]
+                        
+                        # Relationship summary is special
+                        base_dyn_profile["relationship_summary"] = rels_json
+                        
+                        # 合并原始数据中未在 UI 显示的字段 (已经在 JSON 加载时包含)
+                        # for k, v in dyn_profile_data.items(): ... (不再需要，因为 base_dyn_profile 已经包含了)
 
                         payload = {
                             "name": name,
                             "attributes": attrs_json,
                             "traits": traits_json,
-                            "dynamic_profile": new_dyn_profile
+                            "dynamic_profile": base_dyn_profile
                         }
                         
                         if is_edit:
@@ -457,6 +688,19 @@ with tab2:
                             res = requests.post(f"{API_URL}/characters/", json=payload)
                             
                         if res.status_code == 200:
+                            # --- Handle Voice Binding ---
+                            try:
+                                # 1. Unbind old if changed (Rename back to Unknown)
+                                if current_voice_id and selected_voice != current_voice_id:
+                                    vp_service.update_speaker_name(current_voice_id, f"Unknown (was {char_name_curr})")
+                                
+                                # 2. Bind new if selected (Rename to Char Name)
+                                if selected_voice != "-- 不关联 (Unbind) --" and selected_voice != current_voice_id:
+                                    vp_service.update_speaker_name(selected_voice, name)
+                                    st.success(f"声纹已关联: {name}")
+                            except Exception as ve:
+                                st.warning(f"声纹更新异常: {ve}")
+
                             st.success("操作成功！")
                             close_char_dialog()
                         else:

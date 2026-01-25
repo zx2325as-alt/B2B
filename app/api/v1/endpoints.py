@@ -12,7 +12,7 @@ API 端点定义 (API Endpoints)
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import StreamingResponse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
@@ -327,9 +327,22 @@ async def chat(
                 log_db.commit()
                 log_db.refresh(log_entry)
                 
+                # RAG: Index for semantic retrieval
+                await knowledge_service.add_dialogue_log(log_entry)
+                
                 # Yield Log ID for Frontend Feedback (返回 Log ID 供前端反馈使用)
                 yield json.dumps({"type": "meta", "log_id": log_entry.id}, ensure_ascii=False) + "\n"
                 
+                # --- Auto Summary Indexing (自动摘要索引) ---
+                try:
+                    # Count logs for this session to decide if we should summarize
+                    log_count = log_db.query(DialogueLog).filter(DialogueLog.session_id == input_data.session_id).count()
+                    if log_count > 0 and log_count % 10 == 0:
+                        # Trigger summary for last 20 turns (overlap is good)
+                        await extraction_service.summarize_session_segment(log_db, input_data.session_id, last_n=20)
+                except Exception as sum_e:
+                    logger.error(f"Auto summary trigger failed: {sum_e}")
+
                 # --- Active Collection & Relationship Updates (主动信息收集与关系更新) ---
                 if parsed_resp:
                     try:
@@ -612,6 +625,7 @@ class AnalysisRequest(BaseModel):
     mode: Optional[str] = Field("deep", description="分析模式: deep (深度分析) | quick (快速摘要)")
     session_id: Optional[str] = Field(None, description="会话ID，用于关联观察记录")
     history_context: Optional[List[dict]] = Field(default=[], description="历史分析记录上下文")
+    audio_features: Optional[Dict[str, Any]] = Field(default={}, description="声学特征数据 (Pitch, Energy)")
 
 @router.post("/analysis/conversation", summary="分析长对话")
 async def analyze_conversation_endpoint(
@@ -640,7 +654,8 @@ async def analyze_conversation_endpoint(
     try:
         # 1. 自动降级检查 (Automatic degradation check)
         # 如果文本太短，强行使用深度分析不仅浪费 Token，效果也不好
-        if len(request.text) < 50 and request.mode == "deep":
+        # Lowered threshold to 5 to allow short phrases analysis
+        if len(request.text) < 5 and request.mode == "deep":
             logger.info("Input too short, auto-downgrading to quick mode.")
             request.mode = "quick"
 
@@ -655,7 +670,8 @@ async def analyze_conversation_endpoint(
                 request.text, 
                 request.character_names, 
                 db=db,
-                history_context=request.history_context
+                history_context=request.history_context,
+                audio_features=request.audio_features
             )
             
         # --- Persistence (Save to Database) ---
