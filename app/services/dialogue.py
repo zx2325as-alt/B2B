@@ -1,5 +1,6 @@
 from app.models.schemas import NLUOutput
 from app.services.llm import llm_service
+from app.services.knowledge import knowledge_service
 from app.utils.logger import logger
 from app.core.config import settings
 import json
@@ -121,7 +122,10 @@ class DialogueService:
                     "user_status": "active",
                     "user_cognitive_level": "Standard",
                     "user_info_preference": "Balanced",
-                    "conversation_style_history": "Neutral"
+                    "conversation_style_history": "Neutral",
+                    # 补充可能缺失的字段，避免模板报错
+                    "character_display_name": char_name,
+                    "scenario_name": scenario_name
                 }
                 
                 # 安全格式化模板

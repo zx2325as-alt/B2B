@@ -27,7 +27,25 @@ class KnowledgeService:
         if chromadb:
             # Persistent client
             self.client = chromadb.PersistentClient(path=str(settings.DATA_DIR / "chroma_db"))
-            self.collection = self.client.get_or_create_collection(name="btb_knowledge")
+            
+            # Configure Embedding Function (GPU if available)
+            embedding_func = None
+            try:
+                from chromadb.utils import embedding_functions
+                # Try to use CUDA if available
+                device = "cuda" if settings.AUDIO_STT_DEVICE == "cuda" else "cpu"
+                embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
+                    model_name="all-MiniLM-L6-v2",
+                    device=device
+                )
+                logger.info(f"Initialized ChromaDB embedding function on {device}")
+            except Exception as e:
+                logger.warning(f"Failed to init custom embedding function (using default): {e}")
+            
+            self.collection = self.client.get_or_create_collection(
+                name="btb_knowledge_gpu",
+                embedding_function=embedding_func
+            )
         else:
             logger.warning("ChromaDB not installed. Knowledge Service running in mock mode.")
             self.client = None

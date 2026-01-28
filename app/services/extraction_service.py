@@ -53,24 +53,43 @@ class ExtractionService:
             logger.error(f"Quick analyze failed: {e}")
             return {"markdown_report": "Analysis failed.", "structured_data": {}}
 
-    async def deep_analyze(self, text: str, character_names: List[str] = None, db: Session = None, history_context: str = None, audio_features: Dict = None):
+    async def deep_analyze(self, text: str, character_names: List[str] = None, db: Session = None, history_context: str = None, audio_features: Dict = None, emotion_data: Dict = None, speaker_info: Dict = None):
         """
         Deep analysis: Multi-role deduction, Inner OS, Emotion, etc.
         """
         
-        # Format Audio Features for Prompt
-        audio_context = ""
-        if audio_features:
-            pitch = audio_features.get('pitch_mean', 0)
-            energy = audio_features.get('energy_mean', 0)
-            speed = audio_features.get('speech_rate', 0)
-            audio_context = f"""
-            【声学特征参考】
-            - 平均音高: {pitch:.1f} Hz (高音高通常关联激动、紧张或恐惧)
-            - 平均能量: {energy:.1f} (高能量代表声音洪亮、情绪强烈)
-            - 语速: {speed:.1f} 字/秒
-            请结合这些声学特征辅助分析角色的情绪强度。
-            """
+        # Format Audio/Multimodal Context
+        multimodal_context = ""
+        if audio_features or emotion_data:
+            multimodal_context += "\n【多模态感知数据】\n"
+            
+            # 1. Acoustic Features
+            if audio_features:
+                pitch = audio_features.get('pitch', 0)
+                energy = audio_features.get('energy', 0)
+                duration = audio_features.get('duration', 0)
+                # Simple heuristics for context
+                pitch_desc = "偏高 (可能激动/紧张)" if pitch > 200 else "正常"
+                energy_desc = "强 (声音洪亮)" if energy > 0.1 else "正常"
+                
+                multimodal_context += f"- 声学特征: 音高={pitch:.1f}Hz ({pitch_desc}), 能量={energy:.3f} ({energy_desc}), 时长={duration:.1f}s\n"
+            
+            # 2. Emotion Recognition (SER)
+            if emotion_data:
+                top_emotion = emotion_data.get('top_emotion', 'neutral')
+                scores = emotion_data.get('emotions', {})
+                # Format scores like: happy(0.8), sad(0.1)
+                score_str = ", ".join([f"{k}({v:.2f})" for k, v in scores.items() if v > 0.2])
+                multimodal_context += f"- 语音情感识别 (SER): 主导情绪=**{top_emotion}** [{score_str}]\n"
+                
+            multimodal_context += "请将上述感知数据作为重要参考，修正对角色真实情绪和潜台词的判断。\n"
+
+        # Speaker Info
+        speaker_context = ""
+        if speaker_info:
+            spk_name = speaker_info.get('name', 'Unknown')
+            spk_id = speaker_info.get('id', 'unknown')
+            speaker_context = f"【说话人身份】: {spk_name} (ID: {spk_id})\n"
 
         char_list_str = ", ".join(character_names) if character_names else "未知角色"
         
@@ -80,7 +99,8 @@ class ExtractionService:
         【在场角色】
         {char_list_str}
         
-        {audio_context}
+        {speaker_context}
+        {multimodal_context}
         
         【对话内容】
         {text}
@@ -92,7 +112,7 @@ class ExtractionService:
            - 结合声学特征（如果有）来判断情绪的激动程度。
         3. **人际关系动态**: 角色之间的关系是否发生了变化？
         
-        请输出一份 Markdown 格式的报告，并包含一个 JSON 代码块以便程序提取结构化数据。
+        请输出一份 Markdown 格式的报告（**必须使用简体中文**），并包含一个 JSON 代码块以便程序提取结构化数据。
         
         JSON 格式示例：
         ```json

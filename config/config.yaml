@@ -33,25 +33,40 @@ server:
 # ==========================================
 # 决定了系统“大脑”的连接方式。
 llm:
-  # API Key: 模型的访问密钥。
-  # 优先读取此处配置。为了安全，生产环境建议留空并使用环境变量 LLM_API_KEY。
-  api_key: "sk-803936ec8add440db0dca13ec660f070" 
-  
-  # Base URL: 模型 API 地址。
-  # - OpenAI: https://api.openai.com/v1
-  # - DeepSeek: https://api.deepseek.com/v1
-  # - Local (vLLM/Ollama): http://localhost:8000/v1
-  base_url: "https://api.deepseek.com/v1"
+  # 模式选择: "online" (线上API) 或 "local" (本地Ollama)
+  # 修改此处以切换模式
+  mode: "online"
 
-  # Model Name: 使用的模型名称。必须与服务商支持的模型ID一致。
-  model: "deepseek-chat"
+  # --- 线上模式配置 (DeepSeek/OpenAI) ---
+  online:
+    # API Key: 模型的访问密钥。
+    api_key: "sk-803936ec8add440db0dca13ec660f070" 
+    
+    # Base URL: 模型 API 地址。
+    base_url: "https://api.deepseek.com/v1"
   
-  # Timeout: 请求超时时间 (秒)。对于长思考模型，建议设置较长 (如 120s)。
-  timeout: 300.0
-  
-  # Proxy: HTTP 代理地址 (例如 http://127.0.0.1:7890)。
-  # 在国内访问 OpenAI 等海外服务时通常需要配置。访问国内模型 (DeepSeek) 可留空。
-  proxy: ""
+    # Model Name: 使用的模型名称。
+    model: "deepseek-chat"
+    
+    # Proxy: HTTP 代理地址 (例如 http://127.0.0.1:7890)。
+    proxy: ""
+    
+    # Timeout: 请求超时时间 (秒)。
+    timeout: 300.0
+
+  # --- 本地模式配置 (Ollama) ---
+  local:
+    # Ollama 通常不需要 Key
+    api_key: "ollama" 
+    
+    # Ollama 默认地址
+    base_url: "http://localhost:11434/v1"
+    
+    # 本地模型名称 (需先在 ollama run ... 下载)
+    model: "gpt-oss:20b" 
+    
+    proxy: ""
+    timeout: 300.0
 
 # ==========================================
 # 4. 知识库与 RAG 配置 (RAG Settings)

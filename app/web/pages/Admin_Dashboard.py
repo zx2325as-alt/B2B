@@ -668,9 +668,22 @@ with tab2:
                                 base_dyn_profile["communication_style"] = comm_style
                             if events.strip():
                                 base_dyn_profile["recent_key_events"] = [x.strip() for x in events.split('\n') if x.strip()]
+                            
+                            # Relationship summary is special - merge from separate JSON input
+                            if rels_json:
+                                base_dyn_profile["relationship_summary"] = rels_json
                         
-                        # Relationship summary is special
-                        base_dyn_profile["relationship_summary"] = rels_json
+                        # IMPORTANT: If JSON was modified, we trust base_dyn_profile completely.
+                        # However, rels_json comes from a separate text area.
+                        # If user edited the MAIN JSON, they likely edited relationship_summary there too.
+                        # If they edited the separate "Relationship Summary" box, we should respect that IF the main JSON wasn't touched for that part.
+                        # For simplicity:
+                        # - If main JSON modified -> Use main JSON entirely (ignore separate boxes)
+                        # - If main JSON NOT modified -> Use separate boxes to update base_dyn_profile
+                        
+                        # (The logic above `if not json_modified` already handles the separate boxes)
+                        # The only missing part was `relationship_summary` inside that block.
+                        # Added `if rels_json:` block above.
                         
                         # 合并原始数据中未在 UI 显示的字段 (已经在 JSON 加载时包含)
                         # for k, v in dyn_profile_data.items(): ... (不再需要，因为 base_dyn_profile 已经包含了)
@@ -681,6 +694,7 @@ with tab2:
                             "traits": traits_json,
                             "dynamic_profile": base_dyn_profile
                         }
+
                         
                         if is_edit:
                             res = requests.put(f"{API_URL}/characters/{char_data['id']}", json=payload)

@@ -53,6 +53,11 @@ class AudioService:
         # Voice Profile Service
         self.voice_profile_service = VoiceProfileService()
 
+        # Check ffmpeg availability
+        import shutil
+        if not shutil.which("ffmpeg"):
+            logger.warning("ffmpeg not found in system PATH. Audio processing (pydub) may fail or fallback to defaults.")
+
     def _load_stt_model(self):
         if not HAS_WHISPER:
             logger.warning("Whisper STT not available.")
@@ -109,8 +114,10 @@ class AudioService:
 
                 # Try loading with offline mode first if possible, but pipeline doesn't strictly enforce it via kwarg easily without model_kwargs
                 # We'll just wrap it in try-except for connection errors
-                self._ser_pipeline = pipeline("audio-classification", model=model_to_load)
-                logger.info("SER model loaded successfully.")
+                # Use device=0 for GPU if available and requested
+                device = 0 if settings.AUDIO_STT_DEVICE in ["cuda", "gpu"] else -1
+                self._ser_pipeline = pipeline("audio-classification", model=model_to_load, device=device)
+                logger.info(f"SER model loaded successfully on device {device}.")
             except Exception as e:
                 logger.error(f"Failed to load SER model: {e}")
                 # Disable SER to prevent future timeouts
@@ -187,17 +194,21 @@ class AudioService:
             
             avg_pitch = float(np.mean(pitch_values)) if pitch_values else 0.0
             
-            # 3. Speed (Tempo / Duration)
+            # 3. Speed (Syllables estimation)
             duration = librosa.get_duration(y=y, sr=sr)
-            # Speed needs text length usually, but we can estimate "syllables" or just return duration for now
-            # onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-            # tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+            # Estimate syllables using peak detection on envelope (approx 4-5Hz for speech)
+            # This is a rough heuristic
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            peaks = librosa.util.peak_pick(onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=5, delta=0.5, wait=10)
+            syllable_count = len(peaks)
+            speed = syllable_count / duration if duration > 0 else 0
             
             return {
                 "energy": energy,
                 "pitch": avg_pitch,
                 "duration": duration,
-                # "tempo": tempo[0] if hasattr(tempo, '__iter__') else tempo
+                "speed": speed,
+                "syllable_count": syllable_count
             }
         except ImportError:
             logger.warning("Librosa not installed, skipping paralinguistics.")
@@ -208,15 +219,27 @@ class AudioService:
 
     def get_voice_fingerprint(self, audio_path: str) -> Optional[list]:
         """
-        Get simple voice fingerprint (MFCC mean) for speaker ID.
+        Get voice fingerprint for speaker ID.
+        Uses MFCC + Delta + Delta-Delta (39-dim vector) for better robustness.
         """
         try:
             import librosa
             import numpy as np
             y, sr = librosa.load(audio_path, sr=None)
+            
+            # 1. MFCC
             mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-            # Mean across time
-            fingerprint = np.mean(mfcc, axis=1).tolist()
+            
+            # 2. Delta & Delta-Delta
+            mfcc_delta = librosa.feature.delta(mfcc)
+            mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
+            
+            # 3. Stack and Mean
+            # Shape: (39, T)
+            combined = np.vstack([mfcc, mfcc_delta, mfcc_delta2])
+            
+            # Mean across time -> (39,)
+            fingerprint = np.mean(combined, axis=1).tolist()
             return fingerprint
         except Exception as e:
             logger.error(f"Fingerprint error: {e}")
@@ -279,7 +302,17 @@ class AudioService:
                 "is_new_speaker": is_new
             }
         except Exception as e:
+            error_str = str(e)
             logger.error(f"Transcription error: {e}")
+            
+            # Automatic Fallback for CUDA/DLL errors
+            if ("dll" in error_str.lower() or "library" in error_str.lower() or "cuda" in error_str.lower()) and self.device != "cpu":
+                logger.warning(f"CUDA/DLL error detected ({e}). Switching to CPU mode and retrying...")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self._stt_model = None # Force reload
+                return self.transcribe(audio_path) # Recursive retry
+            
             return {"text": "", "error": str(e)}
 
     async def synthesize(self, text: str, voice: str = "zh-CN-XiaoxiaoNeural", output_file: str = "output.mp3") -> Optional[str]:

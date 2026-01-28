@@ -1,8 +1,15 @@
+from app.core.env_setup import setup_environment
+
+# Run Environment Setup (CUDA, FFmpeg paths, KMP fix)
+# MUST be called before importing other app modules to ensure PATH and env vars are set
+setup_environment()
+
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from app.core.config import settings
 from app.utils.logger import logger
 from app.core.database import engine, Base, SessionLocal
+from app.core.middleware import ProcessTimeMiddleware
 from app.core.cache import cache_service
 from app.api.v1.endpoints import router as api_v1_router
 from app.api.v1.scenarios import router as scenarios_router
@@ -10,10 +17,6 @@ from app.api.v1.characters import router as characters_router
 from app.api.v1.feedback import router as feedback_router
 from app.api.v1.audio import router as audio_router
 from app.services.scenario_service import scenario_service
-from app.core.middleware import ProcessTimeMiddleware
-
-# 初始化数据库表结构
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title=settings.APP_NAME,

@@ -189,7 +189,14 @@ class ContextManager:
 
         # (B) RAG 知识检索 (Knowledge Retrieval)
         # 基于实际对话内容检索相关文档
-        rag_docs = await knowledge_service.retrieve(actual_content)
+        rag_results = await knowledge_service.retrieve(actual_content)
+        rag_docs = []
+        if rag_results:
+             for item in rag_results:
+                  if isinstance(item, dict) and "content" in item:
+                       rag_docs.append(f"[RAG]: {item['content']}")
+                  elif isinstance(item, str):
+                       rag_docs.append(f"[RAG]: {item}")
 
         # 6. 组装最终上下文列表 (Assemble Final Context List)
         final_context_list = []

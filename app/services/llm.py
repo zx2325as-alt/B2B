@@ -13,7 +13,13 @@ class LLMService:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        self.proxy = settings.HTTP_PROXY if settings.HTTP_PROXY else None
+        # Auto-detect if we should use proxy
+        # If connecting to localhost, FORCE disable proxy to avoid loopback issues
+        if "localhost" in self.base_url or "127.0.0.1" in self.base_url:
+             self.proxy = None
+        else:
+             self.proxy = settings.HTTP_PROXY if settings.HTTP_PROXY else None
+             
         self.timeout = settings.LLM_TIMEOUT
 
     async def chat_completion(
@@ -29,6 +35,9 @@ class LLMService:
             "temperature": temperature,
         }
         if response_format:
+            # Check if model supports response_format (Ollama support is limited)
+            # For Ollama, strict JSON mode might need specific flags or just prompt engineering
+            # But let's keep it for now as newer Ollama versions support it.
             payload["response_format"] = response_format
 
         try:
@@ -38,7 +47,12 @@ class LLMService:
                 "https://": httpx.AsyncHTTPTransport(proxy=self.proxy),
             } if self.proxy else None
 
-            async with httpx.AsyncClient(timeout=self.timeout, mounts=mounts) as client:
+            # Increase pool limits or keep-alive settings if needed, but default is usually fine.
+            # Adding retries for stability
+            transport = httpx.AsyncHTTPTransport(proxy=self.proxy, retries=3) if self.proxy else httpx.AsyncHTTPTransport(retries=3)
+
+            async with httpx.AsyncClient(timeout=self.timeout, transport=transport) as client:
+                logger.info(f"LLM Request: {url} | Model: {self.model} | Proxy: {self.proxy}")
                 response = await client.post(url, headers=self.headers, json=payload)
                 
                 if response.status_code != 200:
@@ -49,8 +63,11 @@ class LLMService:
                 data = response.json()
                 return data["choices"][0]["message"]["content"]
         except httpx.ConnectError as e:
-            logger.error(f"LLM Connection Failed: {e}. Check your network or proxy settings (HTTP_PROXY).")
+            logger.error(f"LLM Connection Failed: {e}. Check your network, proxy settings, or if Ollama is running.")
             return ""
+        except httpx.RemoteProtocolError as e:
+             logger.error(f"LLM Protocol Error (Server Disconnected): {e}. This often happens if Ollama crashes, times out, or the model name '{self.model}' is incorrect.")
+             return ""
         except Exception as e:
             logger.exception(f"LLM Call Unexpected Error: {e}")
             return ""

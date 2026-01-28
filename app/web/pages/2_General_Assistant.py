@@ -67,69 +67,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("🎙️ 语音交互 (Audio)")
-    
-    # TTS Toggle
-    enable_tts = st.toggle("🔊 启用语音播报 (Enable TTS)", value=False)
-    
-    # Microphone Recorder
-    try:
-        from audiorecorder import audiorecorder
-        st.caption("点击下方麦克风开始录音，再次点击停止。")
-        audio = audiorecorder("🎤 点击开始录音", "⏹️ 点击停止录音")
-        
-        if len(audio) > 0:
-            # Check if this audio is new (avoid reprocessing on rerun)
-            # Use hash or length as simple check. For simplicity, we just check if it's non-empty and user hasn't sent it yet.
-            # Ideally, we should add a 'Send' button or auto-send.
-            # Let's provide a "Send Voice Message" button to confirm.
-            
-            st.audio(audio.export().read(), format="audio/wav")
-            
-            if st.button("📤 发送语音消息"):
-                with st.spinner("正在处理语音消息..."):
-                    try:
-                        # Save to temp
-                        temp_filename = f"mic_{uuid.uuid4()}.wav"
-                        # audiorecorder returns pydub segment. export() returns a file-like object.
-                        audio.export(temp_filename, format="wav")
-                        
-                        # Send to backend
-                        with open(temp_filename, "rb") as f:
-                            files = {"file": (temp_filename, f, "audio/wav")}
-                            res = requests.post(f"{API_URL}/audio/transcribe", files=files)
-                        
-                        # Cleanup
-                        import os
-                        if os.path.exists(temp_filename):
-                            os.remove(temp_filename)
-                            
-                        if res.status_code == 200:
-                            data = res.json()
-                            text = data.get("text", "")
-                            emotion = data.get("top_emotion", "neutral")
-                            
-                            # Set session state to trigger LLM flow below
-                            st.session_state.audio_input_text = text
-                            st.session_state.audio_input_emotion = emotion
-                            st.session_state.trigger_audio_send = True
-                            st.rerun()
-                        else:
-                            st.error(f"识别失败: {res.text}")
-                    except Exception as e:
-                        st.error(f"处理异常: {e}")
-                        
-    except ImportError:
-        st.warning("请安装 streamlit-audiorecorder 以使用麦克风功能。")
-        st.code("pip install streamlit-audiorecorder")
-
-    # Fallback / File Upload (Keep as option)
-    with st.expander("📂 上传音频文件 (备用)"):
-        audio_file = st.file_uploader("上传语音指令", type=["wav", "mp3", "m4a", "webm"])
-        if audio_file and st.button("🔄 识别文件"):
-             # ... (Same logic as before, omitted for brevity but could reuse)
-             pass
-
+   
 # ==========================================
 # 主界面 (Main Interface)
 # ==========================================
@@ -182,6 +120,7 @@ if prompt:
     
     # 调用 API
     with st.chat_message("assistant", avatar="🤖"):
+        st.markdown("**Reasoning (CoT):**") # Explicit header
         message_placeholder = st.empty()
         full_response = ""
         

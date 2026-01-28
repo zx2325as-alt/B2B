@@ -2,6 +2,9 @@
 chcp 65001 > nul
 setlocal enabledelayedexpansion
 
+:: Set Hugging Face Mirror for China
+set HF_ENDPOINT=https://hf-mirror.com
+
 echo ===================================================
 echo       BtB Deep Dialogue System - One-Click Start
 echo ===================================================

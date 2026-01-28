@@ -80,8 +80,10 @@ class VoiceProfileService:
         
         self.profiles[new_id] = {
             "name": new_name,
+            "character_name": None,  # Linked system character
             "fingerprint": fingerprint,
-            "created_at": time.time()
+            "created_at": time.time(),
+            "sample_count": 1
         }
         self._save_profiles()
         logger.info(f"Created new voice profile: {new_name}")
@@ -96,6 +98,47 @@ class VoiceProfileService:
             return True
         return False
 
+    def bind_character(self, speaker_id: str, character_name: str) -> bool:
+        """Bind a speaker profile to a system character."""
+        if speaker_id in self.profiles:
+            self.profiles[speaker_id]["character_name"] = character_name
+            # Also update display name if it was generic
+            if "Unknown Speaker" in self.profiles[speaker_id]["name"]:
+                self.profiles[speaker_id]["name"] = character_name
+            self._save_profiles()
+            return True
+        return False
+
+    def unbind_character(self, speaker_id: str) -> bool:
+        """Unbind a speaker profile from a system character."""
+        if speaker_id in self.profiles:
+            self.profiles[speaker_id]["character_name"] = None
+            self._save_profiles()
+            return True
+        return False
+
+    def calibrate_profile(self, speaker_id: str, new_fingerprint: List[float], weight: float = 0.3) -> bool:
+        """
+        Update speaker fingerprint with new data (Weighted Average).
+        weight: Importance of new data (0.0 - 1.0).
+        """
+        if speaker_id in self.profiles and new_fingerprint:
+            old_vec = np.array(self.profiles[speaker_id]["fingerprint"])
+            new_vec = np.array(new_fingerprint)
+            
+            if old_vec.shape != new_vec.shape:
+                return False
+                
+            # Weighted update: old * (1-w) + new * w
+            updated_vec = old_vec * (1 - weight) + new_vec * weight
+            
+            self.profiles[speaker_id]["fingerprint"] = updated_vec.tolist()
+            self.profiles[speaker_id]["sample_count"] = self.profiles[speaker_id].get("sample_count", 1) + 1
+            self._save_profiles()
+            logger.info(f"Calibrated profile for {speaker_id}")
+            return True
+        return False
+
     def delete_speaker(self, speaker_id: str) -> bool:
         """Delete a speaker profile."""
         if speaker_id in self.profiles:
@@ -107,5 +150,6 @@ class VoiceProfileService:
     def get_all_speakers(self) -> List[Dict]:
         """Get list of all speakers."""
         return [{"id": k, **v} for k, v in self.profiles.items()]
+
 
 import time
