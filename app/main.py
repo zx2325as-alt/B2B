@@ -16,6 +16,7 @@ from app.api.v1.scenarios import router as scenarios_router
 from app.api.v1.characters import router as characters_router
 from app.api.v1.feedback import router as feedback_router
 from app.api.v1.audio import router as audio_router
+from app.api.v1.stream import router as stream_router
 from app.services.scenario_service import scenario_service
 
 app = FastAPI(
@@ -27,6 +28,7 @@ app = FastAPI(
         {"name": "Scenarios", "description": "场景管理接口"},
         {"name": "Characters", "description": "角色与关系管理接口"},
         {"name": "Feedback", "description": "反馈与进化接口"},
+        {"name": "Realtime", "description": "实时音频流接口"},
     ]
 )
 
@@ -38,6 +40,7 @@ app.include_router(scenarios_router, prefix="/api/v1/scenarios", tags=["Scenario
 app.include_router(characters_router, prefix="/api/v1/characters", tags=["Characters"])
 app.include_router(audio_router, prefix="/api/v1", tags=["Audio"])
 app.include_router(feedback_router, prefix="/api/v1", tags=["Feedback"])
+app.include_router(stream_router, prefix="/api/v1", tags=["Realtime"])
 
 @app.on_event("startup")
 async def startup_event():

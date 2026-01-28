@@ -42,9 +42,22 @@ class Settings:
         
         # Models - ASR
         models_config = self._config.get("models") or {}
+        
+        # Global Model Directory
+        self.MODEL_DIR = self.BASE_DIR / "model"
+        self.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        
         asr_config = models_config.get("asr") or {}
         self.AUDIO_STT_MODEL_SIZE = asr_config.get("model_size") or audio_config.get("stt_model_size", "base")
         self.AUDIO_STT_COMPUTE_TYPE = asr_config.get("compute_type") or audio_config.get("stt_compute_type", "int8")
+        
+        # Model Paths (Centralized)
+        self.AUDIO_STT_MODEL_PATH = self.MODEL_DIR / f"faster-whisper-{self.AUDIO_STT_MODEL_SIZE}"
+        self.AUDIO_SER_MODEL_PATH = self.MODEL_DIR / "ser_model"
+        self.PYANNOTE_DIR = self.MODEL_DIR / "pyannote_diarization"
+        self.PYANNOTE_SEGMENTATION_DIR = self.MODEL_DIR / "pyannote_segmentation"
+        self.PYANNOTE_EMBEDDING_DIR = self.MODEL_DIR / "pyannote_embedding"
+        self.PYANNOTE_CONFIG_PATH = self.PYANNOTE_DIR / "config.yaml"
         
         # GPU
         gpu_config = self._config.get("gpu") or {}

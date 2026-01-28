@@ -33,6 +33,7 @@ class LLMService:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
+            "stream": False
         }
         if response_format:
             # Check if model supports response_format (Ollama support is limited)
@@ -60,8 +61,12 @@ class LLMService:
                     return ""
                     
                 response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
+                try:
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"]
+                except json.JSONDecodeError:
+                    logger.error(f"LLM Invalid JSON Response: {response.text}")
+                    return ""
         except httpx.ConnectError as e:
             logger.error(f"LLM Connection Failed: {e}. Check your network, proxy settings, or if Ollama is running.")
             return ""

@@ -90,6 +90,35 @@ class AnalysisLog(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class ConversationSegment(Base):
+    """
+    Real-time conversation segments.
+    """
+    __tablename__ = "conversation_segments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True) # Group segments into a session
+    
+    text = Column(Text)
+    speaker_id = Column(String, index=True) # Voice Profile ID
+    speaker_name = Column(String) # Display Name
+    character_id = Column(Integer, ForeignKey("characters.id"), nullable=True) # Mapped Character
+    
+    emotion = Column(JSON, default={}) # {label: score}
+    metrics = Column(JSON, default={}) # Pitch, energy, etc.
+    analysis = Column(JSON, default={}) # Deep analysis (Inner OS, Subtext)
+    
+    # Rating & Feedback
+    rating = Column(Integer, default=0) # 1-5
+    feedback = Column(Text, nullable=True)
+    
+    start_time = Column(Float, nullable=True) # Relative time in session
+    end_time = Column(Float, nullable=True)
+    
+    audio_path = Column(String, nullable=True) # Path to saved wav segment
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 class Character(Base):
     __tablename__ = "characters"
 

@@ -90,6 +90,54 @@ class VoiceProfileService:
         
         return new_id, new_name, True
 
+    def match_speaker(self, fingerprint: List[float], threshold: float = 0.85) -> Optional[Tuple[str, str, float]]:
+        """
+        Check if fingerprint matches any existing profile WITHOUT creating a new one.
+        Returns: (speaker_id, speaker_name, score) or None
+        """
+        if not fingerprint or len(fingerprint) == 0:
+            return None
+
+        query_vec = np.array(fingerprint)
+        best_score = -1.0
+        best_id = None
+        
+        for pid, data in self.profiles.items():
+            stored_vec = np.array(data["fingerprint"])
+            if stored_vec.shape != query_vec.shape:
+                continue
+                
+            norm_q = np.linalg.norm(query_vec)
+            norm_s = np.linalg.norm(stored_vec)
+            if norm_q == 0 or norm_s == 0:
+                continue
+                
+            score = np.dot(query_vec, stored_vec) / (norm_q * norm_s)
+            
+            if score > best_score:
+                best_score = score
+                best_id = pid
+        
+        if best_score >= threshold and best_id:
+            return best_id, self.profiles[best_id]["name"], float(best_score)
+            
+        return None
+
+    def create_profile(self, fingerprint: List[float], name_hint: str = None) -> Tuple[str, str]:
+        """Manually create a profile."""
+        new_id = f"speaker_{len(self.profiles) + 1}"
+        new_name = name_hint or f"Unknown Speaker {len(self.profiles) + 1}"
+        
+        self.profiles[new_id] = {
+            "name": new_name,
+            "character_name": None,
+            "fingerprint": fingerprint,
+            "created_at": time.time(),
+            "sample_count": 1
+        }
+        self._save_profiles()
+        return new_id, new_name
+
     def update_speaker_name(self, speaker_id: str, new_name: str) -> bool:
         """Update the name of a speaker."""
         if speaker_id in self.profiles:

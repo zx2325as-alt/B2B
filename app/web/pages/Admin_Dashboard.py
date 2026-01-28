@@ -381,67 +381,83 @@ with tab4:
     # B. 实时语音日志 (Realtime Voice Logs)
     # -------------------------------------------------------
     else:
-        st.info("正在监控实时语音分析流...")
+        st.info("正在监控实时语音分析流 (Live Stream)...")
         
-        # Load Logs
-        voice_logs = HistoryService.load_history(limit=50)
+        # 1. Fetch Segments
+        try:
+            res = requests.get(f"{API_URL}/segments", params={"limit": 50})
+            if res.status_code == 200:
+                segments = res.json()
+            else:
+                segments = []
+                st.error("Failed to fetch segments")
+        except Exception as e:
+            segments = []
+            st.error(f"Connection Error: {e}")
         
-        if not voice_logs:
-            st.warning("暂无语音日志。")
+        if not segments:
+            st.warning("暂无语音日志 (No Segments)。")
         else:
             # Metrics
-            total_logs = len(voice_logs)
-            rated_logs = [l for l in voice_logs if l.get("rating", 0) > 0]
-            avg_rating = sum([l["rating"] for l in rated_logs]) / len(rated_logs) if rated_logs else 0.0
+            total_logs = len(segments)
+            rated_logs = [s for s in segments if s.get("rating", 0) > 0]
+            avg_rating = sum([s["rating"] for s in rated_logs]) / len(rated_logs) if rated_logs else 0.0
             
             m1, m2 = st.columns(2)
-            m1.metric("总记录数", total_logs)
-            m2.metric("平均评分", f"{avg_rating:.1f} ⭐")
+            m1.metric("Total Segments", total_logs)
+            m2.metric("Avg Quality", f"{avg_rating:.1f} ⭐")
             
             st.divider()
             
-            # Display Logs (Reverse Order)
-            for i, log in enumerate(reversed(voice_logs)):
-                # Unique Key Base
-                log_id = log.get("id", f"log_{i}")
-                
-                with st.expander(f"[{log.get('timestamp')}] {log.get('speaker')} (Emotion: {log.get('emotion')})", expanded=(i==0)):
+            # Display Segments
+            if segments:
+                for seg in segments:
+                    # Color code emotion
+                    emotion = seg.get("emotion", {}) or {}
                     
-                    # 1. Basic Info & Correction
-                    c_info, c_edit = st.columns([1, 1])
-                    
-                    with c_info:
-                        st.markdown(f"**识别内容**: {log.get('text')}")
-                        st.caption(f"Latency: {log.get('latency')} | ID: {log_id}")
-                        
-                    with c_edit:
-                        # Correction UI
-                        new_text = st.text_input("修正内容", value=log.get("text"), key=f"mon_edit_{log_id}")
-                        if new_text != log.get("text"):
-                            if st.button("💾 保存修正", key=f"mon_save_{log_id}"):
-                                if HistoryService.update_log_text(log_id, new_text):
-                                    # Sync to backend feedback
-                                    try:
-                                        payload = {
-                                            "session_id": "monitor_correction",
-                                            "user_input": new_text,
-                                            "model_output": json.dumps(log.get("analysis", {})),
-                                            "rating": log.get("rating", 0),
-                                            "comment": f"Correction from: {log.get('text')}"
-                                        }
-                                        requests.post(f"{API_URL}/feedback/feedback", json=payload, timeout=5)
-                                    except: pass
-                                    st.success("已更新！")
-                                    st.rerun()
+                    with st.expander(f"🔊 [{seg.get('speaker_name')}] {seg.get('text', '')[:50]}...", expanded=False):
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.markdown(f"**Text:** {seg.get('text')}")
+                            st.caption(f"Time: {seg.get('created_at')} | Speaker ID: {seg.get('speaker_id')}")
+                            
+                            # Analysis Preview
+                            analysis = seg.get("analysis", {}) or {}
+                            if analysis.get("structured"):
+                                 st.json(analysis["structured"])
+                            if analysis.get("report"):
+                                 st.markdown("**Analysis Report:**")
+                                 st.markdown(analysis["report"])
+                                 
+                            st.json(emotion)
 
-                    # 2. Rating UI
-                    current_rating = log.get("rating", 0)
-                    rating = st.slider("评分", 0, 5, current_rating, key=f"mon_rate_{log_id}")
-                    if rating != current_rating:
-                        # Update File
-                        HistoryService.update_log_text(log_id, log.get("text"), rating)
+                        with col2:
+                            st.markdown("### 评分 (Rating)")
+                            curr_rating = seg.get("rating", 0)
+                            curr_feedback = seg.get("feedback", "")
+                            
+                            with st.form(f"rate_seg_{seg['id']}"):
+                                new_rating = st.slider("Rating", 1, 5, value=curr_rating if curr_rating > 0 else 3)
+                                new_feedback = st.text_area("Feedback", value=curr_feedback or "")
+                                
+                                if st.form_submit_button("Submit"):
+                                    try:
+                                        r = requests.post(
+                                            f"{API_URL}/segments/{seg['id']}/rate", 
+                                            params={"rating": new_rating, "feedback": new_feedback}
+                                        )
+                                        if r.status_code == 200:
+                                            st.success("Saved!")
+                                            time.sleep(0.5)
+                                            st.rerun()
+                                        else:
+                                            st.error(f"Failed: {r.text}")
+                                    except Exception as e:
+                                        st.error(f"Error: {e}")
+            else:
+                    st.info("No realtime segments found.")
                         # Sync Backend
-                        try:
+                    try:
                             payload = {
                                 "session_id": "monitor_rating",
                                 "user_input": log.get("text"),
@@ -451,7 +467,7 @@ with tab4:
                             }
                             requests.post(f"{API_URL}/feedback/feedback", json=payload, timeout=5)
                             st.toast(f"评分已同步: {rating}")
-                        except: pass
+                    except: pass
                         
                     # 3. Deep Analysis Inspection (Reuse Logic)
                     analysis = log.get("analysis", {})

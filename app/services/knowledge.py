@@ -1,4 +1,5 @@
 import os
+import sys
 import pickle
 from typing import List, Dict, Any
 
@@ -37,6 +38,38 @@ class KnowledgeService:
             
             # Configure Embedding Function (GPU if available)
             embedding_func = None
+            import torch
+
+            # 1. 再次确认基础状态（应与之前一致）
+            is_cuda_available = torch.cuda.is_available()
+            print(f"[状态] Python解释器路径: {sys.executable}")
+            print(f"[状态] CUDA是否可用: {is_cuda_available}")
+            
+            if is_cuda_available:
+                print(f"[状态] 当前CUDA工具包版本 (nvcc): 11.8")
+                print(f"[状态] 当前PyTorch使用的CUDA版本: {torch.version.cuda}")
+                print(f"[状态] 可用GPU数量: {torch.cuda.device_count()}")
+                try:
+                    print(f"[状态] 当前活动GPU: {torch.cuda.current_device()}")
+                    print(f"[状态] GPU名称: {torch.cuda.get_device_name()}")
+                except Exception as e:
+                    print(f"[状态] 获取GPU详细信息失败: {e}")
+            else:
+                print("[状态] 未检测到可用CUDA设备，系统将回退到CPU运行。如果这不是预期的，请检查您是否激活了正确的Conda环境。")
+
+            # 2. 尝试手动设置并测试GPU（核心步骤）
+            device = torch.device('cuda' if is_cuda_available else 'cpu')
+            print(f"\n[设置] 代码将尝试在设备上运行: {device}")
+
+            # 3. 一个简单的GPU张量运算测试
+            if is_cuda_available:
+                try:
+                    x = torch.randn(3, 3).cuda() # 创建并移动到GPU
+                    y = x * x
+                    print(f"[测试] GPU张量计算测试成功！")
+                    print(f"[测试] 张量所在设备: {x.device}")
+                except Exception as e:
+                    print(f"[测试] GPU测试失败，错误: {e}")
             try:
                 from chromadb.utils import embedding_functions
                 
@@ -47,11 +80,21 @@ class KnowledgeService:
                     else:
                         logger.warning("Settings requested CUDA but Torch reports it's unavailable. Falling back to CPU.")
 
+                # Determine model path (prefer local)
+                model_name_or_path = "all-MiniLM-L6-v2"
+                local_model_path = settings.MODEL_DIR / "sentence-transformers" / "all-MiniLM-L6-v2"
+                
+                if local_model_path.exists():
+                    logger.info(f"Loading embedding model from local path: {local_model_path}")
+                    model_name_or_path = str(local_model_path)
+                else:
+                    logger.info(f"Local embedding model not found at {local_model_path}, using default online model: {model_name_or_path}")
+
                 embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name="all-MiniLM-L6-v2",
+                    model_name=model_name_or_path,
                     device=device
                 )
-                logger.info(f"Initialized ChromaDB embedding function on {device}")
+                logger.info(f"Initialized ChromaDB embedding function on {device} with model {model_name_or_path}")
             except Exception as e:
                 logger.warning(f"Failed to init custom embedding function (using default): {e}")
             

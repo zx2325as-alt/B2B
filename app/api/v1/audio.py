@@ -1,7 +1,11 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Body, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from app.services.audio_service import audio_service
+from app.services.advanced_audio_service import AdvancedAudioService
 from app.utils.logger import logger
+
+advanced_audio_service = AdvancedAudioService()
+
 from pydantic import BaseModel
 import shutil
 import os
@@ -111,7 +115,8 @@ async def transcribe_with_diarization(
         vocals_path = audio_service.separate_vocals(str(temp_path))
             
         # 2. Process using the new method
-        result = audio_service.transcribe_with_diarization(vocals_path)
+        # result = audio_service.transcribe_with_diarization(vocals_path)
+        result = advanced_audio_service.process_full_pipeline(vocals_path)
         
         # Cleanup
         files_to_clean = [str(temp_path)]

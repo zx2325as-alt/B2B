@@ -69,10 +69,16 @@ class AudioService:
             if device.lower() == 'gpu':
                 device = 'cuda'
 
+            # Use local model path if available
+            model_path_or_size = str(settings.AUDIO_STT_MODEL_PATH)
+            if not settings.AUDIO_STT_MODEL_PATH.exists():
+                 logger.warning(f"Local Whisper model not found at {model_path_or_size}, falling back to size '{self.model_size}' (will download)")
+                 model_path_or_size = self.model_size
+
             try:
-                logger.info(f"Loading Whisper model ({self.model_size}) on {device}...")
+                logger.info(f"Loading Whisper model ({model_path_or_size}) on {device}...")
                 self._stt_model = WhisperModel(
-                    self.model_size, 
+                    model_path_or_size, 
                     device=device, 
                     compute_type=self.compute_type
                 )
@@ -83,7 +89,7 @@ class AudioService:
                     logger.info("Retrying with device='cpu'...")
                     try:
                         self._stt_model = WhisperModel(
-                            self.model_size, 
+                            model_path_or_size, 
                             device='cpu', 
                             compute_type="int8"  # Fallback to int8 for CPU
                         )
@@ -98,6 +104,28 @@ class AudioService:
     def _load_ser_model(self):
         if not HAS_SER or not settings.AUDIO_SER_ENABLED:
             return None
+            
+        if self._ser_pipeline is None:
+            try:
+                # Use local model path if available
+                model_path = str(settings.AUDIO_SER_MODEL_PATH)
+                if settings.AUDIO_SER_MODEL_PATH.exists():
+                     logger.info(f"Loading SER model from local path: {model_path}")
+                     model_to_load = model_path
+                else:
+                     logger.warning(f"Local SER model not found at {model_path}, falling back to huggingface ID '{settings.AUDIO_SER_MODEL}'")
+                     model_to_load = settings.AUDIO_SER_MODEL
+
+                # Use device=0 for GPU if available and requested
+                device = 0 if settings.AUDIO_STT_DEVICE in ["cuda", "gpu"] else -1
+                self._ser_pipeline = pipeline("audio-classification", model=model_to_load, device=device)
+                logger.info(f"SER model loaded successfully on device {device}.")
+            except Exception as e:
+                logger.error(f"Failed to load SER model: {e}")
+                # Disable SER to prevent future timeouts
+                self._ser_pipeline = None
+                return None
+        return self._ser_pipeline
 
     def separate_vocals(self, audio_path: str) -> str:
         """
@@ -149,33 +177,6 @@ class AudioService:
         except Exception as e:
             logger.error(f"Error during vocal separation: {e}")
             return audio_path
-
-        
-        if self._ser_pipeline is None:
-            try:
-                model_name = settings.AUDIO_SER_MODEL
-                
-                # Check for local path first if model_name looks like a path or generic name
-                local_path = settings.DATA_DIR / "models" / "ser" / model_name.replace("/", "_")
-                if local_path.exists():
-                    logger.info(f"Loading SER model from local path: {local_path}")
-                    model_to_load = str(local_path)
-                else:
-                    logger.info(f"Loading SER model ({model_name})...")
-                    model_to_load = model_name
-
-                # Try loading with offline mode first if possible, but pipeline doesn't strictly enforce it via kwarg easily without model_kwargs
-                # We'll just wrap it in try-except for connection errors
-                # Use device=0 for GPU if available and requested
-                device = 0 if settings.AUDIO_STT_DEVICE in ["cuda", "gpu"] else -1
-                self._ser_pipeline = pipeline("audio-classification", model=model_to_load, device=device)
-                logger.info(f"SER model loaded successfully on device {device}.")
-            except Exception as e:
-                logger.error(f"Failed to load SER model: {e}")
-                # Disable SER to prevent future timeouts
-                self._ser_pipeline = None
-                return None
-        return self._ser_pipeline
 
     def detect_emotion(self, audio_path: str) -> Dict[str, float]:
         """
@@ -307,6 +308,7 @@ class AudioService:
         """
         Transcribe audio with speaker diarization (segment-level identification).
         Returns a structured transcript with speaker labels.
+        Uses Clustering to improve consistency within the session.
         """
         if not HAS_WHISPER:
             return {"text": "", "error": "STT module not installed"}
@@ -317,6 +319,10 @@ class AudioService:
             
         try:
             import librosa
+            import numpy as np
+            from sklearn.cluster import AgglomerativeClustering
+            from sklearn.metrics.pairwise import cosine_distances
+
             # Load full audio once for slicing
             y_full, sr = librosa.load(audio_path, sr=None)
             duration_total = librosa.get_duration(y=y_full, sr=sr)
@@ -326,17 +332,32 @@ class AudioService:
         try:
             # Transcribe
             # Force Simplified Chinese output
+            # Enable VAD filter to prevent hallucinations on silent audio
+            # Disable condition_on_previous_text to prevent repetitive loops
             segments, info = model.transcribe(
                 audio_path, 
                 beam_size=settings.AUDIO_BEAM_SIZE, 
                 language="zh", 
-                initial_prompt=settings.AUDIO_INITIAL_PROMPT
+                initial_prompt=settings.AUDIO_INITIAL_PROMPT,
+                condition_on_previous_text=False,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
             )
             
-            diarized_segments = []
-            detected_speakers = set()
+            # 1. Collect Segments & Fingerprints
+            temp_segments = [] # List of dicts
+            fingerprints = []
+            valid_indices = [] # Indices in temp_segments that have fingerprints
             
-            for segment in segments:
+            # Known Hallucination Phrases to filter
+            HALLUCINATION_PHRASES = ["请不吝点赞", "订阅", "转发", "打赏支持", "明镜与点点", "字幕", "Amara.org"]
+
+            for i, segment in enumerate(segments):
+                # Hallucination Filter
+                if any(phrase in segment.text for phrase in HALLUCINATION_PHRASES):
+                    # logger.warning(f"Filtered hallucination: {segment.text}")
+                    continue
+
                 # Calculate start/end samples
                 start_sample = int(segment.start * sr)
                 end_sample = int(segment.end * sr)
@@ -344,31 +365,90 @@ class AudioService:
                 # Slice audio
                 y_seg = y_full[start_sample:end_sample]
                 
-                # Identify Speaker
-                speaker_id = "unknown"
-                speaker_name = "Unknown"
+                # Get Fingerprint
+                fp = self.get_voice_fingerprint(y_data=y_seg, sr_rate=sr)
                 
-                fingerprint = self.get_voice_fingerprint(y_data=y_seg, sr_rate=sr)
-                if fingerprint:
-                    speaker_id, speaker_name, is_new = self.voice_profile_service.identify_speaker(fingerprint)
-                    detected_speakers.add((speaker_id, speaker_name))
-                
-                diarized_segments.append({
+                seg_data = {
                     "start": segment.start,
                     "end": segment.end,
                     "text": segment.text,
-                    "speaker_id": speaker_id,
-                    "speaker_name": speaker_name
-                })
+                    "speaker_id": "unknown",
+                    "speaker_name": "Unknown"
+                }
+                
+                temp_segments.append(seg_data)
+                
+                if fp is not None:
+                    fingerprints.append(fp)
+                    valid_indices.append(i)
+            
+            detected_speakers = set()
+            
+            # 2. Clustering Logic
+            if len(fingerprints) > 0:
+                X = np.array(fingerprints)
+                
+                # If very few segments, just match directly
+                if len(fingerprints) < 2:
+                    labels = [0]
+                    n_clusters = 1
+                else:
+                    # Clustering
+                    # Distance threshold 0.5 roughly corresponds to cosine sim 0.5
+                    # But for speaker ID, usually 0.2-0.3 distance (0.8-0.7 sim) is a cut-off.
+                    # VoiceProfile uses 0.85 sim => 0.15 distance.
+                    # Let's use a slightly looser clustering threshold (e.g. 0.3) to group same speaker
+                    try:
+                        clustering = AgglomerativeClustering(
+                            n_clusters=None,
+                            metric='cosine', 
+                            linkage='average',
+                            distance_threshold=0.3  # Cosine distance
+                        ).fit(X)
+                        labels = clustering.labels_
+                        n_clusters = clustering.n_clusters_
+                    except Exception as cluster_err:
+                        logger.warning(f"Clustering failed: {cluster_err}, falling back to single cluster")
+                        labels = [0] * len(fingerprints)
+                        n_clusters = 1
+                
+                # 3. Process Clusters
+                cluster_map = {} # cluster_id -> (speaker_id, speaker_name)
+                
+                for k in range(n_clusters):
+                    # Get all fingerprints in this cluster
+                    cluster_indices = [idx for idx, label in enumerate(labels) if label == k]
+                    cluster_fps = X[cluster_indices]
+                    
+                    # Compute centroid (mean)
+                    centroid = np.mean(cluster_fps, axis=0).tolist()
+                    
+                    # Match against DB
+                    match = self.voice_profile_service.match_speaker(centroid, threshold=0.80)
+                    
+                    if match:
+                        s_id, s_name, _ = match
+                    else:
+                        # Create new profile for this cluster
+                        s_id, s_name = self.voice_profile_service.create_profile(centroid)
+                        
+                    cluster_map[k] = (s_id, s_name)
+                    detected_speakers.add((s_id, s_name))
+                
+                # 4. Assign back to segments
+                for idx, label in zip(valid_indices, labels):
+                    s_id, s_name = cluster_map[label]
+                    temp_segments[idx]["speaker_id"] = s_id
+                    temp_segments[idx]["speaker_name"] = s_name
             
             # Construct full formatted text
             full_formatted_text = ""
-            for seg in diarized_segments:
+            for seg in temp_segments:
                 full_formatted_text += f"【{seg['speaker_name']}】: {seg['text']}\n"
-                
+            
             return {
-                "text": full_formatted_text, # Formatted for text area
-                "raw_segments": diarized_segments,
+                "text": full_formatted_text, 
+                "raw_segments": temp_segments,
                 "detected_speakers": [{"id": s[0], "name": s[1]} for s in list(detected_speakers)],
                 "language": info.language,
                 "duration": duration_total

@@ -24,8 +24,8 @@ app:
 # ==========================================
 audio:
   # STT (Whisper)
-  stt_model_size: "base"      # tiny, base, small, medium, large
-  stt_compute_type: "int8"    # float16, int8_float16, int8
+  stt_model_size: "large"      # tiny, base, small, medium, large
+  stt_compute_type: "float16"    # float16, int8_float16, int8
   beam_size: 5
   initial_prompt: "以下是简体中文的对话。"
   
