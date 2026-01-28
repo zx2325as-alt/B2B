@@ -98,6 +98,58 @@ class AudioService:
     def _load_ser_model(self):
         if not HAS_SER or not settings.AUDIO_SER_ENABLED:
             return None
+
+    def separate_vocals(self, audio_path: str) -> str:
+        """
+        Use Demucs to separate vocals from background music.
+        Returns the path to the separated vocals file.
+        If separation fails or is skipped, returns the original path.
+        """
+        try:
+            import subprocess
+            import shutil
+            
+            # Check if demucs is installed
+            if not shutil.which("demucs") and not shutil.which("demucs.exe"):
+                # Try python -m demucs
+                cmd_base = ["python", "-m", "demucs"]
+            else:
+                cmd_base = ["demucs"]
+
+            output_dir = self.audio_dir / "separated"
+            output_dir.mkdir(exist_ok=True)
+            
+            logger.info(f"Starting vocal separation for: {audio_path}")
+            
+            # Run Demucs
+            # -n htdemucs_ft : High quality model
+            # --two-stems=vocals : Only separate vocals and others
+            cmd = cmd_base + ["-n", "htdemucs_ft", "--two-stems=vocals", "-o", str(output_dir), audio_path]
+            
+            # Use subprocess to run
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                logger.error(f"Demucs separation failed: {process.stderr}")
+                return audio_path
+                
+            # Construct expected output path
+            # Demucs structure: output_dir / model_name / track_name / vocals.wav
+            filename = Path(audio_path).stem
+            model_name = "htdemucs_ft"
+            vocals_path = output_dir / model_name / filename / "vocals.wav"
+            
+            if vocals_path.exists():
+                logger.info(f"Vocal separation successful: {vocals_path}")
+                return str(vocals_path)
+            else:
+                logger.warning(f"Expected separated file not found: {vocals_path}")
+                return audio_path
+                
+        except Exception as e:
+            logger.error(f"Error during vocal separation: {e}")
+            return audio_path
+
         
         if self._ser_pipeline is None:
             try:
@@ -169,11 +221,6 @@ class AudioService:
         try:
             import librosa
             import numpy as np
-            # Force soundfile backend if available to avoid pydub/ffmpeg dependency for WAV
-            try:
-                import soundfile
-            except ImportError:
-                pass
             
             y, sr = librosa.load(audio_path, sr=None)
             
@@ -217,16 +264,27 @@ class AudioService:
             logger.error(f"Feature extraction error: {e}")
             return {}
 
-    def get_voice_fingerprint(self, audio_path: str) -> Optional[list]:
+    def get_voice_fingerprint(self, audio_path: str = None, y_data: Any = None, sr_rate: int = None) -> Optional[list]:
         """
         Get voice fingerprint for speaker ID.
-        Uses MFCC + Delta + Delta-Delta (39-dim vector) for better robustness.
+        Uses MFCC + Delta + Delta-Delta (39-dim vector).
+        Can accept either audio_path or (y_data, sr_rate).
         """
         try:
             import librosa
             import numpy as np
-            y, sr = librosa.load(audio_path, sr=None)
             
+            if y_data is not None and sr_rate is not None:
+                y, sr = y_data, sr_rate
+            elif audio_path:
+                y, sr = librosa.load(audio_path, sr=None)
+            else:
+                return None
+            
+            # Ensure minimum length for MFCC (at least 2048 samples usually)
+            if len(y) < 2048:
+                return None
+
             # 1. MFCC
             mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
             
@@ -242,8 +300,93 @@ class AudioService:
             fingerprint = np.mean(combined, axis=1).tolist()
             return fingerprint
         except Exception as e:
-            logger.error(f"Fingerprint error: {e}")
+            # logger.error(f"Fingerprint error: {e}") # Reduce log spam for short segments
             return None
+
+    def transcribe_with_diarization(self, audio_path: str) -> Dict[str, Any]:
+        """
+        Transcribe audio with speaker diarization (segment-level identification).
+        Returns a structured transcript with speaker labels.
+        """
+        if not HAS_WHISPER:
+            return {"text": "", "error": "STT module not installed"}
+
+        model = self._load_stt_model()
+        if not model:
+            return {"text": "", "error": "Model failed to load"}
+            
+        try:
+            import librosa
+            # Load full audio once for slicing
+            y_full, sr = librosa.load(audio_path, sr=None)
+            duration_total = librosa.get_duration(y=y_full, sr=sr)
+        except Exception as e:
+            return {"text": "", "error": f"Audio load failed: {e}"}
+
+        try:
+            # Transcribe
+            # Force Simplified Chinese output
+            segments, info = model.transcribe(
+                audio_path, 
+                beam_size=settings.AUDIO_BEAM_SIZE, 
+                language="zh", 
+                initial_prompt=settings.AUDIO_INITIAL_PROMPT
+            )
+            
+            diarized_segments = []
+            detected_speakers = set()
+            
+            for segment in segments:
+                # Calculate start/end samples
+                start_sample = int(segment.start * sr)
+                end_sample = int(segment.end * sr)
+                
+                # Slice audio
+                y_seg = y_full[start_sample:end_sample]
+                
+                # Identify Speaker
+                speaker_id = "unknown"
+                speaker_name = "Unknown"
+                
+                fingerprint = self.get_voice_fingerprint(y_data=y_seg, sr_rate=sr)
+                if fingerprint:
+                    speaker_id, speaker_name, is_new = self.voice_profile_service.identify_speaker(fingerprint)
+                    detected_speakers.add((speaker_id, speaker_name))
+                
+                diarized_segments.append({
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text,
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name
+                })
+            
+            # Construct full formatted text
+            full_formatted_text = ""
+            for seg in diarized_segments:
+                full_formatted_text += f"【{seg['speaker_name']}】: {seg['text']}\n"
+                
+            return {
+                "text": full_formatted_text, # Formatted for text area
+                "raw_segments": diarized_segments,
+                "detected_speakers": [{"id": s[0], "name": s[1]} for s in list(detected_speakers)],
+                "language": info.language,
+                "duration": duration_total
+            }
+
+        except Exception as e:
+            error_str = str(e)
+            logger.error(f"Diarization error: {e}")
+            
+            # Automatic Fallback for CUDA/DLL errors
+            if ("dll" in error_str.lower() or "library" in error_str.lower() or "cuda" in error_str.lower()) and self.device != "cpu":
+                logger.warning(f"CUDA/DLL error detected ({e}). Switching to CPU mode and retrying...")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self._stt_model = None # Force reload
+                return self.transcribe_with_diarization(audio_path) # Recursive retry
+                
+            return {"text": "", "error": str(e)}
 
     def transcribe(self, audio_path: str) -> Dict[str, Any]:
         """
@@ -334,7 +477,10 @@ class AudioService:
             return None
 
     def get_available_voices(self) -> list:
-        # Common EdgeTTS voices
+        if settings.AUDIO_TTS_VOICES:
+            return settings.AUDIO_TTS_VOICES
+            
+        # Common EdgeTTS voices fallback
         return [
             {"id": "zh-CN-XiaoxiaoNeural", "name": "Xiaoxiao (Female, Warm)", "lang": "zh-CN"},
             {"id": "zh-CN-YunxiNeural", "name": "Yunxi (Male, Calm)", "lang": "zh-CN"},

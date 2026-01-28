@@ -10,7 +10,7 @@ API 端点定义 (API Endpoints)
 5. 日志查询 (Log Querying): 获取历史对话记录。
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Body
 from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 from app.core.database import get_db
 from app.models.schemas import DialogueInput, NLUOutput, CharacterFeedbackInput
-from app.models.sql_models import DialogueLog, Relationship, Scenario, ConversationSession, CharacterFeedback, CharacterVersion, AnalysisLog
+from app.models.sql_models import DialogueLog, Relationship, Scenario, ConversationSession, CharacterFeedback, CharacterVersion, AnalysisLog, FeedbackLog
 from app.core.engine import nlu_engine
 from app.services.knowledge import knowledge_service
 from app.services.user_profile import user_service
@@ -744,6 +744,39 @@ def get_analysis_history(
     if limit > 0:
         return query.limit(limit).all()
     return query.all()
+
+@router.post("/analysis/logs/{log_id}/rate", summary="评价长对话分析结果")
+def rate_analysis_log(
+    log_id: int,
+    rating: int = Body(..., embed=True, ge=1, le=5),
+    db: Session = Depends(get_db)
+):
+    """
+    对分析记录进行打分 (Rate Analysis Log).
+    更新 AnalysisLog.structured_data 中的 rating 字段。
+    """
+    log = db.query(AnalysisLog).filter(AnalysisLog.id == log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Log not found")
+    
+    # Update structured_data
+    # Note: modifying JSON in place might not trigger update in some ORMs unless reassigned
+    data = dict(log.structured_data) if log.structured_data else {}
+    data["rating"] = rating
+    log.structured_data = data
+    
+    # Also create a FeedbackLog for record keeping
+    feedback = FeedbackLog(
+        session_id=log.session_id or "unknown",
+        user_input=log.text_content[:500] if log.text_content else "",
+        model_output=log.summary or "",
+        rating=rating,
+        comment="Rated from Dashboard"
+    )
+    db.add(feedback)
+    
+    db.commit()
+    return {"status": "success", "rating": rating}
 
 from app.services.character_observation_service import character_observation_service
 

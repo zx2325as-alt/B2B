@@ -32,6 +32,10 @@ st.set_page_config(page_title="长对话分析", page_icon="📜", layout="wide"
 st.title("📜 长对话深度分析与归档")
 st.markdown("---")
 
+# Initialize session state
+if "input_text_content" not in st.session_state:
+    st.session_state.input_text_content = ""
+
 # Sidebar: Character Selection
 st.sidebar.header("已知角色 (Known Characters)")
 characters = []
@@ -55,16 +59,173 @@ selected_char_names = st.sidebar.multiselect(
 st.subheader("📝 输入长对话内容 (Input Conversation)")
 st.caption("支持粘贴大段对话记录、小说片段或工作日志。系统将自动区分角色并分析重点。")
 
-# File Uploader
-uploaded_file = st.file_uploader("或上传文件 (.txt, .md)", type=["txt", "md"])
-file_content = ""
-if uploaded_file is not None:
-    try:
-        file_content = uploaded_file.read().decode("utf-8")
-    except Exception as e:
-        st.error(f"文件读取失败: {e}")
+# Initialize text area state if not exists
+if "input_text_content" not in st.session_state:
+    st.session_state.input_text_content = ""
 
-text_input = st.text_area("在此粘贴内容...", value=file_content, height=300)
+# File Uploader
+uploaded_file = st.file_uploader("上传文件 (支持 .txt, .md 文本; .wav, .mp3, .m4a 音频; .mp4, .mov, .avi, .mkv 视频)", type=["txt", "md", "wav", "mp3", "m4a", "mp4", "mov", "avi", "mkv"])
+
+if uploaded_file is not None:
+    file_ext = uploaded_file.name.split('.')[-1].lower()
+    
+    # Case 1: Text File
+    if file_ext in ['txt', 'md']:
+        try:
+            # Read and update state immediately
+            content = uploaded_file.read().decode("utf-8")
+            if content != st.session_state.input_text_content:
+                st.session_state.input_text_content = content
+                st.rerun()
+        except Exception as e:
+            st.error(f"文件读取失败: {e}")
+            
+    # Case 2: Audio File
+    elif file_ext in ['wav', 'mp3', 'm4a']:
+        st.info(f"🎤 已上传音频文件: {uploaded_file.name}")
+        
+        # Transcribe Button
+        if st.button("🎙️ 开始语音识别与角色区分 (Start Analysis)", type="primary"):
+            with st.spinner("正在进行语音转文字及声纹分析... (可能需要几分钟)"):
+                try:
+                    # Reset file pointer
+                    uploaded_file.seek(0)
+                    files = {"file": (uploaded_file.name, uploaded_file, uploaded_file.type)}
+                    res = requests.post(f"{API_URL}/audio/diarization", files=files)
+                    
+                    if res.status_code == 200:
+                        st.session_state.diarization_result = res.json()
+                        st.success("识别完成！请在下方确认角色身份。")
+                    else:
+                        st.error(f"识别失败: {res.text}")
+                except Exception as e:
+                    st.error(f"Request Error: {e}")
+
+    # Case 3: Video File
+    elif file_ext in ['mp4', 'mov', 'avi', 'mkv']:
+        st.info(f"🎥 已上传视频文件: {uploaded_file.name}")
+        
+        if st.button("🎬 提取音频并开始识别 (Extract & Analyze)", type="primary"):
+            with st.spinner("正在提取音频并进行分析..."):
+                try:
+                    import tempfile
+                    from app.utils.readvoice import extract_audio_ffmpeg
+                    from pathlib import Path
+                    
+                    # 1. Save uploaded video to temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp_video:
+                        tmp_video.write(uploaded_file.getvalue())
+                        tmp_video_path = tmp_video.name
+                    
+                    try:
+                        # 2. Extract Audio
+                        output_dir = Path(tempfile.gettempdir())
+                        success, _, audio_path = extract_audio_ffmpeg(tmp_video_path, output_dir, audio_format="wav")
+                        
+                        if not success:
+                            st.error(f"音频提取失败: {audio_path}")
+                        else:
+                            st.success(f"音频提取成功: {Path(audio_path).name}")
+                            
+                            # 3. Call Diarization API
+                            with open(audio_path, "rb") as f:
+                                files = {"file": (f"{uploaded_file.name}.wav", f, "audio/wav")}
+                                res = requests.post(f"{API_URL}/audio/diarization", files=files)
+                            
+                            if res.status_code == 200:
+                                st.session_state.diarization_result = res.json()
+                                st.success("识别完成！请在下方确认角色身份。")
+                            else:
+                                st.error(f"识别失败: {res.text}")
+                            
+                            # Cleanup audio
+                            try:
+                                os.remove(audio_path)
+                            except:
+                                pass
+                                
+                    finally:
+                        # Cleanup video
+                        try:
+                            os.remove(tmp_video_path)
+                        except:
+                            pass
+                            
+                except Exception as e:
+                    st.error(f"处理异常: {e}")
+
+        # Display Diarization Result & Mapping UI
+        if "diarization_result" in st.session_state:
+            d_res = st.session_state.diarization_result
+            speakers = d_res.get("detected_speakers", [])
+            
+            with st.expander("🗣️ 角色身份确认 (Speaker Identification)", expanded=True):
+                st.markdown("##### 请为检测到的说话人指定角色")
+                
+                with st.form("speaker_mapping_form"):
+                    mappings = {}
+                    cols = st.columns(2)
+                    
+                    # Prepare options
+                    # Filter out "我" from characters list to avoid duplication if it's there
+                    char_names = [c["name"] for c in characters]
+                    options = ["不指定 (Unknown)", "新建角色..."] + char_names
+                    
+                    for idx, spk in enumerate(speakers):
+                        spk_id = spk["id"]
+                        spk_name = spk["name"]
+                        
+                        with cols[idx % 2]:
+                            st.markdown(f"**🔊 {spk_name}**")
+                            
+                            # Smart Default: Try to match if name exists
+                            default_idx = 0
+                            if spk_name in char_names:
+                                default_idx = options.index(spk_name)
+                            
+                            sel_key = f"sel_{spk_id}"
+                            txt_key = f"txt_{spk_id}"
+                            
+                            selected = st.selectbox("映射为:", options, index=default_idx, key=sel_key)
+                            
+                            custom_name = ""
+                            if selected == "新建角色...":
+                                custom_name = st.text_input("输入新名称:", key=txt_key)
+                            
+                            mappings[spk_id] = (selected, custom_name)
+                    
+                    st.markdown("---")
+                    if st.form_submit_button("✅ 应用映射并生成文本"):
+                        # Apply mapping to segments
+                        raw_segments = d_res.get("raw_segments", [])
+                        final_text = ""
+                        
+                        for seg in raw_segments:
+                            sid = seg["speaker_id"]
+                            sname = seg["speaker_name"]
+                            
+                            if sid in mappings:
+                                sel, cust = mappings[sid]
+                                if sel == "新建角色..." and cust:
+                                    sname = cust
+                                elif sel != "不指定 (Unknown)":
+                                    sname = sel
+                            
+                            final_text += f"【{sname}】: {seg['text']}\n"
+                        
+                        # Update main text area
+                        st.session_state.input_text_content = final_text
+                        # Clear diarization result to hide the mapping UI (optional, but cleaner)
+                        # del st.session_state.diarization_result 
+                        st.rerun()
+
+text_input = st.text_area("在此粘贴内容...", value=st.session_state.input_text_content, height=300, key="main_text_area")
+
+# Sync manual edits back to state (Streamlit widgets with key update state automatically, 
+# but we need to ensure our custom state variable tracks it if we used a separate one. 
+# Here we used `input_text_content` as the initial value, but `key="main_text_area"` stores the current value in `st.session_state.main_text_area`.
+# To keep them in sync for the next rerun if we manipulate `input_text_content` again:
+st.session_state.input_text_content = st.session_state.main_text_area
 
 if st.button("开始分析 (Start Analysis)", type="primary"):
     if not text_input:
@@ -191,10 +352,26 @@ if "analysis_result" in st.session_state:
                 # Find the character ID if it exists in our DB
                 char_obj = char_options.get(char_name)
                 
+                # If not found, allow manual selection
+                if not char_obj:
+                    st.warning(f"⚠️ 系统未找到名为 '{char_name}' 的角色档案。")
+                    col_sel, col_new = st.columns([2, 1])
+                    with col_sel:
+                        manual_name = st.selectbox(
+                            f"将其归档到现有角色 (For '{char_name}'):", 
+                            ["-- 请选择 --"] + list(char_options.keys()),
+                            key=f"manual_sel_{i}"
+                        )
+                        if manual_name != "-- 请选择 --":
+                            char_obj = char_options.get(manual_name)
+                    
                 st.markdown("---")
                 if char_obj:
+                    # Update name for display if manually selected
+                    target_name = char_obj['name']
+                    
                     btn_key = f"archive_btn_{char_obj['id']}_{i}"
-                    if st.button(f"📥 归档到 {char_name}", key=btn_key):
+                    if st.button(f"📥 归档到 [{target_name}]", key=btn_key):
                         # Logic to update character profile
                         # 1. Prepare Base Data
                         current_dyn = char_obj.get("dynamic_profile", {}) or {}

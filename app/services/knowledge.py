@@ -1,11 +1,18 @@
+import os
+import pickle
+from typing import List, Dict, Any
+
+# Fix for Windows: Import torch before chromadb to avoid DLL conflicts (CUDA initialization error)
+try:
+    import torch
+except ImportError:
+    torch = None
+
 try:
     import chromadb
 except ImportError:
     chromadb = None
 
-import pickle
-import os
-from typing import List, Dict, Any
 from app.utils.logger import logger
 from app.core.config import settings
 from app.utils.text_utils import SimpleBM25
@@ -32,8 +39,14 @@ class KnowledgeService:
             embedding_func = None
             try:
                 from chromadb.utils import embedding_functions
-                # Try to use CUDA if available
-                device = "cuda" if settings.AUDIO_STT_DEVICE == "cuda" else "cpu"
+                
+                device = "cpu"
+                if settings.AUDIO_STT_DEVICE == "cuda":
+                    if torch and torch.cuda.is_available():
+                        device = "cuda"
+                    else:
+                        logger.warning("Settings requested CUDA but Torch reports it's unavailable. Falling back to CPU.")
+
                 embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
                     model_name="all-MiniLM-L6-v2",
                     device=device

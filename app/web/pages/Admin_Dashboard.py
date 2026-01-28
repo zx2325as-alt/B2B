@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.utils.history_utils import HistoryService
 from app.services.voice_profile import VoiceProfileService
 import datetime
+import time
 
 # ==========================================
 # 配置与初始化 (Configuration & Initialization)
@@ -176,7 +177,7 @@ with tab4:
     # Source Selection
     monitor_source = st.radio(
         "选择监控数据源", 
-        ["💬 聊天对话日志 (Chat Logs)", "🎙️ 实时语音日志 (Realtime Voice Logs)"],
+        ["💬 聊天对话日志 (Chat Logs)", "🎙️ 实时语音日志 (Realtime Voice Logs)", "📜 长对话分析记录 (Long Conversation Logs)"],
         horizontal=True
     )
     
@@ -303,6 +304,79 @@ with tab4:
         except Exception as e:
             st.error(f"连接错误: {e}")
             
+    # -------------------------------------------------------
+    # C. 长对话分析记录 (Long Conversation Logs)
+    # -------------------------------------------------------
+    elif "Long Conversation Logs" in monitor_source:
+        st.markdown("在此查看和评价长对话分析的归档记录。")
+        
+        # 1. Fetch
+        try:
+            res = requests.get(f"{API_URL}/analysis/history", params={"limit": 50})
+            if res.status_code == 200:
+                logs = res.json()
+                
+                if not logs:
+                    st.info("暂无分析记录")
+                else:
+                    # Metrics
+                    rated_logs = [l for l in logs if l.get('structured_data', {}).get('rating', 0) > 0]
+                    avg_rating = sum([l['structured_data']['rating'] for l in rated_logs]) / len(rated_logs) if rated_logs else 0.0
+                    
+                    st.markdown("### 📈 核心指标 (Core Metrics)")
+                    m1, m2 = st.columns(2)
+                    m1.metric("记录总数 (Total)", len(logs))
+                    m2.metric("平均评分 (Avg Rating)", f"{avg_rating:.1f} ⭐")
+                    st.divider()
+                    
+                    # Display
+                    for log in logs:
+                        s_data = log.get('structured_data', {}) or {}
+                        rating = s_data.get('rating', 0)
+                        
+                        with st.expander(f"📝 [{log['created_at'][:16]}] {log.get('summary', '')[:50]}...", expanded=False):
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.markdown(f"**Log ID**: {log['id']} | **Time**: {log['created_at']}")
+                                st.markdown(f"**摘要**: {log.get('summary', 'N/A')}")
+                                st.markdown(f"**参与角色**: {log.get('character_names', [])}")
+                                
+                                # Structured Data Preview
+                                if s_data.get("character_analysis"):
+                                    st.markdown("**角色分析概览**:")
+                                    for char_a in s_data["character_analysis"]:
+                                        c_name = char_a.get("name", "Unknown")
+                                        c_intent = char_a.get("deep_intent", "N/A")
+                                        st.caption(f"- {c_name}: {c_intent}")
+
+                                st.markdown("**完整分析报告**:")
+                                with st.container(height=300):
+                                    st.markdown(log.get('markdown_report', ''))
+
+                                if st.checkbox("显示完整数据 (Raw & JSON)", key=f"show_raw_{log['id']}"):
+                                     st.text_area("原始内容", log.get('text_content', ''), height=200)
+                                     st.json(s_data)
+                                
+                            with col2:
+                                st.markdown("### 评分")
+                                new_rating = st.slider("Rating", 1, 5, value=rating if rating > 0 else 3, key=f"lc_rate_{log['id']}")
+                                if st.button("提交评分", key=f"btn_lc_{log['id']}"):
+                                    try:
+                                        r = requests.post(f"{API_URL}/analysis/logs/{log['id']}/rate", json={"rating": new_rating})
+                                        if r.status_code == 200:
+                                            st.success("评分已更新")
+                                            time.sleep(0.5)
+                                            st.rerun()
+                                        else:
+                                            st.error("更新失败")
+                                    except Exception as e:
+                                        st.error(f"Error: {e}")
+                                        
+            else:
+                st.error("获取数据失败")
+        except Exception as e:
+            st.error(f"Connection Error: {e}")
+
     # -------------------------------------------------------
     # B. 实时语音日志 (Realtime Voice Logs)
     # -------------------------------------------------------

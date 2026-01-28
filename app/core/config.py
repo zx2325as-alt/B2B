@@ -32,6 +32,14 @@ class Settings:
         self.AUDIO_CHANNELS = audio_config.get("channels", 1)
         self.AUDIO_CHUNK_SIZE = audio_config.get("chunk_size", 1024)
         
+        self.AUDIO_BEAM_SIZE = audio_config.get("beam_size", 5)
+        self.AUDIO_INITIAL_PROMPT = audio_config.get("initial_prompt", "以下是简体中文的对话。")
+        self.AUDIO_TTS_DEFAULT_VOICE = audio_config.get("default_voice", "zh-CN-XiaoxiaoNeural")
+        self.AUDIO_TTS_VOICES = audio_config.get("available_voices", [])
+        
+        self.AUDIO_SER_ENABLED = audio_config.get("ser_enabled", True)
+        self.AUDIO_SER_MODEL = audio_config.get("ser_model", "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition")
+        
         # Models - ASR
         models_config = self._config.get("models") or {}
         asr_config = models_config.get("asr") or {}

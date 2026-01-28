@@ -20,7 +20,35 @@ app:
   default_scenario: "深度对话理解与个性化翻译中枢" 
 
 # ==========================================
-# 2. 服务器与端口配置 (Server & Ports)
+# 2. 音频处理配置 (Audio Settings)
+# ==========================================
+audio:
+  # STT (Whisper)
+  stt_model_size: "base"      # tiny, base, small, medium, large
+  stt_compute_type: "int8"    # float16, int8_float16, int8
+  beam_size: 5
+  initial_prompt: "以下是简体中文的对话。"
+  
+  # TTS (Edge-TTS)
+  default_voice: "zh-CN-XiaoxiaoNeural"
+  available_voices:
+    - {id: "zh-CN-XiaoxiaoNeural", name: "Xiaoxiao (Female, Warm)", lang: "zh-CN"}
+    - {id: "zh-CN-YunxiNeural", name: "Yunxi (Male, Calm)", lang: "zh-CN"}
+    - {id: "en-US-JennyNeural", name: "Jenny (Female, US)", lang: "en-US"}
+    - {id: "en-US-GuyNeural", name: "Guy (Male, US)", lang: "en-US"}
+
+  # SER (Emotion)
+  ser_enabled: true
+  ser_model: "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+  
+  # Input
+  input_device: "default"
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1024
+
+# ==========================================
+# 3. 服务器与端口配置 (Server & Ports)
 # ==========================================
 server:
   host: "127.0.0.1"       # 监听地址 (0.0.0.0 允许局域网访问，127.0.0.1 仅限本机)
