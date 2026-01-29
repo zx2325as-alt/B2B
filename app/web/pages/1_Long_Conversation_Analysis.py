@@ -4,6 +4,7 @@ import json
 import os
 import datetime
 from app.core.config import settings
+from app.utils.data_utils import deep_merge_profile
 
 API_URL = settings.API_URL
 
@@ -26,6 +27,214 @@ def load_history_from_api(character_names=None):
         # st.error(f"Failed to load history: {e}")
         pass
     return []
+
+def load_raw_dialogue_logs(character_names=None, character_map=None):
+    """
+    Load raw dialogue logs (User inputs & Bot responses) from backend API.
+    Returns a list of dicts: {"character": str, "text": str, "timestamp": str}
+    """
+    raw_history = []
+    try:
+        # We want to fetch logs for the selected characters.
+        # The /logs endpoint filters by character_id.
+        # If character_names is provided, we need to find their IDs.
+        
+        target_ids = []
+        if character_names and character_map:
+            for name in character_names:
+                if name in character_map:
+                    target_ids.append(character_map[name]['id'])
+        
+        # If no specific characters selected, maybe fetch all? 
+        # But usually we focus on selected ones.
+        
+        all_logs = []
+        
+        if not target_ids:
+            # Try to fetch some recent global logs?
+            # Or just return empty if no char selected.
+            # Let's fetch global recent logs if no char selected (unlikely in this UI)
+            res = requests.get(f"{API_URL}/logs", params={"limit": 100})
+            if res.status_code == 200:
+                all_logs = res.json()
+        else:
+            # Fetch for each character (API doesn't support list of IDs yet, so loop)
+            # This might be slow if many chars, but usually 1-3.
+            for cid in target_ids:
+                res = requests.get(f"{API_URL}/logs", params={"character_id": cid, "limit": 50})
+                if res.status_code == 200:
+                    all_logs.extend(res.json())
+        
+        # Deduplicate by id (if multiple chars in same session, might get same log? 
+        # DialogueLog has character_id, so usually one char per log unless group chat? 
+        # Current model seems 1 char per log)
+        seen_ids = set()
+        unique_logs = []
+        for log in all_logs:
+            if log['id'] not in seen_ids:
+                unique_logs.append(log)
+                seen_ids.add(log['id'])
+        
+        # Sort by created_at
+        unique_logs.sort(key=lambda x: x['created_at'])
+        
+        # Format
+        for log in unique_logs:
+            ts = log.get('created_at', '')
+            
+            # User turn
+            if log.get('user_input'):
+                raw_history.append({
+                    "character": "User", 
+                    "text": log['user_input'],
+                    "timestamp": ts
+                })
+            
+            # Bot turn
+            if log.get('bot_response'):
+                # Resolve character name
+                cid = log.get('character_id')
+                cname = "Assistant"
+                # Try to find name from map
+                if character_map:
+                    for name, c_obj in character_map.items():
+                        if c_obj['id'] == cid:
+                            cname = name
+                            break
+                
+                raw_history.append({
+                    "character": cname,
+                    "text": log['bot_response'],
+                    "timestamp": ts
+                })
+                
+    except Exception as e:
+        # print(f"Error loading raw logs: {e}")
+        pass
+        
+    return raw_history
+
+def perform_character_archive(api_url, target_char_id, target_char_name, profile_update, event_data):
+    """
+    Unified function to archive character data (Events + Profile Update).
+    Returns: (success, message, updated_dims)
+    """
+    import requests
+    import datetime
+    from app.utils.data_utils import deep_merge_profile
+    
+    logs = []
+    updated_dims = []
+    
+    try:
+        # 1. Add Timeline Event (Deeds)
+        # Priority: explicit deeds list in profile_update > event_data
+        events_to_post = []
+        if profile_update and isinstance(profile_update, dict):
+            deeds = profile_update.get("character_deeds", [])
+            if deeds:
+                for deed in deeds:
+                    events_to_post.append({
+                        "summary": deed.get("event"),
+                        "timestamp": deed.get("timestamp")
+                    })
+        
+        if not events_to_post and event_data:
+            events_to_post.append(event_data)
+            
+        for evt in events_to_post:
+             evt_time = evt.get("timestamp") or datetime.datetime.now().strftime("%Y-%m-%d")
+             summary = evt.get("summary")
+             if not summary: continue
+             
+             # Use metadata from event_data if available, otherwise defaults
+             intent = event_data.get("intent", "Manual Archive") if event_data else "Archive"
+             strategy = event_data.get("strategy", "Analysis") if event_data else "Analysis"
+             session_id = event_data.get("session_id", "manual_analysis") if event_data else "manual_analysis"
+
+             payload = {
+                "summary": f"[{evt_time}] {summary}",
+                "intent": intent,
+                "strategy": strategy,
+                "session_id": session_id
+            }
+             try:
+                requests.post(f"{api_url}/characters/{target_char_id}/events", json=payload)
+                logs.append(f"✅ 时间线事件已添加: {summary[:20]}...")
+             except Exception as e:
+                logs.append(f"⚠️ 时间线添加失败: {e}")
+
+        # 2. Update Profile (Deep Merge)
+        if profile_update:
+            # Re-fetch latest profile
+            try:
+                res = requests.get(f"{api_url}/characters/{target_char_id}")
+                if res.status_code == 200:
+                    latest_char = res.json()
+                else:
+                    latest_char = {} 
+                    logs.append("⚠️ 无法获取最新档案，跳过档案更新")
+            except Exception as e:
+                logs.append(f"⚠️ 获取最新档案失败: {e}")
+                latest_char = {}
+
+            if latest_char:
+                current_dyn = latest_char.get("dynamic_profile", {}) or {}
+                current_attrs = latest_char.get("attributes", {}) or {}
+                current_traits = latest_char.get("traits", {}) or {}
+                
+                # Merge
+                # D1: Basic Attributes
+                if "basic_attributes" in profile_update:
+                    raw = profile_update["basic_attributes"]
+                    new_val = raw.get("data", raw) if isinstance(raw, dict) else {}
+                    current_attrs = deep_merge_profile(current_attrs, new_val)
+                    updated_dims.append("基础属性")
+
+                # D5: Personality Traits
+                if "personality_traits" in profile_update:
+                    raw = profile_update["personality_traits"]
+                    new_val = raw.get("data", raw) if isinstance(raw, dict) else {}
+                    current_traits = deep_merge_profile(current_traits, new_val)
+                    updated_dims.append("人格特质")
+
+                # D2,3,4,6,7 -> Dynamic
+                map_keys = {
+                    "surface_behavior": "表层行为", 
+                    "emotional_traits": "情绪特征", 
+                    "cognitive_decision": "认知决策", 
+                    "core_essence": "核心本质",
+                    "character_arc": "人物弧光"
+                }
+                for k, label in map_keys.items():
+                    if k in profile_update:
+                        raw = profile_update[k]
+                        new_val = raw.get("data", raw) if isinstance(raw, dict) else {}
+                        current_dyn = deep_merge_profile(current_dyn, new_val)
+                        updated_dims.append(label)
+                
+                # Update
+                update_payload = {
+                    "attributes": current_attrs,
+                    "traits": current_traits,
+                    "dynamic_profile": current_dyn,
+                    "version_note": event_data.get("version_note", "Analysis Archive")
+                }
+                
+                res_put = requests.put(f"{api_url}/characters/{target_char_id}", json=update_payload)
+                if res_put.status_code == 200:
+                    logs.append(f"✅ 档案深度更新成功 (维度: {', '.join(updated_dims)})")
+                else:
+                    logs.append(f"❌ 档案更新请求失败: {res_put.text}")
+                    return False, " | ".join(logs), updated_dims
+            else:
+                 # If we couldn't fetch latest, we skipped update but maybe event succeeded
+                 pass
+        
+        return True, " | ".join(logs), updated_dims
+
+    except Exception as e:
+        return False, f"归档过程发生未知异常: {str(e)}", []
 
 st.set_page_config(page_title="长对话分析", page_icon="📜", layout="wide")
 
@@ -393,6 +602,9 @@ if st.button("开始分析 (Start Analysis)", type="primary"):
                 # Load recent history for context
                 history_records = load_history_from_api(selected_char_names)
                 
+                # Load raw dialogue history (User requested "reference to historical speech")
+                raw_dialogue_history = load_raw_dialogue_logs(selected_char_names, char_options)
+
                 # Take recent summaries for context
                 recent_history = [
                     {"timestamp": r.get("created_at"), "summary": r.get("summary")} 
@@ -402,7 +614,9 @@ if st.button("开始分析 (Start Analysis)", type="primary"):
                 payload = {
                     "text": final_text,
                     "character_names": selected_char_names,
-                    "history_context": recent_history
+                    "history_context": recent_history,
+                    "character_profiles": [char_options[name] for name in selected_char_names if name in char_options],
+                    "dialogue_history": raw_dialogue_history
                 }
                 res = requests.post(f"{API_URL}/analysis/conversation", json=payload)
                 
@@ -435,13 +649,15 @@ if "analysis_result" in st.session_state:
     # ==========================================
     # 2. Multi-Character Archiving Section
     # ==========================================
+    # 0. Data Prep & Definition
     structured_data = result.get("structured_data", {})
     # Support both keys just in case
-    char_analysis_list = structured_data.get("characters", []) or structured_data.get("character_analysis", [])
+    char_analysis_list = structured_data.get("characters", []) or structured_data.get("character_analysis", []) or result.get("analysis", [])
+    overall_summary = result.get("overall_analysis", {}).get("summary", "") or result.get("summary", "")
 
     if char_analysis_list:
-        st.markdown("### 🗄️ 多角色归档 (Multi-Character Archiving)")
-        st.caption("以下是分析中提取的角色信息，您可以将其归档到角色库中。")
+        st.subheader("🧩 详细画像提取与归档 (Deep Profile Extraction & Archiving)")
+        st.caption("以下数据已从思考报告中结构化提取，可用于更新角色档案。")
         
         # Get existing characters for dropdown
         existing_chars = []
@@ -451,107 +667,251 @@ if "analysis_result" in st.session_state:
                 existing_chars = res_chars.json()
         except:
             pass
-            
-        existing_char_names = [c["name"] for c in existing_chars]
-        existing_char_map = {c["name"]: c["id"] for c in existing_chars}
+        char_options = {c["name"]: c for c in existing_chars} # Ensure char_options is fresh
 
-        for idx, char_data in enumerate(char_analysis_list):
-            char_name = char_data.get("name", f"Unknown_{idx}")
-            summary = char_data.get("summary", "")
-            tags = char_data.get("tags", [])
+        # Batch Archive Section
+        with st.container():
+            st.info("💡 提示: 系统会自动根据角色名匹配现有档案。")
+            col_batch_info, col_batch_btn = st.columns([3, 1])
+            with col_batch_info:
+                matched_count = 0
+                for item in char_analysis_list:
+                    c_name = item.get("name", item.get("character_name", "Unknown"))
+                    if char_options.get(c_name):
+                        matched_count += 1
+                st.write(f"📊 检测到 {len(char_analysis_list)} 个角色数据，其中 {matched_count} 个已自动匹配现有档案。")
             
-            with st.expander(f"👤 {char_name}", expanded=False):
-                col1, col2 = st.columns([2, 1])
+            with col_batch_btn:
+                btn_batch_archive = st.button("📦 批量归档所有匹配角色", type="primary", use_container_width=True)
+        
+        if btn_batch_archive:
+            success_count = 0
+            fail_count = 0
+            logs = []
+            
+            progress_bar = st.progress(0)
+            
+            for idx, item in enumerate(char_analysis_list):
+                c_name = item.get("name", item.get("character_name", "Unknown"))
+                target_char = char_options.get(c_name)
                 
-                with col1:
-                    st.markdown(f"**分析摘要**: {summary}")
-                    st.markdown(f"**标签**: {', '.join(tags)}")
-                
-                with col2:
-                    # Archiving Form
-                    form_key = f"archive_form_{idx}"
-                    with st.form(form_key):
-                        st.markdown("##### 归档设置")
+                if target_char:
+                    try:
+                        # 1. Prepare Data
+                        profile_update = item.get("profile_update") or item.get("metrics", {})
+                        deep_intent = item.get("deep_intent", "未检测到")
+                        strategies = item.get("strategy") or item.get("strategies", [])
+                        if isinstance(strategies, list): strategies = ", ".join(strategies)
                         
-                        # Match existing or new
-                        match_idx = 0
-                        if char_name in existing_char_names:
-                            match_idx = existing_char_names.index(char_name) + 1 # +1 for New
-                            default_action = "Update Existing"
-                        else:
-                            default_action = "Create New"
+                        # 2. Event Data
+                        evt_summary = profile_update.get("timeline_summary")
+                        if not evt_summary:
+                            evt_summary = f"参与对话分析。意图: {deep_intent}。策略: {strategies}"
                             
-                        # Options: [Create New, Existing Char 1, Existing Char 2...]
-                        target_options = ["🆕 新建角色 (Create New)"] + existing_char_names
+                        event_data = {
+                            "summary": evt_summary,
+                            "intent": deep_intent,
+                            "strategy": strategies,
+                            "session_id": result.get("log_id", "manual_analysis"),
+                            "version_note": "Batch Analysis Archive"
+                        }
+
+                        # 3. Call Unified Function
+                        success, msg, updated_dims = perform_character_archive(
+                            API_URL, 
+                            target_char['id'], 
+                            target_char['name'], 
+                            profile_update, 
+                            event_data
+                        )
                         
-                        # Set default index
-                        default_opt_idx = 0
-                        if char_name in existing_char_names:
-                            default_opt_idx = target_options.index(char_name)
+                        if success:
+                            success_count += 1
+                            logs.append(f"✅ [{c_name}] {msg}")
+                        else:
+                            fail_count += 1
+                            logs.append(f"❌ [{c_name}] {msg}")
                         
-                        selected_target = st.selectbox("目标角色 (Target Character)", target_options, index=default_opt_idx)
-                        
-                        # Edit Name if New
-                        final_name = char_name
-                        if selected_target == "🆕 新建角色 (Create New)":
-                            final_name = st.text_input("角色名称 (Name)", value=char_name)
-                        
-                        # Edit Profile/Summary to be saved
-                        final_profile = st.text_area("更新内容 (Profile Content)", value=summary, height=100)
-                        
-                        if st.form_submit_button("💾 保存归档 (Save to Profile)"):
-                            try:
-                                # Prepare Payload
-                                payload = {
-                                    "name": final_name if selected_target == "🆕 新建角色 (Create New)" else selected_target,
-                                    "description": final_profile, # Using description for simple profile update
-                                    # If updating specific fields like 'personality' or 'background', 
-                                    # we might need a more complex extraction or mapping.
-                                    # For now, we append the summary to the description or specific field if available.
-                                    "tags": tags
-                                }
-                                
-                                # Check if Create or Update
-                                if selected_target == "🆕 新建角色 (Create New)":
-                                    # Create
-                                    create_res = requests.post(f"{API_URL}/characters/", json=payload)
-                                    if create_res.status_code == 200:
-                                        st.success(f"✅ 新角色 '{final_name}' 创建成功！")
-                                        st.rerun()
-                                    else:
-                                        st.error(f"创建失败: {create_res.text}")
-                                else:
-                                    # Update
-                                    # We need ID
-                                    target_id = existing_char_map.get(selected_target)
-                                    if target_id:
-                                        # First get existing to merge? Or just PUT?
-                                        # API Update usually expects full object or PATCH.
-                                        # Let's try to get first
-                                        curr_char = requests.get(f"{API_URL}/characters/{target_id}").json()
-                                        
-                                        # Merge Description (Append)
-                                        new_desc = curr_char.get("description", "") + f"\n\n【{datetime.datetime.now().strftime('%Y-%m-%d')} 归档】\n{final_profile}"
-                                        
-                                        update_payload = {
-                                            "name": selected_target,
-                                            "description": new_desc,
-                                            "tags": list(set(curr_char.get("tags", []) + tags))
-                                        }
-                                        
-                                        update_res = requests.put(f"{API_URL}/characters/{target_id}", json=update_payload)
-                                        if update_res.status_code == 200:
-                                            st.success(f"✅ 角色 '{selected_target}' 更新成功！")
-                                        else:
-                                            st.error(f"更新失败: {update_res.text}")
-                                    else:
-                                        st.error("无法找到目标角色 ID")
-                            except Exception as e:
-                                st.error(f"操作异常: {e}")
+                    except Exception as e:
+                        fail_count += 1
+                        logs.append(f"❌ [{c_name}] 归档失败: {e}")
+                else:
+                    fail_count += 1
+                    logs.append(f"⚠️ [{c_name}] 未找到匹配档案，跳过")
+                
+                progress_bar.progress((idx + 1) / len(char_analysis_list))
+                
+            if success_count > 0:
+                st.success(f"批量归档完成！成功: {success_count}, 失败/跳过: {fail_count}")
+                with st.expander("查看归档日志", expanded=True):
+                    for log in logs:
+                        st.write(log)
+            else:
+                st.warning("未成功归档任何角色。请检查角色名是否匹配。")
+
+        st.divider()
+
+        for i, item in enumerate(char_analysis_list):
+            # Compatible field mapping
+            char_name = item.get("name", item.get("character_name", "Unknown"))
+            deep_intent = item.get("deep_intent", "未检测到")
+            strategies = item.get("strategy") or item.get("strategies", [])
+            if isinstance(strategies, list): strategies = ", ".join(strategies)
+            mood = item.get("mood") or item.get("emotions", [])
+            if isinstance(mood, list): mood = ", ".join(mood)
+            
+            profile_update = item.get("profile_update") or item.get("metrics", {})
+
+            # Use index in expander key to avoid duplicate ID errors
+            with st.expander(f"🎭 {char_name} 归档面板", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**🎯 意图**: {deep_intent}")
+                    st.markdown(f"**♟️ 策略**: {strategies}")
+                with col2:
+                    st.markdown(f"**😊 情绪**: {mood}")
+                
+                # Six Dimensions Display
+                if profile_update:
+                    st.divider()
+                    st.markdown("#### 🧬 深度画像归档 (Deep Profile Archiving)")
+                    st.caption("以下是从对话中提取的六维深度数据，点击归档将同步至人物档案。")
+                    
+                    # 7 Dimensions Tabs
+                    tab_names = [
+                        "1️⃣ 基础属性", "2️⃣ 表层行为", "3️⃣ 情绪特征", 
+                        "4️⃣ 认知决策", "5️⃣ 人格特质", "6️⃣ 核心本质",
+                        "7️⃣ 人物弧光"
+                    ]
+                    tabs = st.tabs(tab_names)
+                    
+                    # Helper to display dimension data
+                    def display_dim(tab, key, label):
+                        with tab:
+                            data_obj = profile_update.get(key, {})
+                            if isinstance(data_obj, dict) and "data" in data_obj:
+                                content = data_obj.get("data", {})
+                                desc = data_obj.get("desc", f"{label}更新")
+                            else:
+                                content = data_obj
+                                desc = f"{label}更新"
+                            
+                            st.markdown(f"**{desc}**")
+                            if content:
+                                st.json(content)
+                            else:
+                                st.info("本轮对话未提取到相关新信息。")
+                            return content
+
+                    d1_data = display_dim(tabs[0], "basic_attributes", "基础属性")
+                    d2_data = display_dim(tabs[1], "surface_behavior", "表层行为")
+                    d3_data = display_dim(tabs[2], "emotional_traits", "情绪特征")
+                    d4_data = display_dim(tabs[3], "cognitive_decision", "认知决策")
+                    d5_data = display_dim(tabs[4], "personality_traits", "人格特质")
+                    d6_data = display_dim(tabs[5], "core_essence", "核心本质")
+                    d7_data = display_dim(tabs[6], "character_arc", "人物弧光")
+
+                # Archiving Action UI
+                st.markdown("---")
+                st.markdown("##### 📥 归档操作")
+                
+                # Try to find a match
+                matched_char = char_options.get(char_name)
+                
+                # UI for Selection
+                col_target, col_action = st.columns([3, 1])
+                
+                target_char_obj = None
+                archive_mode = "Existing"
+                new_char_name_input = ""
+
+                with col_target:
+                    # Construct options list
+                    opts = []
+                    if matched_char:
+                        opts.append(f"✅ 现有角色: {matched_char['name']}")
+                    opts.append("🆕 新建角色...")
+                    # Add other characters (sorted)
+                    other_chars = sorted([c for c in char_options.keys() if c != (matched_char['name'] if matched_char else "")])
+                    opts.extend([f"👤 {c}" for c in other_chars])
+                    
+                    sel_label = st.selectbox(f"归档目标 (Target)", opts, key=f"archive_sel_{i}", label_visibility="collapsed")
+                    
+                    if "🆕 新建角色..." in sel_label:
+                        archive_mode = "New"
+                        new_char_name_input = st.text_input("输入新角色名称:", value=char_name, key=f"new_name_{i}")
+                    elif "✅" in sel_label:
+                        archive_mode = "Existing"
+                        target_char_obj = matched_char
+                    else:
+                        archive_mode = "Existing"
+                        selected_name = sel_label.replace("👤 ", "")
+                        target_char_obj = char_options.get(selected_name)
+
+                with col_action:
+                    btn_clicked = st.button("🚀 执行归档", key=f"do_archive_{i}", type="primary", use_container_width=True)
+
+                if btn_clicked:
+                    try:
+                        # 0. Handle New Character Creation
+                        if archive_mode == "New":
+                            if not new_char_name_input.strip():
+                                st.error("请输入新角色名称！")
+                                st.stop()
+                            
+                            # Create Character
+                            create_payload = {
+                                "name": new_char_name_input.strip(),
+                                "system_prompt": f"You are {new_char_name_input}.", # Basic init
+                                "attributes": {},
+                                "traits": {}
+                            }
+                            res_create = requests.post(f"{API_URL}/characters", json=create_payload)
+                            if res_create.status_code == 200:
+                                target_char_obj = res_create.json()
+                                st.toast(f"✅ 新角色 [{new_char_name_input}] 创建成功！")
+                            else:
+                                st.error(f"创建角色失败: {res_create.text}")
+                                st.stop()
+
+                        if target_char_obj:
+                            target_name = target_char_obj['name']
+                            
+                            # Prepare Event Data
+                            timeline_summary = profile_update.get("timeline_summary")
+                            if not timeline_summary:
+                                timeline_summary = overall_summary[:50] + "..." if overall_summary else "对话分析归档"
+                            
+                            event_data = {
+                                "summary": timeline_summary,
+                                "intent": deep_intent,
+                                "strategy": strategies,
+                                "session_id": result.get("log_id", "manual_analysis"),
+                                "version_note": "来自深度对话分析(六维画像归档)"
+                            }
+                            
+                            # Call Unified Function
+                            success, msg, _ = perform_character_archive(
+                                API_URL,
+                                target_char_obj['id'],
+                                target_name,
+                                profile_update,
+                                event_data
+                            )
+                            
+                            if success:
+                                st.toast(f"✅ 已成功更新 {target_name} 的六维档案！")
+                                st.success(f"归档成功！数据已合并至 [{target_name}]。")
+                            else:
+                                st.error(f"归档失败: {msg}")
+                        else:
+                            st.error("无法确定目标角色，归档失败。")
+                            
+                    except Exception as e:
+                        st.error(f"归档过程异常: {e}")
 
     else:
         st.info("本次分析未提取到结构化角色信息。")
-
         # Fallback: Old Format Support
         st.warning("⚠️ 收到旧格式数据或解析失败，尝试以兼容模式显示。")
         structured_data = result
@@ -627,350 +987,40 @@ if "analysis_result" in st.session_state:
                     target_char_obj = char_options.get(selected_name)
                 
                 if target_char_obj:
-                    evt_time = datetime.datetime.now().strftime("%Y-%m-%d")
-                    event_payload = {
-                        "summary": f"[{evt_time}] 对话分析归档: {archive_content[:100]}...",
-                        "intent": "Manual Archive",
-                        "strategy": "Analysis",
-                        "session_id": result.get("log_id", "manual_analysis")
-                    }
-                    
-                    requests.post(f"{API_URL}/characters/{target_char_obj['id']}/events", json=event_payload)
-                    st.success(f"✅ 已成功将分析摘要归档至 [{target_char_obj['name']}] 的时间线！")
-                    
+                    # Prepare data
+                    profile_update = {}
                     found_struct = next((item for item in char_analysis_list if item.get("name") == target_char_obj['name']), None)
                     if found_struct:
-                        st.info(f"💡 检测到 [{target_char_obj['name']}] 的深度画像数据，请在下方【详细画像提取】面板中确认更新。")
+                        profile_update = found_struct.get("profile_update") or found_struct.get("metrics", {})
+                    
+                    event_data = {
+                        "summary": f"对话分析归档: {archive_content[:100]}...",
+                        "intent": "Manual Archive",
+                        "strategy": "Analysis",
+                        "session_id": result.get("log_id", "manual_analysis"),
+                        "version_note": "Universal Analysis Archive"
+                    }
+                    
+                    success, msg, updated_dims = perform_character_archive(
+                        API_URL,
+                        target_char_obj['id'],
+                        target_char_obj['name'],
+                        profile_update,
+                        event_data
+                    )
+                    
+                    if success:
+                        st.success(f"✅ 已成功归档至 [{target_char_obj['name']}]！")
+                        if updated_dims:
+                            st.info(f"🔄 检测到深度画像数据，已执行增量更新 (维度: {', '.join(updated_dims)})")
+                    else:
+                        st.error(f"归档失败: {msg}")
                         
                 else:
                     st.error("目标角色无效。")
                     
             except Exception as e:
                 st.error(f"归档失败: {e}")
-
-    # ==========================================
-    # 3. Detailed Character Extraction (Optional)
-    # ==========================================
-    if char_analysis_list:
-        st.subheader("🧩 详细画像提取 (Deep Profile Extraction)")
-        st.caption("以下数据已从思考报告中结构化提取，可用于更新角色档案。")
-        
-        # Batch Archive Section
-        with st.container():
-            st.info("💡 提示: 系统会自动根据角色名匹配现有档案。")
-            col_batch_info, col_batch_btn = st.columns([3, 1])
-            with col_batch_info:
-                matched_count = 0
-                for item in char_analysis_list:
-                    c_name = item.get("name", item.get("character_name", "Unknown"))
-                    if char_options.get(c_name):
-                        matched_count += 1
-                st.write(f"📊 检测到 {len(char_analysis_list)} 个角色数据，其中 {matched_count} 个已自动匹配现有档案。")
-            
-            with col_batch_btn:
-                btn_batch_archive = st.button("📦 批量归档所有匹配角色", type="primary", use_container_width=True)
-        
-        if btn_batch_archive:
-            success_count = 0
-            fail_count = 0
-            logs = []
-            
-            progress_bar = st.progress(0)
-            
-            for idx, item in enumerate(char_analysis_list):
-                c_name = item.get("name", item.get("character_name", "Unknown"))
-                target_char = char_options.get(c_name)
-                
-                if target_char:
-                    try:
-                        # 1. Prepare Data
-                        profile_update = item.get("profile_update", {})
-                        deep_intent = item.get("deep_intent", "未检测到")
-                        strategies = item.get("strategy") or item.get("strategies", [])
-                        if isinstance(strategies, list): strategies = ", ".join(strategies)
-                        
-                        # 2. Update Profile (Merge)
-                        current_dyn = target_char.get("dynamic_profile", {}) or {}
-                        current_attrs = target_char.get("attributes", {}) or {}
-                        current_traits = target_char.get("traits", {}) or {}
-                        
-                        # Merge Logic (Simplified for Batch)
-                        if profile_update:
-                             # D1
-                             if "basic_attributes" in profile_update: current_attrs.update(profile_update["basic_attributes"].get("data", {}))
-                             # D2-D6 (Dynamic)
-                             for key in ["surface_behavior", "emotional_traits", "cognitive_decision", "core_essence"]:
-                                 if key in profile_update:
-                                     current_dyn.update(profile_update[key].get("data", {}))
-                             # D5 (Traits)
-                             if "personality_traits" in profile_update: current_traits.update(profile_update["personality_traits"].get("data", {}))
-
-                        # 3. Add Timeline Event
-                        # Use character specific summary or timeline_summary
-                        evt_summary = profile_update.get("timeline_summary")
-                        if not evt_summary:
-                            # Fallback: Create summary from intent/strategy
-                            evt_summary = f"参与对话分析。意图: {deep_intent}。策略: {strategies}"
-                            
-                        evt_time = datetime.datetime.now().strftime("%Y-%m-%d")
-                        event_payload = {
-                            "summary": f"[{evt_time}] {evt_summary}",
-                            "intent": deep_intent,
-                            "strategy": strategies,
-                            "session_id": result.get("log_id", "manual_analysis")
-                        }
-                        
-                        # API Calls
-                        requests.post(f"{API_URL}/characters/{target_char['id']}/events", json=event_payload)
-                        
-                        update_payload = {
-                            "attributes": current_attrs,
-                            "traits": current_traits,
-                            "dynamic_profile": current_dyn,
-                            "version_note": "Batch Analysis Archive"
-                        }
-                        requests.put(f"{API_URL}/characters/{target_char['id']}", json=update_payload)
-                        
-                        success_count += 1
-                        logs.append(f"✅ [{c_name}] 归档成功")
-                        
-                    except Exception as e:
-                        fail_count += 1
-                        logs.append(f"❌ [{c_name}] 归档失败: {e}")
-                else:
-                    fail_count += 1
-                    logs.append(f"⚠️ [{c_name}] 未找到匹配档案，跳过")
-                
-                progress_bar.progress((idx + 1) / len(char_analysis_list))
-                
-            if success_count > 0:
-                st.success(f"批量归档完成！成功: {success_count}, 失败/跳过: {fail_count}")
-                with st.expander("查看归档日志", expanded=True):
-                    for log in logs:
-                        st.write(log)
-            else:
-                st.warning("未成功归档任何角色。请检查角色名是否匹配。")
-
-        st.divider()
-
-        for i, item in enumerate(char_analysis_list):
-            # Compatible field mapping
-            char_name = item.get("name", item.get("character_name", "Unknown"))
-            deep_intent = item.get("deep_intent", "未检测到")
-            strategies = item.get("strategy") or item.get("strategies", [])
-            if isinstance(strategies, list): strategies = ", ".join(strategies)
-            mood = item.get("mood") or item.get("emotions", [])
-            if isinstance(mood, list): mood = ", ".join(mood)
-            
-            profile_update = item.get("profile_update", {})
-
-            # Use index in expander key to avoid duplicate ID errors
-            with st.expander(f"🎭 {char_name} 归档面板", expanded=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**🎯 意图**: {deep_intent}")
-                    st.markdown(f"**♟️ 策略**: {strategies}")
-                with col2:
-                    st.markdown(f"**😊 情绪**: {mood}")
-                
-                # Six Dimensions Display
-                if profile_update:
-                    st.divider()
-                    st.markdown("#### 🧬 深度画像归档 (Deep Profile Archiving)")
-                    st.caption("以下是从对话中提取的六维深度数据，点击归档将同步至人物档案。")
-                    
-                    # 6 Dimensions Tabs
-                    tab_names = [
-                        "1️⃣ 基础属性", "2️⃣ 表层行为", "3️⃣ 情绪特征", 
-                        "4️⃣ 认知决策", "5️⃣ 人格特质", "6️⃣ 核心本质"
-                    ]
-                    tabs = st.tabs(tab_names)
-                    
-                    # Helper to display dimension data
-                    def display_dim(tab, key, label):
-                        with tab:
-                            data_obj = profile_update.get(key, {})
-                            desc = data_obj.get("desc", f"{label}更新")
-                            content = data_obj.get("data", {})
-                            
-                            st.markdown(f"**{desc}**")
-                            if content:
-                                st.json(content)
-                            else:
-                                st.info("本轮对话未提取到相关新信息。")
-                            return content
-
-                    d1_data = display_dim(tabs[0], "basic_attributes", "基础属性")
-                    d2_data = display_dim(tabs[1], "surface_behavior", "表层行为")
-                    d3_data = display_dim(tabs[2], "emotional_traits", "情绪特征")
-                    d4_data = display_dim(tabs[3], "cognitive_decision", "认知决策")
-                    d5_data = display_dim(tabs[4], "personality_traits", "人格特质")
-                    d6_data = display_dim(tabs[5], "core_essence", "核心本质")
-
-                # Archiving Action UI
-                st.markdown("---")
-                st.markdown("##### 📥 一键归档操作 (One-click Archive)")
-                
-                # Try to find a match
-                matched_char = char_options.get(char_name)
-                
-                # UI for Selection
-                col_target, col_action = st.columns([3, 1])
-                
-                target_char_obj = None
-                archive_mode = "Existing"
-                new_char_name_input = ""
-
-                with col_target:
-                    # Construct options list
-                    opts = []
-                    if matched_char:
-                        opts.append(f"✅ 现有角色: {matched_char['name']}")
-                    opts.append("🆕 新建角色...")
-                    # Add other characters (sorted)
-                    other_chars = sorted([c for c in char_options.keys() if c != (matched_char['name'] if matched_char else "")])
-                    opts.extend([f"👤 {c}" for c in other_chars])
-                    
-                    sel_label = st.selectbox(f"归档目标 (Target)", opts, key=f"archive_sel_{i}", label_visibility="collapsed")
-                    
-                    if "🆕 新建角色..." in sel_label:
-                        archive_mode = "New"
-                        new_char_name_input = st.text_input("输入新角色名称:", value=char_name, key=f"new_name_{i}")
-                    elif "✅" in sel_label:
-                        archive_mode = "Existing"
-                        target_char_obj = matched_char
-                    else:
-                        archive_mode = "Existing"
-                        selected_name = sel_label.replace("👤 ", "")
-                        target_char_obj = char_options.get(selected_name)
-
-                with col_action:
-                    btn_clicked = st.button("🚀 执行归档", key=f"do_archive_{i}", type="primary", use_container_width=True)
-
-                if btn_clicked:
-                    try:
-                        # 0. Handle New Character Creation
-                        if archive_mode == "New":
-                            if not new_char_name_input.strip():
-                                st.error("请输入新角色名称！")
-                                st.stop()
-                            
-                            # Create Character
-                            create_payload = {
-                                "name": new_char_name_input.strip(),
-                                "system_prompt": f"You are {new_char_name_input}.", # Basic init
-                                "attributes": {},
-                                "traits": {}
-                            }
-                            res_create = requests.post(f"{API_URL}/characters", json=create_payload)
-                            if res_create.status_code == 200:
-                                target_char_obj = res_create.json()
-                                st.toast(f"✅ 新角色 [{new_char_name_input}] 创建成功！")
-                            else:
-                                st.error(f"创建角色失败: {res_create.text}")
-                                st.stop()
-
-                        if target_char_obj:
-                            target_name = target_char_obj['name']
-                            
-                            # Logic to update character profile
-                            # 1. Prepare Base Data
-                            current_dyn = target_char_obj.get("dynamic_profile", {}) or {}
-                            current_attrs = target_char_obj.get("attributes", {}) or {}
-                            current_traits = target_char_obj.get("traits", {}) or {}
-                            
-                            # 2. Merge Updates (Strategy: Update if exists in extraction)
-                            # D1: Basic -> Attributes
-                            if profile_update and d1_data:
-                                current_attrs.update(d1_data)
-                                
-                            # D2: Surface -> Dynamic
-                            if profile_update and d2_data:
-                                if d2_data.get("communication_style"): current_dyn["communication_style"] = d2_data["communication_style"]
-                                if d2_data.get("behavior_habits"): current_dyn["behavior_habits"] = d2_data["behavior_habits"]
-                                # Merge others
-                                for k, v in d2_data.items():
-                                    if k not in ["communication_style", "behavior_habits"]:
-                                        current_dyn[k] = v
-
-                            # D3: Emotional -> Dynamic
-                            if profile_update and d3_data:
-                                if d3_data.get("emotional_baseline"): current_dyn["emotional_baseline"] = d3_data["emotional_baseline"]
-                                
-                            # D4: Cognitive -> Dynamic
-                            if profile_update and d4_data:
-                                if d4_data.get("decision_style"): current_dyn["decision_style"] = d4_data["decision_style"]
-                                if d4_data.get("thinking_mode"): current_dyn["thinking_mode"] = d4_data["thinking_mode"]
-
-                            # D5: Personality -> Traits
-                            if profile_update and d5_data:
-                                current_traits.update(d5_data)
-                                
-                            # D6: Core -> Dynamic
-                            if profile_update and d6_data:
-                                if d6_data.get("core_drivers"): 
-                                    exist_drivers = set(current_dyn.get("core_drivers", []))
-                                    new_drivers = d6_data["core_drivers"]
-                                    if isinstance(new_drivers, list):
-                                        exist_drivers.update(new_drivers)
-                                        current_dyn["core_drivers"] = list(exist_drivers)
-                                
-                                if d6_data.get("inferred_core_needs"):
-                                    exist_needs = set(current_dyn.get("inferred_core_needs", []))
-                                    new_needs = d6_data["inferred_core_needs"]
-                                    if isinstance(new_needs, list):
-                                        exist_needs.update(new_needs)
-                                        current_dyn["inferred_core_needs"] = list(exist_needs)
-
-                            # 3. Add Timeline Events (Character Arc - Deeds)
-                            character_deeds = profile_update.get("character_deeds", [])
-                            
-                            # If no structured deeds, try legacy summary
-                            if not character_deeds:
-                                timeline_summary = profile_update.get("timeline_summary")
-                                if not timeline_summary:
-                                    timeline_summary = overall_summary[:50] + "..." if overall_summary else "对话分析归档"
-                                character_deeds = [{"event": timeline_summary, "timestamp": datetime.now().strftime("%Y-%m-%d")}]
-                            
-                            count_events = 0
-                            for deed in character_deeds:
-                                evt_content = deed.get("event")
-                                evt_time = deed.get("timestamp") or datetime.now().strftime("%Y-%m-%d")
-                                
-                                event_payload = {
-                                    "summary": f"[{evt_time}] {evt_content}",
-                                    "intent": deep_intent,
-                                    "strategy": strategies,
-                                    "session_id": "manual_analysis"
-                                }
-                                try:
-                                    requests.post(f"{API_URL}/characters/{target_char_obj['id']}/events", json=event_payload)
-                                    count_events += 1
-                                except Exception as e:
-                                    st.warning(f"时间线添加失败: {e}")
-                            
-                            if count_events > 0:
-                                st.toast(f"✅ 已添加 {count_events} 条人物事迹到弧光！")
-
-                            # 4. Construct Payload
-                            update_payload = {
-                                "attributes": current_attrs,
-                                "traits": current_traits,
-                                "dynamic_profile": current_dyn,
-                                "version_note": "来自深度对话分析(六维画像归档)"
-                            }
-                            
-                            up_res = requests.put(f"{API_URL}/characters/{target_char_obj['id']}", json=update_payload)
-                            if up_res.status_code == 200:
-                                st.toast(f"✅ 已成功更新 {target_name} 的六维档案！")
-                                st.success(f"归档成功！数据已合并至 [{target_name}]。")
-                            else:
-                                st.error(f"更新失败: {up_res.text}")
-                        else:
-                            st.error("无法确定目标角色，归档失败。")
-                            
-                    except Exception as e:
-                        st.error(f"归档过程异常: {e}")
 
     # ==========================================
     # 3. Feedback & Evolution

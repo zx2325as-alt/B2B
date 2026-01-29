@@ -628,6 +628,8 @@ class AnalysisRequest(BaseModel):
     audio_features: Optional[Dict[str, Any]] = Field(default={}, description="声学特征数据 (Pitch, Energy)")
     emotion_data: Optional[Dict[str, Any]] = Field(default={}, description="语音情感识别数据 (SER)")
     speaker_info: Optional[Dict[str, Any]] = Field(default={}, description="说话人身份信息")
+    character_profiles: Optional[List[Dict[str, Any]]] = Field(default=[], description="已知角色完整档案 (用于增量更新)")
+    dialogue_history: Optional[List[Dict[str, Any]]] = Field(default=[], description="角色过往对话记录 (用于参考说话风格)")
 
 @router.post("/analysis/conversation", summary="分析长对话")
 async def analyze_conversation_endpoint(
@@ -675,7 +677,9 @@ async def analyze_conversation_endpoint(
                 history_context=request.history_context,
                 audio_features=request.audio_features,
                 emotion_data=request.emotion_data,
-                speaker_info=request.speaker_info
+                speaker_info=request.speaker_info,
+                character_profiles=request.character_profiles,
+                dialogue_history=request.dialogue_history
             )
             
         # --- Persistence (Save to Database) ---

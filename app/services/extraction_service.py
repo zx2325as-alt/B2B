@@ -53,7 +53,7 @@ class ExtractionService:
             logger.error(f"Quick analyze failed: {e}")
             return {"markdown_report": "Analysis failed.", "structured_data": {}}
 
-    async def deep_analyze(self, text: str, character_names: List[str] = None, db: Session = None, history_context: str = None, audio_features: Dict = None, emotion_data: Dict = None, speaker_info: Dict = None):
+    async def deep_analyze(self, text: str, character_names: List[str] = None, db: Session = None, history_context: List[Dict] = None, audio_features: Dict = None, emotion_data: Dict = None, speaker_info: Dict = None, character_profiles: List[Dict] = None, dialogue_history: List[Dict] = None):
         """
         Deep analysis: Multi-role deduction, Inner OS, Emotion, etc.
         """
@@ -91,6 +91,50 @@ class ExtractionService:
             spk_id = speaker_info.get('id', 'unknown')
             speaker_context = f"【说话人身份】: {spk_name} (ID: {spk_id})\n"
 
+        # History Context (Analysis Summaries)
+        history_str = ""
+        if history_context:
+            history_str = "\n【历史背景与过往分析 (Summaries)】\n"
+            # User requested all history, removing [-5:] limit
+            for item in history_context: 
+                ts = item.get("timestamp", "Unknown Time")
+                summ = item.get("summary", "")
+                if summ:
+                    history_str += f"- [{ts}] {summ}\n"
+            history_str += "请参考上述历史背景，确保本次分析与过往剧情连贯，并注意人物关系的变化。\n"
+        
+        # Dialogue History (Raw Speech) - New
+        dialogue_history_str = ""
+        if dialogue_history:
+             dialogue_history_str = "\n【角色过往对话记录 (Raw Speech)】\n"
+             # Assuming dialogue_history contains objects like { "character": "...", "text": "...", "timestamp": "..." }
+             for item in dialogue_history:
+                 char = item.get("character", "Unknown")
+                 content = item.get("text", "")
+                 ts = item.get("timestamp", "")
+                 if content:
+                     dialogue_history_str += f"- [{ts}] {char}: {content}\n"
+             dialogue_history_str += "请参考角色过往的说话风格、用词习惯以及曾表达过的观点。\n"
+
+        # Known Character Metrics (New)
+        known_metrics_str = ""
+        if character_profiles:
+            known_metrics_str = "\n【已知角色档案 (Reference)】\n"
+            for p in character_profiles:
+                p_name = p.get('name', 'Unknown')
+                # Try to get simplified summary or key metrics to save tokens
+                metrics_summary = {
+                    "basic_attributes": p.get("attributes", {}),
+                    "personality_traits": p.get("traits", {}),
+                    # Dynamic profile parts
+                    "surface_behavior": p.get("dynamic_profile", {}).get("surface_behavior", {}),
+                    "emotional_traits": p.get("dynamic_profile", {}).get("emotional_traits", {}),
+                    "cognitive_decision": p.get("dynamic_profile", {}).get("cognitive_decision", {}),
+                    "core_essence": p.get("dynamic_profile", {}).get("core_essence", {}),
+                    "character_arc": p.get("dynamic_profile", {}).get("character_arc", [])
+                }
+                known_metrics_str += f"### 角色: {p_name}\n{json.dumps(metrics_summary, ensure_ascii=False, indent=2)}\n"
+
         char_list_str = ", ".join(character_names) if character_names else "未知角色"
         
         prompt = f"""
@@ -101,6 +145,9 @@ class ExtractionService:
         
         {speaker_context}
         {multimodal_context}
+        {history_str}
+        {dialogue_history_str}
+        {known_metrics_str}
         
         【对话内容】
         {text}
@@ -110,10 +157,24 @@ class ExtractionService:
         2. **多角色心理推演 (重点)**: 
            - 对每一位在场角色，分析其**潜台词 (Subtext)**、**内心独白 (Inner OS)** 和 **真实情绪 (Emotion)**。
            - 结合声学特征（如果有）来判断情绪的激动程度。
-        3. **角色档案更新 (归档用)**:
-           - 为每位角色提取**本次对话体现的特征/信息摘要 (Summary)**。
-           - 提取 3-5 个**关键词标签 (Tags)**。
-        4. **人际关系动态**: 角色之间的关系是否发生了变化？
+        3. **角色档案更新 (Character Metrics Update)**:
+           - 请参考【已知角色档案】，严格按照以下 6 个维度提取**新的**或**修正的**信息。
+           - 若某维度在本次对话中无新信息，则留空。
+             1. **基础属性 (Basic Attributes)**: 身份标签、成长经历、客观边界
+             2. **表层行为 (Surface Behavior)**: 沟通模式、行为习惯、社交风格
+             3. **情绪特征 (Emotional Traits)**: 情绪基线、情绪触发点、情绪表达、情绪调节
+             4. **认知决策 (Cognitive Decision)**: 决策风格、思维模式、判断标准、信息处理
+             5. **人格特质 (Personality Traits)**: 核心性格、特质倾向、三观底色、行为一致性
+             6. **核心本质 (Core Essence)**: 核心驱动力、动机来源、深层需求、行为底线
+             
+             *注意：请重点关注**变化**、**新发现**或**深层动机的暴露**。*
+        
+        4. **人物弧光 (Character Arc) 分析**:
+           - 识别角色是否经历了成长、退步或观念转变？
+           - 记录关键的**转折点 (Turning Point)** 或 **里程碑 (Milestone)**。
+           - 格式：请生成一段简短的描述，用于记录在角色成长时间线上。
+
+        5. **人际关系动态**: 角色之间的关系是否发生了变化？
         
         请输出一份 Markdown 格式的报告（**必须使用简体中文**），并包含一个 JSON 代码块以便程序提取结构化数据。
         
@@ -127,7 +188,20 @@ class ExtractionService:
                     "inner_os": "内心独白...",
                     "emotion": "真实情绪...",
                     "subtext": "潜台词...",
-                    "summary": "该角色本次对话的行为/信息摘要 (用于归档)...",
+                    "metrics": {{
+                        "basic_attributes": {{ "identity": "...", "background": "..." }},
+                        "surface_behavior": {{ "communication_style": "..." }},
+                        "emotional_traits": {{ ... }},
+                        "cognitive_decision": {{ ... }},
+                        "personality_traits": {{ ... }},
+                        "core_essence": {{ ... }}
+                    }},
+                    "character_arc": {{
+                         "event": "事件描述...",
+                         "type": "Growth/Regression/Stasis/Turning Point",
+                         "timestamp": "当前时间或对话时间"
+                    }},
+                    "summary": "该角色本次对话的行为/信息摘要...",
                     "tags": ["标签1", "标签2"]
                 }}
             ],
@@ -140,14 +214,78 @@ class ExtractionService:
             response = await llm_service.chat_completion([{"role": "user", "content": prompt}])
             
             structured_data = {}
-            # Extract JSON
+            # Extract JSON - Robust
             import re
-            match = re.search(r'```json\n(.*?)\n```', response, re.DOTALL)
+            
+            json_str = ""
+            # 1. Try standard markdown code block
+            match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
             if match:
+                json_str = match.group(1)
+            else:
+                # 2. Try raw JSON (find first { and last })
+                p1 = response.find('{')
+                p2 = response.rfind('}')
+                if p1 != -1 and p2 != -1:
+                    json_str = response[p1:p2+1]
+            
+            if json_str:
                 try:
-                    structured_data = json.loads(match.group(1))
-                except:
-                    pass
+                    structured_data = json.loads(json_str)
+                except json.JSONDecodeError:
+                    logger.warning(f"JSON decode error, raw: {json_str[:100]}...")
+                    # --- Retry Mechanism (Self-Correction) ---
+                    try:
+                        logger.info("Attempting to repair JSON with LLM...")
+                        repair_prompt = f"""
+                        The following JSON is invalid. Please fix it and return ONLY the valid JSON object.
+                        
+                        {json_str}
+                        """
+                        repair_response = await llm_service.chat_completion([{"role": "user", "content": repair_prompt}])
+                        
+                        # Try extract again
+                        match_r = re.search(r'```json\s*(.*?)\s*```', repair_response, re.DOTALL | re.IGNORECASE)
+                        json_str_r = match_r.group(1) if match_r else repair_response
+                        
+                        # Strip non-json chars just in case
+                        p1_r = json_str_r.find('{')
+                        p2_r = json_str_r.rfind('}')
+                        if p1_r != -1 and p2_r != -1:
+                            json_str_r = json_str_r[p1_r:p2_r+1]
+                            
+                        structured_data = json.loads(json_str_r)
+                        logger.info("JSON successfully repaired.")
+                    except Exception as e_repair:
+                        logger.error(f"JSON repair failed: {e_repair}")
+                        pass
+                    # -----------------------------------------
+            else:
+                 # --- No JSON Found: Retry Extraction ---
+                 try:
+                     logger.info("No JSON found in response. Attempting extraction from raw text...")
+                     extract_prompt = f"""
+                     Please extract the structured data (JSON) from the following text. 
+                     Return ONLY the JSON object matching the previously defined schema.
+                     
+                     {response}
+                     """
+                     extract_response = await llm_service.chat_completion([{"role": "user", "content": extract_prompt}])
+                     
+                     match_e = re.search(r'```json\s*(.*?)\s*```', extract_response, re.DOTALL | re.IGNORECASE)
+                     json_str_e = match_e.group(1) if match_e else extract_response
+                     
+                     p1_e = json_str_e.find('{')
+                     p2_e = json_str_e.rfind('}')
+                     if p1_e != -1 and p2_e != -1:
+                         json_str_e = json_str_e[p1_e:p2_e+1]
+                         
+                     structured_data = json.loads(json_str_e)
+                     logger.info("JSON successfully extracted via secondary prompt.")
+                 except Exception as e_extract:
+                     logger.error(f"Secondary extraction failed: {e_extract}")
+                     pass
+                 # ---------------------------------------
             
             return {
                 "markdown_report": response,
@@ -235,6 +373,7 @@ class ExtractionService:
             response = await llm_service.chat_completion([{"role": "user", "content": prompt}])
             import re
             match = re.search(r'```json\n(.*?)\n```', response, re.DOTALL)
+
             if match:
                 return json.loads(match.group(1))
             # Try direct parse
