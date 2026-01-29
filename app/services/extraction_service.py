@@ -1,6 +1,7 @@
 import logging
 import json
 import time
+import re
 from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
 from app.services.llm import llm_service
@@ -160,6 +161,7 @@ class ExtractionService:
         3. **角色档案更新 (Character Metrics Update)**:
            - 请参考【已知角色档案】，严格按照以下 6 个维度提取**新的**或**修正的**信息。
            - 若某维度在本次对话中无新信息，则留空。
+           - 请将这些维度统一放在 `metrics` 字段下。
              1. **基础属性 (Basic Attributes)**: 身份标签、成长经历、客观边界
              2. **表层行为 (Surface Behavior)**: 沟通模式、行为习惯、社交风格
              3. **情绪特征 (Emotional Traits)**: 情绪基线、情绪触发点、情绪表达、情绪调节
@@ -173,6 +175,7 @@ class ExtractionService:
            - 识别角色是否经历了成长、退步或观念转变？
            - 记录关键的**转折点 (Turning Point)** 或 **里程碑 (Milestone)**。
            - 格式：请生成一段简短的描述，用于记录在角色成长时间线上。
+           - 请将此字段 `character_arc` 与 `metrics` 平级。
 
         5. **人际关系动态**: 角色之间的关系是否发生了变化？
         
@@ -215,19 +218,38 @@ class ExtractionService:
             
             structured_data = {}
             # Extract JSON - Robust
-            import re
-            
             json_str = ""
-            # 1. Try standard markdown code block
-            match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
-            if match:
-                json_str = match.group(1)
-            else:
-                # 2. Try raw JSON (find first { and last })
-                p1 = response.find('{')
-                p2 = response.rfind('}')
-                if p1 != -1 and p2 != -1:
-                    json_str = response[p1:p2+1]
+            
+            # Helper function to find JSON in text
+            def find_json_segment(text):
+                # 1. Try markdown code block
+                match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
+                if match:
+                    return match.group(1)
+                
+                # 2. Try raw JSON (find first { or [ and last } or ])
+                p_obj_start = text.find('{')
+                p_arr_start = text.find('[')
+                
+                p_start = -1
+                if p_obj_start != -1 and p_arr_start != -1:
+                    p_start = min(p_obj_start, p_arr_start)
+                elif p_obj_start != -1:
+                    p_start = p_obj_start
+                elif p_arr_start != -1:
+                    p_start = p_arr_start
+                    
+                if p_start != -1:
+                    # Find last closing bracket
+                    p_obj_end = text.rfind('}')
+                    p_arr_end = text.rfind(']')
+                    p_end = max(p_obj_end, p_arr_end)
+                    
+                    if p_end != -1 and p_end > p_start:
+                        return text[p_start : p_end + 1]
+                return ""
+
+            json_str = find_json_segment(response)
             
             if json_str:
                 try:
@@ -238,26 +260,24 @@ class ExtractionService:
                     try:
                         logger.info("Attempting to repair JSON with LLM...")
                         repair_prompt = f"""
-                        The following JSON is invalid. Please fix it and return ONLY the valid JSON object.
+                        The following JSON is invalid. Please fix it and return ONLY the valid JSON object or array.
+                        Do not wrap in markdown code blocks. Just the raw JSON.
                         
                         {json_str}
                         """
                         repair_response = await llm_service.chat_completion([{"role": "user", "content": repair_prompt}])
                         
-                        # Try extract again
-                        match_r = re.search(r'```json\s*(.*?)\s*```', repair_response, re.DOTALL | re.IGNORECASE)
-                        json_str_r = match_r.group(1) if match_r else repair_response
-                        
-                        # Strip non-json chars just in case
-                        p1_r = json_str_r.find('{')
-                        p2_r = json_str_r.rfind('}')
-                        if p1_r != -1 and p2_r != -1:
-                            json_str_r = json_str_r[p1_r:p2_r+1]
-                            
+                        # Try extract again from repair response
+                        json_str_r = find_json_segment(repair_response)
+                        if not json_str_r:
+                             json_str_r = repair_response.strip()
+
                         structured_data = json.loads(json_str_r)
                         logger.info("JSON successfully repaired.")
                     except Exception as e_repair:
                         logger.error(f"JSON repair failed: {e_repair}")
+                        # Last Resort: Dirty Regex Extraction for "basic_attributes" etc?
+                        # Maybe not worth it, risk of garbage data.
                         pass
                     # -----------------------------------------
             else:
@@ -272,13 +292,8 @@ class ExtractionService:
                      """
                      extract_response = await llm_service.chat_completion([{"role": "user", "content": extract_prompt}])
                      
-                     match_e = re.search(r'```json\s*(.*?)\s*```', extract_response, re.DOTALL | re.IGNORECASE)
-                     json_str_e = match_e.group(1) if match_e else extract_response
-                     
-                     p1_e = json_str_e.find('{')
-                     p2_e = json_str_e.rfind('}')
-                     if p1_e != -1 and p2_e != -1:
-                         json_str_e = json_str_e[p1_e:p2_e+1]
+                     json_str_e = find_json_segment(extract_response)
+                     if not json_str_e: json_str_e = extract_response
                          
                      structured_data = json.loads(json_str_e)
                      logger.info("JSON successfully extracted via secondary prompt.")
@@ -286,6 +301,35 @@ class ExtractionService:
                      logger.error(f"Secondary extraction failed: {e_extract}")
                      pass
                  # ---------------------------------------
+            
+            # --- Normalize Data Structure ---
+            # Ensure we have a standard dict with 'characters' list
+            
+            # 1. Handle List Root
+            if isinstance(structured_data, list):
+                structured_data = {"characters": structured_data}
+            
+            # 2. Handle Dict Root
+            elif isinstance(structured_data, dict):
+                # Check for alternative keys
+                if "characters" not in structured_data:
+                    # Map common misnamed keys
+                    for key in ["analysis", "character_analysis", "roles", "profiles"]:
+                        if key in structured_data and isinstance(structured_data[key], list):
+                            structured_data["characters"] = structured_data[key]
+                            break
+                            
+                    # If still no characters, check if it's a single character object
+                    if "characters" not in structured_data:
+                        if "name" in structured_data or "metrics" in structured_data or "basic_attributes" in structured_data:
+                             # Wrap single character in list
+                             # But be careful not to wrap the wrapper itself if it's empty
+                             structured_data = {"characters": [structured_data]}
+            
+            # 3. Final Check: Ensure 'characters' is a list
+            if "characters" in structured_data and not isinstance(structured_data["characters"], list):
+                 structured_data["characters"] = [structured_data["characters"]]
+            # --------------------------------
             
             return {
                 "markdown_report": response,

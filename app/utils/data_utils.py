@@ -54,8 +54,16 @@ def deep_merge_profile(old_data, new_data):
             except Exception:
                 # 兜底策略：直接拼接
                 merged[key] = old_val + new_val
+        elif isinstance(new_val, list) and isinstance(old_val, str):
+            merged[key] = [old_val] + [v for v in new_val if v != old_val]
+        elif isinstance(new_val, str) and isinstance(old_val, list):
+            merged[key] = old_val + ([new_val] if new_val not in old_val else [])
+        elif isinstance(new_val, str) and isinstance(old_val, str):
+            if new_val == old_val:
+                merged[key] = old_val
+            else:
+                merged[key] = [old_val, new_val]
         else:
-            # 基本类型：覆盖 (Overwrite)
             merged[key] = new_val
     
     return merged

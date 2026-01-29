@@ -20,6 +20,7 @@ class CharacterEventCreate(BaseModel):
     intent: Optional[str] = None
     strategy: Optional[str] = None
     session_id: Optional[str] = None
+    event_date: Optional[str] = None
 
 @router.post("/feedback", summary="提交用户反馈")
 async def create_feedback(
@@ -61,7 +62,8 @@ def add_event(
             event.summary, 
             event.intent, 
             event.strategy, 
-            event.session_id
+            event.session_id,
+            event.event_date
         )
         return {"status": "success", "id": new_event.id}
     except Exception as e:

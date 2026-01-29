@@ -137,6 +137,7 @@ class Character(Base):
     # Relationships
     relationships_as_source = relationship("Relationship", foreign_keys="[Relationship.source_id]", back_populates="source")
     relationships_as_target = relationship("Relationship", foreign_keys="[Relationship.target_id]", back_populates="target")
+    events = relationship("CharacterEvent", back_populates="character", order_by="desc(CharacterEvent.event_date)")
 
 class Relationship(Base):
     __tablename__ = "relationships"
@@ -254,8 +255,12 @@ class CharacterEvent(Base):
     id = Column(Integer, primary_key=True, index=True)
     character_id = Column(Integer, ForeignKey("characters.id"))
     
-    event_time = Column(String) # YYYY-MM-DD
-    description = Column(Text)
-    source_log_id = Column(Integer, nullable=True)
+    event_date = Column(DateTime(timezone=True), server_default=func.now())
+    summary = Column(Text)
+    intent = Column(String, nullable=True)
+    strategy = Column(String, nullable=True)
+    source_session_id = Column(String, nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    character = relationship("Character", back_populates="events")

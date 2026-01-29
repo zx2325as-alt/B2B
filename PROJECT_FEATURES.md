@@ -1,111 +1,75 @@
-# BtB 系统深度功能技术白皮书
+# Project Features & Documentation
 
-本文档深入解析 BtB (Behind the Bot) 系统各个模块的技术实现细节、数据流逻辑及核心算法策略。
+## 1. 核心功能模块 (Core Modules)
 
----
+### A. 长对话深度分析 (Long Conversation Analysis)
+- **入口**: `pages/1_Long_Conversation_Analysis.py`
+- **功能**:
+  - **多角色多维度分析**: 支持对对话中的多个角色进行并行分析，提取 6 维人物属性（基础属性、表层行为、情绪特征、认知决策、人格特质、核心本质）。
+  - **动态归档 (Dynamic Archiving)**: 
+    - 使用 `deep_merge_profile` 算法，支持对角色档案的非破坏性增量更新。
+    - 自动版本控制，保留历史变更记录。
+    - 支持 "Pending" 状态的观察记录，需管理员审核后合入主档案。
+  - **全量历史回溯**: 支持加载完整的对话历史 (`limit=-1`) 进行深度挖掘。
+  - **可视化展示**: 提供多维度的雷达图、趋势图展示角色成长与变化。
 
-## 1. 🏠 前端交互与会话管理 (Frontend UI)
-**核心文件**: `app/web/chat_ui.py`
+### B. 实时语音交互 (Real-time Audio Interaction)
+- **入口**: `pages/3_Audio_Collector.py` (Frontend) + `pages/4_Analysis_Monitor.py` (Backend Monitor)
+- **架构**: 
+  - **前后端分离**: 采集端 (Collector) 负责音频流捕获、VAD 切分、初步特征提取 (MFCC, SER)；分析端 (Monitor) 负责深度 LLM 分析与融合。
+  - **WebSocket流式传输**: 实现低延迟的音频数据传输。
+  - **并发处理**: 采用生产者-消费者模型，音频录制与 API 调用并行，支持 Overlap 处理。
+- **特性**:
+  - **实时转写 (STT)**: 集成 Faster-Whisper，支持 CUDA 加速与 CPU 自动回退 (Fallback)。
+  - **说话人分离 (Diarization)**: 基于聚类 (Agglomerative Clustering) 的轻量级声纹识别，结合 Voice Profile 数据库。
+  - **情感识别 (SER)**: 实时输出情感标签与置信度。
 
-基于 Streamlit 构建的沉浸式角色扮演工作台，采用了 **Session State 驱动** 的状态管理模式。
+### C. 会议分析系统 (Meeting Analysis System)
+- **入口**: `pages/5_Meeting_Analysis_System.py`
+- **功能**:
+  - **实时仪表盘**: 整合音频采集、波形显示、实时转写、情感分析于一体。
+  - **角色弧光 (Character Arc)**: 实时追踪参会者的情绪变化与观点演进。
+  - **深度分析**: 会后自动生成会议纪要、决议提取、待办事项整理。
 
-### **1.1 会话状态同步机制 (Session Synchronization)**
-前端与后端通过 `create_or_update_session` 函数保持严格同步，确保上下文的一致性：
-- **状态初始化**: 系统启动时自动生成 UUID 作为 `session_id`。
-- **动态更新 (PUT)**: 当用户切换 **场景 (Scenario)** 或 **当前扮演角色 (Character)** 时，触发 `PUT /sessions/{session_id}` 请求，更新后端上下文指针。
-- **自动恢复 (Auto-Recovery)**: 若后端返回 `404 Not Found` (会话过期)，前端会自动重置 `session_id` 并发起 `POST` 请求创建新会话，实现无感知的断线重连。
+### D. 系统管理后台 (Admin Dashboard)
+- **入口**: `pages/Admin_Dashboard.py`
+- **功能概览**:
+  - **数据管理中心**: 提供对系统核心数据（对话日志、角色档案、场景配置）的增删改查 (CRUD) 界面。
+  - **反馈与评估系统**: 查看并管理用户提交的对话评分 (Rating) 与反馈建议 (Feedback)，用于模型微调与系统优化。
+- **子模块详情**:
+  1.  **场景管理 (Scene Management)**:
+      -   **功能**: 管理对话场景的预设配置，包括场景背景、预设引导语、相关角色绑定等。
+      -   **实现**: 基于 `SceneService`，支持 JSON 配置的导入导出。
+  2.  **角色管理 (Character Management)**:
+      -   **功能**: 查看和编辑系统中的角色档案 (Profiles)。支持查看角色的多维度属性（基础、行为、情绪等）以及历史版本记录。
+      -   **实现**: 复用 `CharacterService`，提供结构化 JSON 编辑器。
+  3.  **关系管理 (Relation Management)**:
+      -   **功能**: 定义和管理角色之间的人物关系图谱 (Relationship Graph)。
+      -   **可视化**: 使用图表展示角色间的互动频率与情感倾向。
+  4.  **核心监控 (Core Monitoring)**:
+      -   **功能**: 全局监控系统运行状态，包括聊天日志、实时语音日志和长对话分析记录。
+      -   **指标**: 实时计算平均响应延迟 (Latency)、用户评分 (Rating) 和对话吞吐量。
+  5.  **待处理建议 (Suggestions)**:
+      -   **功能**: 审核由 AI 自动提取的角色观察建议 (Observations)。
+      -   **操作**: 管理员可对建议进行 "批准 (Approve)" 或 "拒绝 (Reject)"，批准后自动合入档案。
+  6.  **人物指标 (Character Metrics)**:
+      -   **功能**: 可视化展示角色的成长轨迹和关键指标变化（如好感度、情绪波动等）。
 
-### **1.2 可视化组件技术细节**
-- **实时关系图谱 (Graphviz)**:
-    - 调用 `GET /characters/{id}/relationships` 获取邻接表数据。
-    - 使用 `graphviz.Digraph` 动态渲染有向图，当前角色节点高亮 (Gold)，关系边显示交互细节 (`details`)。
-- **人机回环反馈 UI (HITL Feedback)**:
-    - **状态机管理**: 每个消息块独立维护反馈状态 (`pending` -> `providing_reason` -> `done_yes/no`)。
-    - **多级反馈**:
-        - ✅ **准确**: 直接提交正向反馈。
-        - ❌ **不准确**: 触发二级表单，收集 `reason_category` (如：情绪判断错误、意图偏差) 和 `comment`，用于后续的模型微调 (SFT) 数据集构建。
+## 2. 关键技术特性 (Key Technical Features)
 
-### **1.3 多模态消息渲染**
-- **结构化推理展示**: 解析后端返回的 JSON `details` 字段，通过 `st.expander` 或直接嵌入消息体展示：
-    - **意图分析 (Intent)**: 显式展示 AI 对用户话语的意图判断。
-    - **潜台词 (Subtext)**: 揭示角色听到的“弦外之音”。
-    - **全景推演 (Audience Analysis)**: 使用 `st.columns` 网格化展示在场其他 NPC 的心理活动与预期反应。
+### 数据一致性与版本控制
+- **Deep Merge Strategy**: 自研 `deep_merge_profile` 工具函数 (`app/utils/data_utils.py`)，确保 JSON 数据在合并时保留原有结构，支持列表追加与字典递归更新。
+- **Session State Management**: 利用 Streamlit Session State 在多页面间保持上下文与用户状态。
 
----
+### 高性能音频处理
+- **Hybrid Retrieval**: 结合 BM25 关键词检索与语义向量检索 (`KnowledgeService`)，提高 RAG 准确率。
+- **CUDA/CPU Hybrid**: 智能检测硬件环境，自动切换推理设备，确保系统稳定性。
 
-## 2. 📜 长对话深度分析引擎 (Deep Analysis Engine)
-**核心文件**: `app/services/extraction_service.py`, `app/web/pages/1_Long_Conversation_Analysis.py`
+### API 与 接口规范
+- **RESTful API**: 基于 FastAPI 构建后端服务 (`app/api/`)。
+- **规范化校验**: 使用 Pydantic 模型与 `Body(..., embed=True)` 确保请求参数的严格校验，统一前端调用规范 (JSON Body)。
 
-系统的核心大脑，负责将非结构化的对话流转化为结构化的角色档案数据。
-
-### **2.1 上下文注入策略 (Context Injection Strategy)**
-为了让 LLM (Large Language Model) 做出精准判断，系统采用了 **动态提示词工程 (Dynamic Prompt Engineering)**，注入多源上下文：
-1.  **多模态感知 (Multimodal Context)**:
-    - 注入音频特征：`Pitch` (音高/Hz), `Energy` (能量/dB), `Duration` (时长)。
-    - 注入 SER (语音情感识别) 结果：例如 `Top Emotion: Anger (0.85)`。
-    - *目的*: 修正 LLM 仅凭文本对语气和情绪的误判。
-2.  **历史摘要 (History Summaries)**:
-    - 检索 ChromaDB 或 SQL 中的过往会话摘要，构建长期记忆链。
-3.  **原始对话回溯 (Raw Dialogue History)**:
-    - **新增特性**: 不仅依赖摘要，直接注入角色过往的 **原始对话记录 (Raw Logs)**。
-    - *实现*: `load_raw_dialogue_logs` 函数按时间戳拉取 `User` 和 `Bot` 的逐字对白，保留原汁原味的说话风格。
-4.  **已知档案锚点 (Known Metrics)**:
-    - 注入角色当前的 6 维属性，要求 LLM 仅提取 **“变化”** 或 **“新信息”**，避免重复提取。
-
-### **2.2 七维数据提取架构 (7-Dimensional Extraction)**
-LLM 被指示严格按照 JSON Schema 提取以下七个维度的信息：
-1.  **基础属性 (Basic Attributes)**: 身份、年龄、客观事实。
-2.  **表层行为 (Surface Behavior)**: 口癖、肢体语言习惯。
-3.  **情绪特征 (Emotional Traits)**: 情绪阈值、压力反应模式。
-4.  **认知决策 (Cognitive Decision)**: 逻辑闭环、价值观优先级。
-5.  **人格特质 (Personality Traits)**: Big Five, MBTI, 核心性格底色。
-6.  **核心本质 (Core Essence)**: 终极欲望、恐惧、灵魂暗面。
-7.  **人物弧光 (Character Arc) [NEW]**:
-    - **事件驱动**: 记录 `event` (事件描述) 和 `timestamp`。
-    - **类型标记**: 识别变化类型 (`Growth` 成长, `Regression` 退行, `Turning Point` 转折点)。
-
-### **2.3 鲁棒性设计 (Robustness)**
-- **JSON 自修复机制**: 若 LLM 输出的 JSON 格式错误 (如多余的逗号、Markdown 标记)，系统会自动捕获 `JSONDecodeError` 并发起二次 LLM 调用 (`repair_prompt`) 进行格式修复，确保数据管道不中断。
-
----
-
-## 3. 💾 数据归档与演化算法 (Data Management)
-**核心文件**: `app/utils/data_utils.py`, `app/web/pages/1_Long_Conversation_Analysis.py`
-
-### **3.1 非破坏性深度合并算法 (Non-Destructive Deep Merge)**
-**函数**: `deep_merge_profile(old_data, new_data)`
-为了解决“新分析覆盖旧记忆”的问题，实现了递归合并逻辑：
-- **字典 (Dict)**: 递归遍历键值对进行合并。
-- **列表 (List)**: **追加并去重 (Append & Deduplicate)**。
-    - 使用 `Set` 对可哈希元素去重。
-    - 对不可哈希元素 (如复杂 Dict) 直接追加，保留完整历史痕迹。
-- **基本类型 (Primitive)**: 仅当新值非空 (Truthy) 时才覆盖旧值，防止有效信息被空值擦除。
-
-### **3.2 统一归档工作流 (Unified Workflow)**
-`perform_character_archive` 函数标准化了所有归档操作：
-1.  **时间线记录**: 将分析出的 `character_deeds` 或手动事件写入 `Event` 表。
-2.  **最新状态同步**: 在合并前强制 `GET` 最新档案，防止并发写入导致的数据回滚 (Stale Data)。
-3.  **增量更新**: 应用 `deep_merge_profile` 生成最终档案快照。
-4.  **版本控制**: 每次归档自动生成 `version_note`，支持回滚。
-
----
-
-## 4. 🎙️ 实时音频流处理 (Real-time Processing)
-**核心文件**: `app/web/pages/6_Realtime_Recording.py`
-
-### **4.1 低延迟架构**
-- **WebSocket 全双工通信**: 浏览器端 JS 组件通过 WebSocket 直接推送 16kHz PCM 音频流。
-- **VAD (Voice Activity Detection)**: 后端集成 `webrtcvad` 进行静音检测，仅处理有效语音帧，降低计算负载。
-- **流式识别**: 采用 `Faster-Whisper` 或云端 API 进行流式 STT (Speech-to-Text)。
-
-### **4.2 动态声纹聚类**
-- 系统实时维护一个 **声纹特征池 (Embedding Pool)**。
-- 每段新语音计算 Embedding 后，与池中质心计算余弦相似度，实时判断是 "Speaker A" 还是 "New Speaker"，实现会议场景下的自动角色区分。
-
----
-
-## 5. 🛠️ 通用助手与文件解析
-**核心文件**: `app/web/pages/2_General_Assistant.py`
-
-- **智能编码检测**: 使用 `chardet` 库自动识别上传文件 (`.txt`, `.md`) 的编码格式 (UTF-8, GBK, Latin-1)，彻底解决中文乱码问题。
-- **思维链展示 (CoT)**: 对于复杂指令，系统会请求 LLM 输出 `<thinking>` 标签包裹的推理过程，并在 UI 上通过 `st.expander("Reasoning")` 折叠展示，增强可解释性。
+## 3. 部署与环境 (Deployment)
+- **依赖管理**: `requirements.txt`
+- **模型下载**: `scripts/download_models.py` (支持 HF Mirror)
+- **启动脚本**: `start_btb.bat` (集成环境配置与服务启动)

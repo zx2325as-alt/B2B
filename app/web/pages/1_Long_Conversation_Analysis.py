@@ -28,7 +28,7 @@ def load_history_from_api(character_names=None):
         pass
     return []
 
-def load_raw_dialogue_logs(character_names=None, character_map=None):
+def load_raw_dialogue_logs(character_names=None, character_map=None, limit=-1):
     """
     Load raw dialogue logs (User inputs & Bot responses) from backend API.
     Returns a list of dicts: {"character": str, "text": str, "timestamp": str}
@@ -50,18 +50,19 @@ def load_raw_dialogue_logs(character_names=None, character_map=None):
         
         all_logs = []
         
+        limit_param = limit if limit is not None else 50
         if not target_ids:
             # Try to fetch some recent global logs?
             # Or just return empty if no char selected.
             # Let's fetch global recent logs if no char selected (unlikely in this UI)
-            res = requests.get(f"{API_URL}/logs", params={"limit": 100})
+            res = requests.get(f"{API_URL}/logs", params={"limit": limit_param})
             if res.status_code == 200:
                 all_logs = res.json()
         else:
             # Fetch for each character (API doesn't support list of IDs yet, so loop)
             # This might be slow if many chars, but usually 1-3.
             for cid in target_ids:
-                res = requests.get(f"{API_URL}/logs", params={"character_id": cid, "limit": 50})
+                res = requests.get(f"{API_URL}/logs", params={"character_id": cid, "limit": limit_param})
                 if res.status_code == 200:
                     all_logs.extend(res.json())
         
@@ -156,7 +157,8 @@ def perform_character_archive(api_url, target_char_id, target_char_name, profile
                 "summary": f"[{evt_time}] {summary}",
                 "intent": intent,
                 "strategy": strategy,
-                "session_id": session_id
+                "session_id": session_id,
+                "event_date": evt_time
             }
              try:
                 requests.post(f"{api_url}/characters/{target_char_id}/events", json=payload)
@@ -210,7 +212,8 @@ def perform_character_archive(api_url, target_char_id, target_char_name, profile
                     if k in profile_update:
                         raw = profile_update[k]
                         new_val = raw.get("data", raw) if isinstance(raw, dict) else {}
-                        current_dyn = deep_merge_profile(current_dyn, new_val)
+                        # Merge under the specific key to maintain structure
+                        current_dyn = deep_merge_profile(current_dyn, {k: new_val})
                         updated_dims.append(label)
                 
                 # Update
@@ -597,19 +600,26 @@ if st.button("开始分析 (Start Analysis)", type="primary"):
     if not final_text:
         st.warning("请先输入内容或上传文本文件。")
     else:
+        # Store for feedback
+        st.session_state.analyzed_text_content = final_text
         with st.spinner("正在分析中 (Analyzing)..."):
             try:
-                # Load recent history for context
-                history_records = load_history_from_api(selected_char_names)
+                actual_char_names = [name for name in selected_char_names if name in char_options]
+                history_records = load_history_from_api(actual_char_names)
                 
                 # Load raw dialogue history (User requested "reference to historical speech")
-                raw_dialogue_history = load_raw_dialogue_logs(selected_char_names, char_options)
+                raw_dialogue_history = load_raw_dialogue_logs(actual_char_names, char_options, limit=-1)
 
                 # Take recent summaries for context
-                recent_history = [
-                    {"timestamp": r.get("created_at"), "summary": r.get("summary")} 
-                    for r in history_records
-                ]
+                recent_history = []
+                for r in history_records:
+                    summary_val = r.get("summary")
+                    if not summary_val:
+                        summary_val = (r.get("structured_data") or {}).get("summary")
+                    if not summary_val and r.get("markdown_report"):
+                        summary_val = r.get("markdown_report")[:200]
+                    if summary_val:
+                        recent_history.append({"timestamp": r.get("created_at"), "summary": summary_val})
 
                 payload = {
                     "text": final_text,
@@ -699,6 +709,11 @@ if "analysis_result" in st.session_state:
                     try:
                         # 1. Prepare Data
                         profile_update = item.get("profile_update") or item.get("metrics", {})
+                        if isinstance(profile_update, dict):
+                            profile_update = profile_update.copy()
+                            if "character_arc" in item:
+                                profile_update["character_arc"] = item["character_arc"]
+                        
                         deep_intent = item.get("deep_intent", "未检测到")
                         strategies = item.get("strategy") or item.get("strategies", [])
                         if isinstance(strategies, list): strategies = ", ".join(strategies)
@@ -761,6 +776,10 @@ if "analysis_result" in st.session_state:
             if isinstance(mood, list): mood = ", ".join(mood)
             
             profile_update = item.get("profile_update") or item.get("metrics", {})
+            if isinstance(profile_update, dict):
+                profile_update = profile_update.copy()
+                if "character_arc" in item:
+                    profile_update["character_arc"] = item["character_arc"]
 
             # Use index in expander key to avoid duplicate ID errors
             with st.expander(f"🎭 {char_name} 归档面板", expanded=False):
@@ -911,6 +930,9 @@ if "analysis_result" in st.session_state:
                         st.error(f"归档过程异常: {e}")
 
     else:
+# 调试信息
+        st.write("调试信息：分析结果的结构")
+        st.write(result)
         st.info("本次分析未提取到结构化角色信息。")
         # Fallback: Old Format Support
         st.warning("⚠️ 收到旧格式数据或解析失败，尝试以兼容模式显示。")
@@ -922,7 +944,7 @@ if "analysis_result" in st.session_state:
     # 2. Universal Archive (One-Click)
     # ==========================================
     st.subheader("📥 通用一键归档 (One-Click Archive)")
-    st.caption("将本次分析结果（摘要/报告）归档到指定角色的时间线或档案中。")
+    st.caption("将本次分析结果（摘要/报告）归档到指定角色的时间线或档案中。支持多角色批量归档。")
     
     # Universal Archive Container
     with st.container():
@@ -934,93 +956,126 @@ if "analysis_result" in st.session_state:
              else:
                  archive_content = st.session_state.input_text_content[:200] + "..."
         
+        # --- Multi-Character Selection Logic ---
+        detected_names = [item.get("name") for item in char_analysis_list if item.get("name")]
+        
+        # Pre-select detected characters if they exist in DB
+        default_selections = []
+        for name in detected_names:
+            if name in char_options:
+                default_selections.append(name)
+        
+        # Filter valid options from DB
+        all_char_names = sorted(list(char_options.keys()))
+        
         col_univ_target, col_univ_action = st.columns([3, 1])
         
         with col_univ_target:
-            univ_opts = ["🆕 新建角色..."] + sorted([f"👤 {c}" for c in char_options.keys()])
-            default_univ_idx = 0
-            if selected_char_names:
-                first_sel = selected_char_names[0]
-                if first_sel in char_options:
-                     try:
-                        default_univ_idx = univ_opts.index(f"👤 {first_sel}")
-                     except:
-                        pass
+            selected_targets = st.multiselect(
+                "选择归档目标 (可多选，默认选中分析检测到的角色)", 
+                options=all_char_names,
+                default=default_selections,
+                key="univ_archive_multiselect"
+            )
             
-            univ_sel = st.selectbox("选择归档目标 (Select Character)", univ_opts, index=default_univ_idx, key="univ_archive_sel")
-            
-            univ_new_name = ""
-            if "🆕" in univ_sel:
-                univ_new_name = st.text_input("输入新角色名称:", key="univ_new_name")
-        
+            # Show warning for detected but missing characters
+            missing_chars = [name for name in detected_names if name not in char_options]
+            if missing_chars:
+                st.warning(f"⚠️ 检测到未注册角色: {', '.join(missing_chars)}")
+                # Option to auto-create missing could be added here, but keeping it simple for now
+                # Or provide a quick create button?
+                cols_missing = st.columns(len(missing_chars))
+                for idx, m_name in enumerate(missing_chars):
+                    if cols_missing[idx].button(f"➕ 创建 '{m_name}'", key=f"create_missing_{idx}"):
+                        try:
+                            create_payload = {
+                                "name": m_name,
+                                "system_prompt": f"You are {m_name}.",
+                                "attributes": {},
+                                "traits": {}
+                            }
+                            res_create = requests.post(f"{API_URL}/characters", json=create_payload)
+                            if res_create.status_code == 200:
+                                st.toast(f"✅ 新角色 [{m_name}] 创建成功！请刷新页面或重新选择。")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(f"创建失败: {res_create.text}")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
         with col_univ_action:
             st.write("") # Spacer
             st.write("")
-            btn_univ_archive = st.button("🚀 归档本次分析", key="btn_univ_archive", type="primary", use_container_width=True)
+            btn_univ_archive = st.button("🚀 批量归档 (Batch Archive)", key="btn_univ_archive", type="primary", use_container_width=True)
             
         if btn_univ_archive:
-            try:
-                target_char_obj = None
+            if not selected_targets:
+                st.error("请至少选择一个归档目标角色！")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-                # 1. Handle New Character
-                if "🆕" in univ_sel:
-                    if not univ_new_name.strip():
-                        st.error("请输入新角色名称！")
-                        st.stop()
-                    
-                    create_payload = {
-                        "name": univ_new_name.strip(),
-                        "system_prompt": f"You are {univ_new_name}.",
-                        "attributes": {},
-                        "traits": {}
-                    }
-                    res_create = requests.post(f"{API_URL}/characters", json=create_payload)
-                    if res_create.status_code == 200:
-                        target_char_obj = res_create.json()
-                        st.toast(f"✅ 新角色 [{univ_new_name}] 创建成功！")
-                    else:
-                        st.error(f"创建角色失败: {res_create.text}")
-                        st.stop()
-                else:
-                    # Existing Character
-                    selected_name = univ_sel.replace("👤 ", "")
-                    target_char_obj = char_options.get(selected_name)
+                success_count = 0
+                fail_count = 0
                 
-                if target_char_obj:
-                    # Prepare data
-                    profile_update = {}
-                    found_struct = next((item for item in char_analysis_list if item.get("name") == target_char_obj['name']), None)
-                    if found_struct:
-                        profile_update = found_struct.get("profile_update") or found_struct.get("metrics", {})
-                    
-                    event_data = {
-                        "summary": f"对话分析归档: {archive_content[:100]}...",
-                        "intent": "Manual Archive",
-                        "strategy": "Analysis",
-                        "session_id": result.get("log_id", "manual_analysis"),
-                        "version_note": "Universal Analysis Archive"
-                    }
-                    
-                    success, msg, updated_dims = perform_character_archive(
-                        API_URL,
-                        target_char_obj['id'],
-                        target_char_obj['name'],
-                        profile_update,
-                        event_data
-                    )
-                    
-                    if success:
-                        st.success(f"✅ 已成功归档至 [{target_char_obj['name']}]！")
-                        if updated_dims:
-                            st.info(f"🔄 检测到深度画像数据，已执行增量更新 (维度: {', '.join(updated_dims)})")
-                    else:
-                        st.error(f"归档失败: {msg}")
+                for idx, target_name in enumerate(selected_targets):
+                    status_text.text(f"正在处理: {target_name}...")
+                    try:
+                        target_char_obj = char_options.get(target_name)
                         
-                else:
-                    st.error("目标角色无效。")
+                        if target_char_obj:
+                            # Prepare data
+                            profile_update = {}
+                            found_struct = next((item for item in char_analysis_list if item.get("name") == target_name), None)
+                            
+                            # If found specific analysis for this character, use it
+                            if found_struct:
+                                profile_update = found_struct.get("profile_update") or found_struct.get("metrics", {})
+                                if isinstance(profile_update, dict):
+                                    profile_update = profile_update.copy()
+                                    if "character_arc" in found_struct:
+                                        profile_update["character_arc"] = found_struct["character_arc"]
+                                        # Auto-extract timeline summary from Arc
+                                        if isinstance(found_struct["character_arc"], dict) and "event" in found_struct["character_arc"]:
+                                            profile_update["timeline_summary"] = found_struct["character_arc"]["event"]
+                            
+                            event_data = {
+                                "summary": f"对话分析归档: {archive_content[:100]}...",
+                                "intent": "Manual Archive",
+                                "strategy": "Analysis",
+                                "session_id": result.get("log_id", "manual_analysis"),
+                                "version_note": "Universal Analysis Archive"
+                            }
+                            
+                            success, msg, updated_dims = perform_character_archive(
+                                API_URL,
+                                target_char_obj['id'],
+                                target_char_obj['name'],
+                                profile_update,
+                                event_data
+                            )
+                            
+                            if success:
+                                success_count += 1
+                                # st.toast(f"✅ [{target_name}] 归档成功！")
+                            else:
+                                fail_count += 1
+                                st.error(f"[{target_name}] 归档失败: {msg}")
+                        else:
+                            fail_count += 1
+                            st.error(f"[{target_name}] 角色对象未找到。")
+                            
+                    except Exception as e:
+                        fail_count += 1
+                        st.error(f"[{target_name}] 处理异常: {e}")
                     
-            except Exception as e:
-                st.error(f"归档失败: {e}")
+                    progress_bar.progress((idx + 1) / len(selected_targets))
+                
+                status_text.text("处理完成！")
+                st.success(f"批量归档完成！成功: {success_count}, 失败: {fail_count}")
+                if success_count > 0:
+                    st.balloons()
 
     # ==========================================
     # 3. Feedback & Evolution
@@ -1029,19 +1084,30 @@ if "analysis_result" in st.session_state:
     st.subheader("📊 质量反馈与进化 (Feedback & Evolution)")
     st.caption("您的反馈将帮助系统进化。差评 (<=2星) 将自动触发‘复盘分析’并生成微调数据。")
     
+    feedback_log_id = result.get("log_id", "manual_analysis")
+    rating_key = f"lc_feedback_rating_{feedback_log_id}"
+    comment_key = f"lc_feedback_comment_{feedback_log_id}"
+    if rating_key not in st.session_state:
+        st.session_state[rating_key] = 5
+    if comment_key not in st.session_state:
+        st.session_state[comment_key] = ""
+
     with st.form("feedback_form"):
         col_f1, col_f2 = st.columns([1, 3])
         with col_f1:
-            rating = st.slider("评分 (Rating)", 1, 5, 5, help="1=差评(触发进化), 5=好评")
+            rating = st.slider("评分 (Rating)", 1, 5, help="1=差评(触发进化), 5=好评", key=rating_key)
         with col_f2:
-            comment = st.text_input("建议/吐槽 (Optional comment)")
+            comment = st.text_input("建议/吐槽 (Optional comment)", key=comment_key)
             
         submitted = st.form_submit_button("提交反馈 (Submit)")
         if submitted:
+            # Use actual analyzed text if available, else fallback to current input
+            feedback_input = st.session_state.get("analyzed_text_content", st.session_state.get("input_text_content", ""))
+            
             feedback_payload = {
                 "session_id": "manual_analysis",
-                "user_input": text_input,
-                "model_output": json.dumps(result, ensure_ascii=False),
+                "user_input": feedback_input[:5000], # Limit length to avoid huge payload
+                "model_output": json.dumps(result, ensure_ascii=False, default=str),
                 "rating": rating,
                 "comment": comment
             }

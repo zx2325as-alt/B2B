@@ -91,7 +91,7 @@ llm:
     base_url: "http://localhost:11434/v1"
     
     # 本地模型名称 (需先在 ollama run ... 下载)
-    model: "gpt-oss:20b" 
+    model: "qwen3:0.6b" 
     
     proxy: ""
     timeout: 300.0

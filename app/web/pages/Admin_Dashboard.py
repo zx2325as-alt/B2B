@@ -292,7 +292,7 @@ with tab4:
                                         try:
                                             rate_res = requests.post(
                                                 f"{API_URL}/chat/{log['id']}/rate", 
-                                                params={"rating": new_rating, "feedback": feedback}
+                                                json={"rating": new_rating, "feedback": feedback}
                                             )
                                             if rate_res.status_code == 200:
                                                 st.success("已更新！")
@@ -444,7 +444,7 @@ with tab4:
                                     try:
                                         r = requests.post(
                                             f"{API_URL}/segments/{seg['id']}/rate", 
-                                            params={"rating": new_rating, "feedback": new_feedback}
+                                            json={"rating": new_rating, "feedback": new_feedback}
                                         )
                                         if r.status_code == 200:
                                             st.success("Saved!")
@@ -465,7 +465,7 @@ with tab4:
                                 "rating": rating,
                                 "comment": "Monitor Rating"
                             }
-                            requests.post(f"{API_URL}/feedback/feedback", json=payload, timeout=5)
+                            requests.post(f"{API_URL}/feedback", json=payload, timeout=5)
                             st.toast(f"评分已同步: {rating}")
                     except: pass
                         
@@ -1931,11 +1931,16 @@ with tab7:
         st.subheader("🧬 结构化动态档案 (Structured Dynamic Profile)")
         
         # Helper to safely get nested values
-        def get_val(data, key, default="待补充"):
-            val = data.get(key)
+        def get_val(data, key, default="待补充", fallback=None):
+            val = data.get(key) if isinstance(data, dict) else None
             if val:
                 if isinstance(val, (dict, list)): return val
                 return val
+            if fallback is not None:
+                val = fallback.get(key) if isinstance(fallback, dict) else None
+                if val:
+                    if isinstance(val, (dict, list)): return val
+                    return val
             return default
 
         # Use Tabs instead of vertical expanders
@@ -1946,6 +1951,10 @@ with tab7:
         
         attrs = char_detail.get("attributes", {})
         traits = char_detail.get("traits", {})
+        surface = dyn.get("surface_behavior", {}) if isinstance(dyn.get("surface_behavior"), dict) else {}
+        emotional = dyn.get("emotional_traits", {}) if isinstance(dyn.get("emotional_traits"), dict) else {}
+        cognitive = dyn.get("cognitive_decision", {}) if isinstance(dyn.get("cognitive_decision"), dict) else {}
+        core = dyn.get("core_essence", {}) if isinstance(dyn.get("core_essence"), dict) else {}
         
         with p_tab1:
             c1, c2, c3 = st.columns(3)
@@ -1955,26 +1964,26 @@ with tab7:
             
         with p_tab2:
             c1, c2, c3 = st.columns(3)
-            c1.markdown("**🗣️ 沟通模式**"); c1.write(get_val(dyn, "communication_style"))
-            c2.markdown("**🎭 行为习惯**"); c2.write(get_val(dyn, "behavior_habits"))
-            c3.markdown("**🤝 社交风格**"); c3.write(get_val(dyn, "social_style"))
+            c1.markdown("**🗣️ 沟通模式**"); c1.write(get_val(surface, "communication_style", fallback=dyn))
+            c2.markdown("**🎭 行为习惯**"); c2.write(get_val(surface, "behavior_habits", fallback=dyn))
+            c3.markdown("**🤝 社交风格**"); c3.write(get_val(surface, "social_style", fallback=dyn))
             
         with p_tab3:
             c1, c2, c3 = st.columns(3)
-            c1.markdown("**🌊 情绪基线**"); c1.info(get_val(dyn, "emotional_baseline"))
-            c2.markdown("**💥 情绪触发点**"); c2.write(get_val(dyn, "emotional_triggers"))
-            c3.markdown("**📤 情绪表达**"); c3.write(get_val(dyn, "emotional_expression"))
+            c1.markdown("**🌊 情绪基线**"); c1.info(get_val(emotional, "emotional_baseline", fallback=dyn))
+            c2.markdown("**💥 情绪触发点**"); c2.write(get_val(emotional, "emotional_triggers", fallback=dyn))
+            c3.markdown("**📤 情绪表达**"); c3.write(get_val(emotional, "emotional_expression", fallback=dyn))
             # Regulation in c1 or new line? Let's put regulation in c1 bottom
             # st.markdown("**🧘 情绪调节**"); st.write(get_val(dyn, "emotional_regulation"))
             
         with p_tab4:
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**⚖️ 决策风格**"); st.write(get_val(dyn, "decision_style"))
-                st.markdown("**🧠 思维模式**"); st.write(get_val(dyn, "thinking_mode"))
+                st.markdown("**⚖️ 决策风格**"); st.write(get_val(cognitive, "decision_style", fallback=dyn))
+                st.markdown("**🧠 思维模式**"); st.write(get_val(cognitive, "thinking_mode", fallback=dyn))
             with c2:
-                st.markdown("**📏 判断标准**"); st.write(get_val(dyn, "judgment_criteria"))
-                st.markdown("**📥 信息处理**"); st.write(get_val(dyn, "info_processing"))
+                st.markdown("**📏 判断标准**"); st.write(get_val(cognitive, "judgment_criteria", fallback=dyn))
+                st.markdown("**📥 信息处理**"); st.write(get_val(cognitive, "info_processing", fallback=dyn))
                 
         with p_tab5:
             c1, c2 = st.columns(2)
@@ -1989,19 +1998,19 @@ with tab7:
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("**🚀 核心驱动力**")
-                drivers = dyn.get("core_drivers", [])
+                drivers = core.get("core_drivers") if isinstance(core.get("core_drivers"), list) else dyn.get("core_drivers", [])
                 if drivers:
                     for d in drivers: st.markdown(f"- {d}")
                 else: st.caption("待挖掘")
-                st.markdown("**🔋 动机来源**"); st.write(get_val(dyn, "motivation_source"))
+                st.markdown("**🔋 动机来源**"); st.write(get_val(core, "motivation_source", fallback=dyn))
                 
             with c2:
                 st.markdown("**❤️ 深层需求**")
-                needs = dyn.get("inferred_core_needs", [])
+                needs = core.get("inferred_core_needs") if isinstance(core.get("inferred_core_needs"), list) else dyn.get("inferred_core_needs", [])
                 if needs:
                     for n in needs: st.markdown(f"- {n}")
                 else: st.caption("待挖掘")
-                st.markdown("**🛡️ 行为底线**"); st.write(get_val(dyn, "behavior_bottom_line"))
+                st.markdown("**🛡️ 行为底线**"); st.write(get_val(core, "behavior_bottom_line", fallback=dyn))
             
             # Pending Updates
             st.caption("📝 待更新信息：基于后续对话分析自动补充...")

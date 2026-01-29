@@ -6,6 +6,7 @@ from app.services.llm import llm_service
 from app.utils.logger import logger
 import json
 import re
+import datetime
 
 class FeedbackService:
     """
@@ -80,17 +81,23 @@ class FeedbackService:
             logger.error(f"Evolution analysis failed: {e}")
             return None
 
-    def add_character_event(self, db: Session, character_id: int, summary: str, intent: str = None, strategy: str = None, session_id: str = None) -> CharacterEvent:
+    def add_character_event(self, db: Session, character_id: int, summary: str, intent: str = None, strategy: str = None, session_id: str = None, event_date: str = None) -> CharacterEvent:
         """
         Add a timeline event for a character.
         """
-        event = CharacterEvent(
-            character_id=character_id,
-            summary=summary,
-            intent=intent,
-            strategy=strategy,
-            source_session_id=session_id
-        )
+        event_payload = {
+            "character_id": character_id,
+            "summary": summary,
+            "intent": intent,
+            "strategy": strategy,
+            "source_session_id": session_id
+        }
+        if event_date:
+            try:
+                event_payload["event_date"] = datetime.datetime.fromisoformat(event_date)
+            except Exception:
+                event_payload["event_date"] = event_date
+        event = CharacterEvent(**event_payload)
         db.add(event)
         db.commit()
         db.refresh(event)
@@ -100,6 +107,6 @@ class FeedbackService:
         """
         Get events for a character, ordered by date desc.
         """
-        return db.query(CharacterEvent).filter(CharacterEvent.character_id == character_id).order_by(CharacterEvent.created_at.desc()).limit(limit).all()
+        return db.query(CharacterEvent).filter(CharacterEvent.character_id == character_id).order_by(CharacterEvent.event_date.desc()).limit(limit).all()
 
 feedback_service = FeedbackService()

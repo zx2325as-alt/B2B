@@ -362,21 +362,17 @@ async def chat(
 @router.post("/chat/{log_id}/rate", summary="评价对话质量")
 async def rate_dialogue(
     log_id: int, 
-    rating: int, 
-    feedback: str = None,
+    rating: int = Body(..., embed=True), 
+    feedback: str = Body(None, embed=True),
     db: Session = Depends(get_db)
 ):
     """
     提交用户反馈 (Submit User Feedback).
     
     Args:
-        log_id (int): 对话日志ID (由/chat接口返回)
-        rating (int): 评分 (1-5, 1=减少, 5=增加)
+        log_id (int): 对话日志ID
+        rating (int): 评分 (1-5)
         feedback (str, optional): 文本反馈建议
-        
-    Logic:
-        - 更新 `DialogueLog` 表中的评分和反馈。
-        - 如果评分 <= 2，标记为 `is_archived_for_tuning`，用于后续优化模型。
     """
     log_entry = db.query(DialogueLog).filter(DialogueLog.id == log_id).first()
     if not log_entry:
@@ -384,7 +380,7 @@ async def rate_dialogue(
     
     log_entry.rating = rating
     if feedback:
-        log_entry.feedback_text = feedback
+        log_entry.feedback_text = feedback[:2000] # Limit length
         
     if rating <= 2:
         log_entry.is_archived_for_tuning = 1
@@ -412,7 +408,10 @@ async def get_logs(
     if character_id:
         query = query.filter(DialogueLog.character_id == character_id)
     
-    logs = query.order_by(DialogueLog.created_at.desc()).offset(skip).limit(limit).all()
+    query = query.order_by(DialogueLog.created_at.desc()).offset(skip)
+    if limit and limit > 0:
+        query = query.limit(limit)
+    logs = query.all()
     return logs
 
 async def update_character_profile(db: Session, char_name: str, text: str):

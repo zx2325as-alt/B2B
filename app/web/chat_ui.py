@@ -77,7 +77,7 @@ def create_or_update_session():
         
         # Branch 1: 已有 Session ID -> 尝试更新 (UPDATE)
         if st.session_state.session_id:
-            res = requests.put(f"{API_URL}/sessions/{st.session_state.session_id}", params=payload)
+            res = requests.put(f"{API_URL}/sessions/{st.session_state.session_id}", json=payload)
             if res.status_code == 200:
                 pass # st.toast(f"会话上下文已更新") - Hidden as requested
             else:
@@ -91,7 +91,7 @@ def create_or_update_session():
         
         # Branch 2: 无 Session ID -> 创建新会话 (CREATE)
         else:
-            res = requests.post(f"{API_URL}/sessions", params=payload)
+            res = requests.post(f"{API_URL}/sessions", json=payload)
             if res.status_code == 200:
                 data = res.json()
                 st.session_state.session_id = data["session_id"]
@@ -423,7 +423,7 @@ for message in st.session_state.messages:
                         if st.button("提交反馈", key=f"btn_{log_id}"):
                             # Call API
                             try:
-                                res = requests.post(f"{API_URL}/chat/{log_id}/rate", params={"rating": new_score, "feedback": new_comment})
+                                res = requests.post(f"{API_URL}/chat/{log_id}/rate", json={"rating": new_score, "feedback": new_comment})
                                 if res.status_code == 200:
                                     # Update local state
                                     st.session_state.feedback_map[log_id]["count"] += 1

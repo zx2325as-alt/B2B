@@ -71,8 +71,8 @@ async def update_speaker(segment_id: int, speaker_name: str = Body(..., embed=Tr
 @router.post("/segments/{segment_id}/rate")
 async def rate_segment(
     segment_id: int, 
-    rating: int, 
-    feedback: str = None,
+    rating: int = Body(..., embed=True), 
+    feedback: str = Body(None, embed=True),
     db: Session = Depends(get_db)
 ):
     """
