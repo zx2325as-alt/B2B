@@ -4,10 +4,13 @@
     <div class="char-panel">
       <div class="panel-header">
         <span class="panel-title">角色库 <span class="count-badge">{{ chars.characters.length }}</span></span>
-        <button class="btn btn-primary" style="padding:6px 12px;font-size:12px" @click="openCreateModal">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          新建
-        </button>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" @click="openImportModal">导入/导出</button>
+          <button class="btn btn-primary" style="padding:6px 12px;font-size:12px" @click="openCreateModal">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            新建
+          </button>
+        </div>
       </div>
 
       <!-- Search -->
@@ -370,6 +373,116 @@
           </div>
         </div>
       </div>
+
+      <div v-if="showImportModal" class="modal-overlay" @click.self="showImportModal = false">
+        <div class="modal card fade-up" style="width:980px;max-height:88vh;overflow-y:auto">
+          <div class="modal-header">
+            <span>统一智能导入 / 导出</span>
+            <button class="btn-close" @click="showImportModal = false">✕</button>
+          </div>
+          <div style="padding:20px;display:flex;flex-direction:column;gap:18px">
+            <div class="section" style="margin-bottom:0">
+              <div class="section-title">文件入口</div>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                <input ref="importFileInput" type="file" class="input" accept=".txt,.md,.pdf,.docx,.json,.csv" style="max-width:340px" @change="handleImportFileChange"/>
+                <button class="btn btn-primary" :disabled="!selectedImportFile || importLoading" @click="previewImport">
+                  {{ importLoading ? '解析中…' : '上传并预览' }}
+                </button>
+                <button class="btn btn-ghost" @click="downloadExport">导出全量 JSON</button>
+              </div>
+              <div class="empty-hint" style="padding:8px 0 0;text-align:left">支持 TXT / MD / PDF / DOCX / JSON / CSV，统一进入 AI Harness 语义解析链路。</div>
+            </div>
+
+            <template v-if="importPreview">
+              <div class="import-grid">
+                <div class="card import-card">
+                  <div class="section-title">角色预览</div>
+                  <div v-if="!importPreview.role_mappings?.length" class="empty-hint">暂无角色</div>
+                  <div v-else class="import-list">
+                    <div v-for="mapping in importPreview.role_mappings" :key="mapping.original_name" class="import-item">
+                      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                        <strong>{{ mapping.original_name }}</strong>
+                        <span class="tag" :class="mapping.status === 'confirmed' ? 'green' : mapping.status === 'ambiguous' ? 'amber' : 'violet'">{{ mapping.status }}</span>
+                      </div>
+                      <div style="display:grid;grid-template-columns:1fr 100px;gap:8px;margin-top:8px">
+                        <input class="input" v-model="mapping.resolved_name" placeholder="确认名称 / 合并名称"/>
+                        <select class="input" v-model="mapping.action">
+                          <option value="create">新建</option>
+                          <option value="link">映射</option>
+                          <option value="skip">跳过</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card import-card">
+                  <div class="section-title">心理语义预览</div>
+                  <div v-if="!importPreview.interaction_units?.length" class="empty-hint">暂无交互单元</div>
+                  <div v-else class="import-list">
+                    <div v-for="(unit, idx) in importPreview.interaction_units.slice(0, 12)" :key="`${unit.speaker}-${idx}`" class="import-item">
+                      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                        <strong>{{ unit.speaker }} → {{ unit.receiver || '待推断' }}</strong>
+                        <span class="tag" :class="unit.receiver_confidence >= 0.6 ? 'green' : 'amber'">{{ Math.round((unit.receiver_confidence || 0) * 100) }}%</span>
+                      </div>
+                      <div class="obs-reason" style="margin-top:6px">{{ unit.content }}</div>
+                      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+                        <span class="tag">{{ unit.intent?.value || '意图待定' }}</span>
+                        <span class="tag">{{ unit.strategy?.value || '策略待定' }}</span>
+                        <span class="tag">{{ unit.emotion?.value || '情绪待定' }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="import-grid">
+                <div class="card import-card">
+                  <div class="section-title">事件 / 关系 / 剧情结构</div>
+                  <div class="import-list">
+                    <div class="import-item">
+                      <div><strong>事件数</strong> {{ importPreview.events?.length || 0 }}</div>
+                      <div><strong>关系数</strong> {{ importPreview.relationships?.length || 0 }}</div>
+                      <div><strong>低置信交互</strong> {{ importPreview.low_confidence_units?.length || 0 }}</div>
+                    </div>
+                    <div class="import-item">
+                      <div class="obs-field">主冲突</div>
+                      <div class="obs-reason">{{ importPreview.plot_summary?.main_conflict || '暂无' }}</div>
+                    </div>
+                    <div class="import-item">
+                      <div class="obs-field">关系演化</div>
+                      <div class="obs-reason">{{ importPreview.plot_summary?.relationship_path || '暂无' }}</div>
+                    </div>
+                    <div class="import-item">
+                      <div class="obs-field">关键转折</div>
+                      <div class="obs-reason">{{ (importPreview.plot_summary?.turning_points || []).join(' / ') || '暂无' }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card import-card">
+                  <div class="section-title">写入选项</div>
+                  <div style="display:flex;flex-direction:column;gap:10px">
+                    <label class="check-row"><input type="checkbox" v-model="importOptions.create_readonly_conversation"/> 创建只读会话并接入页面1</label>
+                    <label class="check-row"><input type="checkbox" v-model="importOptions.auto_archive"/> 导入后自动进入归档/关系更新流程</label>
+                    <select class="input" v-model="importOptions.scenario">
+                      <option value="general">通用对话</option>
+                      <option value="bar_chat">老友酒吧闲聊</option>
+                      <option value="business">商务谈判</option>
+                      <option value="hr_interview">HR面试</option>
+                      <option value="counseling">心理咨询</option>
+                    </select>
+                    <button class="btn btn-primary" :disabled="importLoading" @click="commitImport">
+                      {{ importLoading ? '导入中…' : '确认导入并写入系统' }}
+                    </button>
+                    <div v-if="importResult" class="obs-reason">导入完成：角色 {{ importResult.created_characters?.length || 0 }} / 交互 {{ importResult.interaction_units || 0 }} / 关系 {{ importResult.relationships || 0 }}</div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -388,6 +501,17 @@ const events = ref([])
 const observations = ref([])
 const relAnalysis = ref(null)
 const loadingSuggest = ref(false)
+const importLoading = ref(false)
+const showImportModal = ref(false)
+const importFileInput = ref(null)
+const selectedImportFile = ref(null)
+const importPreview = ref(null)
+const importResult = ref(null)
+const importOptions = ref({
+  scenario: 'general',
+  create_readonly_conversation: true,
+  auto_archive: true,
+})
 
 const showCharModal = ref(false)
 const showRelModal = ref(false)
@@ -453,6 +577,9 @@ function openCreateModal() {
   editingChar.value = null
   charForm.value = { name:'', role:'', background:'', age:null, avatar_color:'#00d4ff', motivation:'', weakness:'', speaking_style:'' }
   showCharModal.value = true
+}
+function openImportModal() {
+  showImportModal.value = true
 }
 function openEditModal(c) {
   editingChar.value = c
@@ -532,6 +659,65 @@ async function submitRel() {
 async function analyzeRel(id) {
   const res = await relationshipApi.analyze(id)
   relAnalysis.value = res.data
+}
+
+async function handleImportFileChange(e) {
+  selectedImportFile.value = e.target.files?.[0] || null
+  importPreview.value = null
+  importResult.value = null
+}
+async function previewImport() {
+  if (!selectedImportFile.value || importLoading.value) return
+  importLoading.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', selectedImportFile.value)
+    const res = await characterApi.previewImport(formData)
+    importPreview.value = res.data
+    importResult.value = null
+  } finally {
+    importLoading.value = false
+  }
+}
+async function commitImport() {
+  if (!importPreview.value || importLoading.value) return
+  importLoading.value = true
+  try {
+    const res = await characterApi.commitImport({
+      filename: selectedImportFile.value?.name || 'import.txt',
+      file_type: importPreview.value.detected_type || 'dialogue',
+      import_file_id: importPreview.value.import_file_id,
+      scenario: importOptions.value.scenario,
+      create_readonly_conversation: importOptions.value.create_readonly_conversation,
+      auto_archive: importOptions.value.auto_archive,
+      preview_payload: importPreview.value,
+      role_mappings: (importPreview.value.role_mappings || []).map(item => ({
+        original_name: item.original_name,
+        resolved_name: item.resolved_name,
+        status: item.status,
+        candidate_ids: item.candidate_ids || [],
+        action: item.action,
+      })),
+    })
+    importResult.value = res.data
+    await chars.fetchAll()
+    if (activeChar.value) {
+      const refreshed = chars.characters.find(c => c.id === activeChar.value.id)
+      if (refreshed) activeChar.value = refreshed
+    }
+  } finally {
+    importLoading.value = false
+  }
+}
+async function downloadExport() {
+  const res = await characterApi.exportAll()
+  const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `btb-export-${new Date().toISOString().slice(0,19).replace(/[:T]/g, '-')}.json`
+  link.click()
+  URL.revokeObjectURL(url)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -705,6 +891,11 @@ function renderGraph() {
 .empty-hint { text-align:center; color:var(--text-muted); font-size:12px; padding:24px 0; }
 .loading-state { display:flex; justify-content:center; padding:24px; }
 .spinner { width:24px; height:24px; border:2px solid var(--border); border-top-color:var(--cyan); border-radius:50%; animation:spin 1s linear infinite; }
+.import-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.import-card { padding:14px; }
+.import-list { display:flex; flex-direction:column; gap:10px; max-height:320px; overflow:auto; }
+.import-item { border:1px solid var(--border); background:var(--bg-elevated); border-radius:var(--radius-sm); padding:10px; }
+.check-row { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--text-secondary); }
 
 /* Detail Panel */
 .detail-panel { flex:1; overflow:hidden; display:flex; flex-direction:column; min-width:0; border-right:1px solid var(--border); }

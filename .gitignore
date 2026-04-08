@@ -1,3 +1,5 @@
 start_project.bat
 frontend/node_modules/
 __pycache__/
+backend/btb.db
+*.db

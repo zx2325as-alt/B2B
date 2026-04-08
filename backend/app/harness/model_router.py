@@ -5,10 +5,28 @@ AI Harness: Model Router + Guardrails
 """
 import json
 import re
+import os
+import yaml
+from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+# 读取 YAML 配置文件
+CONF_DIR = Path(__file__).parent.parent / "conf"
+CONFIG_FILE = CONF_DIR / "config.yaml"
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+config_data = load_config()
+ai_config = config_data.get("ai", {})
+default_provider_name = ai_config.get("default_provider", "deepseek")
+provider_config = ai_config.get("providers", {}).get(default_provider_name, {})
+models_config = provider_config.get("models", {})
 
 # ─── Model Router ─────────────────────────────────────────────────────────────
 
@@ -27,17 +45,17 @@ class ModelConfig:
 
 MODEL_CONFIGS: dict[TaskComplexity, ModelConfig] = {
     TaskComplexity.SIMPLE: ModelConfig(
-        model="claude-haiku-4-5-20251001",
+        model=models_config.get("simple", "deepseek-chat"),
         max_tokens=512,
         temperature=0.3,
     ),
     TaskComplexity.MEDIUM: ModelConfig(
-        model="claude-sonnet-4-20250514",
+        model=models_config.get("medium", "deepseek-chat"),
         max_tokens=1024,
         temperature=0.5,
     ),
     TaskComplexity.COMPLEX: ModelConfig(
-        model="claude-sonnet-4-20250514",
+        model=models_config.get("complex", "deepseek-reasoner"),
         max_tokens=2048,
         temperature=0.7,
     ),
@@ -51,7 +69,11 @@ class ModelRouter:
 
     # 哪些 prompt 类型使用什么复杂度
     TASK_MAP: dict[str, TaskComplexity] = {
+        "chat_surface_reply": TaskComplexity.MEDIUM,
         "chat_analysis": TaskComplexity.MEDIUM,
+        "import_dialogue_parse": TaskComplexity.COMPLEX,
+        "import_narrative_parse": TaskComplexity.COMPLEX,
+        "interaction_analysis_rebuild": TaskComplexity.COMPLEX,
         "character_profile_gen": TaskComplexity.COMPLEX,
         "relationship_analysis": TaskComplexity.MEDIUM,
         "ai_suggest_update": TaskComplexity.COMPLEX,

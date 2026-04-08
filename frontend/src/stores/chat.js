@@ -8,6 +8,7 @@ export const useChatStore = defineStore('chat', () => {
   const messages = ref([])          // messages for active conversation
   const streaming = ref(false)
   const streamBuffer = ref('')      // in-progress streamed text
+  const streamController = ref(null)
 
   // Branch tree: parent_id → [children]
   const messageTree = computed(() => {
@@ -33,16 +34,27 @@ export const useChatStore = defineStore('chat', () => {
     return res.data
   }
 
+  async function deleteConversation(convId) {
+    await chatApi.deleteConversation(convId)
+    conversations.value = conversations.value.filter(c => c.id !== convId)
+  }
+
   async function loadMessages(convId) {
     activeConvId.value = convId
     const res = await chatApi.getMessages(convId)
     messages.value = res.data
   }
 
-  async function sendMessage({ speaker, content, characterId }) {
+  async function sendMessage({ speaker, content, characterId, activeCharacters }) {
+    if (streaming.value && streamController.value) {
+      streamController.value.abort()
+      streaming.value = false
+      streamBuffer.value = ''
+    }
     if (!activeConvId.value) await newConversation()
     streaming.value = true
     streamBuffer.value = ''
+    streamController.value = new AbortController()
 
     // Optimistic user message
     const tempId = Date.now()
@@ -73,8 +85,10 @@ export const useChatStore = defineStore('chat', () => {
         speaker,
         content,
         character_id: characterId || null,
+        active_characters: activeCharacters,
       },
       {
+        signal: streamController.value.signal,
         onDelta: (text) => {
           streamBuffer.value += text
           const aiMsg = messages.value.find(m => m.id === aiPlaceholderId)
@@ -106,7 +120,17 @@ export const useChatStore = defineStore('chat', () => {
 
     streaming.value = false
     streamBuffer.value = ''
+    streamController.value = null
     return finalResult
+  }
+
+  function cancelStreaming() {
+    if (streamController.value) {
+      streamController.value.abort()
+      streamController.value = null
+    }
+    streaming.value = false
+    streamBuffer.value = ''
   }
 
   async function createBranch(messageId) {
@@ -119,6 +143,6 @@ export const useChatStore = defineStore('chat', () => {
 
   return {
     conversations, activeConvId, messages, streaming, streamBuffer, messageTree,
-    loadConversations, newConversation, loadMessages, sendMessage, createBranch,
+    loadConversations, newConversation, deleteConversation, loadMessages, sendMessage, createBranch, cancelStreaming,
   }
 })

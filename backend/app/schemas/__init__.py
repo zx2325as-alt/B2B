@@ -124,12 +124,17 @@ class ObservationOut(BaseModel):
 
 # ─── Chat ────────────────────────────────────────────────────────────────────
 
+class ActiveCharacter(BaseModel):
+    id: Optional[int]
+    name: str
+
 class ChatMessage(BaseModel):
     conversation_id: int
     speaker: str
     content: str
     character_id: Optional[int] = None
     scenario: str = "general"
+    active_characters: Optional[list[ActiveCharacter]] = None
 
 class ConversationCreate(BaseModel):
     title: str = "新对话"
@@ -148,6 +153,48 @@ class MessageOut(BaseModel):
     subtext: Optional[str]
     psychological_tag: Optional[str]
     created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Import / Export ─────────────────────────────────────────────────────────
+
+class ImportRoleMapping(BaseModel):
+    original_name: str
+    resolved_name: str
+    status: str = "new"
+    candidate_ids: list[int] = []
+    action: str = "create"
+
+
+class ImportPreviewRequest(BaseModel):
+    filename: str
+    file_type: str
+    content_text: str
+
+
+class ImportCommitRequest(BaseModel):
+    filename: str
+    file_type: str
+    import_file_id: Optional[int] = None
+    scenario: str = "general"
+    create_readonly_conversation: bool = True
+    auto_archive: bool = True
+    preview_payload: dict[str, Any]
+    role_mappings: list[ImportRoleMapping] = []
+
+
+class ImportFileOut(BaseModel):
+    id: int
+    filename: str
+    file_type: str
+    content_type: str
+    status: str
+    summary: Optional[str]
+    metadata_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True

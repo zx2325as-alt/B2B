@@ -13,8 +13,11 @@
         <div v-for="c in chat.conversations" :key="c.id"
           class="conv-item" :class="{ active: chat.activeConvId === c.id }"
           @click="selectConversation(c.id)">
-          <div class="conv-title">{{ c.title }}</div>
-          <div class="conv-meta">{{ formatDate(c.updated_at) }}</div>
+          <div style="flex:1;min-width:0">
+            <div class="conv-title">{{ c.title }}</div>
+            <div class="conv-meta">{{ formatDate(c.updated_at) }}</div>
+          </div>
+          <button class="btn btn-ghost" style="padding:2px 4px;font-size:12px;opacity:0.6" @click.stop="handleDeleteConv(c.id)" title="删除对话">✕</button>
         </div>
         <div v-if="!chat.conversations.length" class="empty-hint">暂无对话，点击新建开始</div>
       </div>
@@ -26,9 +29,17 @@
       <div class="chat-topbar">
         <div class="conv-info">
           <span class="conv-name">{{ currentConvTitle }}</span>
-          <span class="tag">{{ currentScenario }}</span>
+          <span class="tag">{{ scenarioLabel(currentScenario) }}</span>
         </div>
         <div class="topbar-actions">
+          <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="showScenarioModal = true">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M9 4v16"/><path d="M4 9h16"/></svg>
+            切换场景
+          </button>
+          <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="handleArchiveConversation">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
+            一键归档
+          </button>
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="showRoleModal = true">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
             角色管理
@@ -50,6 +61,7 @@
 
         <TransitionGroup name="msg">
           <div v-for="msg in chat.messages" :key="msg.id"
+            :data-msg-id="msg.id"
             class="msg-wrapper" :class="msg.role">
             <!-- Avatar -->
             <div class="msg-avatar" :style="{ background: getCharacterColor(msg.character_name) }">
@@ -75,28 +87,47 @@
                 <span v-if="msg._streaming" class="cursor-blink">▌</span>
               </div>
 
+              <div v-if="msg.role === 'assistant' && getAnalysisTags(msg).length" class="analysis-tags">
+                <button
+                  v-for="tag in getAnalysisTags(msg)"
+                  :key="tag"
+                  class="tag tag-btn"
+                  @click="focusAnalysis(msg.id, 'strategy')"
+                >
+                  {{ tag }}
+                </button>
+              </div>
+
               <!-- Analysis Layer (AI messages only) -->
-              <div v-if="msg.role === 'assistant' && msg.inner_monologue" class="analysis-layer">
+              <div v-if="msg.role === 'assistant'" class="analysis-layer">
                 <button class="analysis-toggle" @click="toggleAnalysis(msg.id)">
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
                   </svg>
-                  深层分析
+                  查看分析
                   <span v-if="msg.emotion_label" class="tag" style="font-size:10px;padding:1px 7px">{{ msg.emotion_label }}</span>
                 </button>
 
                 <div v-if="expandedIds.has(msg.id)" class="analysis-content fade-up">
-                  <div class="analysis-row">
-                    <span class="a-label">内心独白</span>
+                  <button
+                    v-if="needsReanalysis(msg)"
+                    class="btn btn-ghost"
+                    style="align-self:flex-start;font-size:11px;padding:4px 10px"
+                    @click="reanalyzeMessage(msg)"
+                  >
+                    补全分析
+                  </button>
+                  <div v-if="msg.inner_monologue" class="analysis-row" :class="{ focused: isFieldFocused(msg.id, 'monologue') }">
+                    <span class="a-label">接收方内心独白</span>
                     <span class="a-value">{{ msg.inner_monologue }}</span>
                   </div>
-                  <div class="analysis-row">
-                    <span class="a-label">隐含动机</span>
-                    <span class="a-value">{{ msg.subtext }}</span>
+                  <div v-if="msg.emotion_label" class="analysis-row" :class="{ focused: isFieldFocused(msg.id, 'emotion') }">
+                    <span class="a-label">情绪归因标签</span>
+                    <span class="a-value">{{ msg.emotion_label }}</span>
                   </div>
-                  <div class="analysis-row" v-if="msg.psychological_tag">
-                    <span class="a-label">心理侧写</span>
-                    <span class="tag violet" style="font-size:11px">{{ msg.psychological_tag }}</span>
+                  <div v-if="msg.subtext" class="analysis-row" :class="{ focused: isFieldFocused(msg.id, 'strategy') }">
+                    <span class="a-label">策略性动机</span>
+                    <span class="a-value">{{ msg.subtext }}</span>
                   </div>
                   <div class="analysis-row" v-if="msg.emotion_score != null">
                     <span class="a-label">情绪强度</span>
@@ -121,12 +152,13 @@
             <button v-for="role in activeRoles" :key="role.id || role.name"
               class="role-pill" :class="{ active: currentSpeaker === role.name }"
               :style="{ '--rc': role.color }"
-              @click="currentSpeaker = role.name; currentCharId = role.id">
+              @click="handleSelectSpeaker(role)">
               <span class="role-dot"></span>{{ role.name }}
             </button>
             <button class="role-pill add-role" @click="showRoleModal = true">＋</button>
           </div>
         </div>
+        <div v-if="!currentSpeaker" class="empty-hint" style="padding:0 0 10px;text-align:left">请先选择发言角色</div>
 
         <div class="input-row">
           <textarea
@@ -138,12 +170,12 @@
             @keydown.enter.exact.prevent="handleSend"
             @input="autoResize"
           />
-          <button class="send-btn" :disabled="chat.streaming || !inputText.trim()" @click="handleSend">
+          <button class="send-btn" :disabled="!chat.streaming && !inputText.trim()" @click="handleSend">
             <svg v-if="!chat.streaming" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
               <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
             </svg>
-            <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:spin 1s linear infinite">
-              <circle cx="12" cy="12" r="10" stroke-dasharray="40" stroke-dashoffset="10"/>
+            <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="7" y="7" width="10" height="10" rx="2"/>
             </svg>
           </button>
         </div>
@@ -157,9 +189,9 @@
         <button class="btn btn-ghost" style="padding:4px 8px;font-size:11px" @click="refreshEmotionCurve">刷新</button>
       </div>
       <div v-if="activeRoles.length" style="padding:0 16px">
-        <div class="label">追踪角色</div>
-        <select class="input" v-model="trackingCharacter" @change="refreshEmotionCurve" style="margin-bottom:16px">
-          <option v-for="r in activeRoles" :key="r.name" :value="r.name">{{ r.name }}</option>
+        <div class="label">追踪角色对</div>
+        <select class="input" v-model="trackingPair" @change="refreshEmotionCurve" style="margin-bottom:16px">
+          <option v-for="pair in rolePairs" :key="pair.value" :value="pair.value">{{ pair.label }}</option>
         </select>
       </div>
       <div v-if="emotionData.emotions?.length" class="emotion-chart-wrap">
@@ -171,12 +203,38 @@
         </div>
         <!-- Simple bar chart -->
         <div class="emotion-bars">
-          <div v-for="(e, i) in emotionData.emotions" :key="i" class="ebar-row">
+          <div v-for="(e, i) in emotionData.emotions" :key="i" class="ebar-row clickable" @click="scrollToMessage(e.message_id)">
             <span class="ebar-label">{{ e.label }}</span>
             <div class="ebar-track">
               <div class="ebar-fill" :style="{ width: (e.score*100)+'%', background: emotionColor(e.score) }"></div>
             </div>
             <span class="ebar-pct">{{ Math.round(e.score*100) }}%</span>
+          </div>
+        </div>
+        <div v-if="emotionData.deep_emotions?.length" style="margin-top:14px">
+          <div class="label">深层情绪</div>
+          <div class="emotion-bars">
+            <div v-for="(e, i) in emotionData.deep_emotions" :key="`deep-${i}`" class="ebar-row clickable" @click="scrollToMessage(e.message_id)">
+              <span class="ebar-label">{{ e.label }}</span>
+              <div class="ebar-track">
+                <div class="ebar-fill" :style="{ width: (e.score*100)+'%', background: '#7c3aed' }"></div>
+              </div>
+              <span class="ebar-pct">{{ Math.round(e.score*100) }}%</span>
+            </div>
+          </div>
+        </div>
+        <div v-if="emotionData.strategy_trajectory?.length" style="margin-top:14px">
+          <div class="label">策略轨迹</div>
+          <div class="strategy-list">
+            <button
+              v-for="item in emotionData.strategy_trajectory"
+              :key="`strategy-${item.message_id}`"
+              class="strategy-item"
+              @click="scrollToMessage(item.message_id)"
+            >
+              <span>{{ item.short_term || '短期策略未识别' }}</span>
+              <small>{{ item.long_term || '长期模式未识别' }}</small>
+            </button>
           </div>
         </div>
       </div>
@@ -192,6 +250,14 @@
             <button class="btn-close" @click="showRoleModal = false">✕</button>
           </div>
           <div style="padding:20px">
+            <div class="label">当前对话角色</div>
+            <div class="role-pills" style="margin-bottom:16px;flex-wrap:wrap">
+              <span v-for="r in activeRoles" :key="r.name" class="role-pill active" :style="{ '--rc': r.color, 'cursor':'default', 'padding-right':'6px' }">
+                <span class="role-dot"></span>{{ r.name }}
+                <button @click="removeRole(r.name)" style="background:none;border:none;color:inherit;cursor:pointer;padding:2px;margin-left:4px;border-radius:4px" title="移除角色">✕</button>
+              </span>
+            </div>
+
             <div class="label">从已有角色选择加入对话</div>
             <div class="char-select-list">
               <label v-for="c in chars.characters" :key="c.id" class="char-select-item">
@@ -215,6 +281,28 @@
         </div>
       </div>
     </Teleport>
+
+    <Teleport to="body">
+      <div v-if="showScenarioModal" class="modal-overlay" @click.self="showScenarioModal = false">
+        <div class="modal card fade-up" style="width:480px;max-height:80vh;overflow-y:auto">
+          <div class="modal-header">
+            <span>场景切换</span>
+            <button class="btn-close" @click="showScenarioModal = false">✕</button>
+          </div>
+          <div style="padding:20px;display:flex;flex-direction:column;gap:10px">
+            <button
+              v-for="preset in scenarioOptions"
+              :key="preset.key"
+              class="btn btn-ghost"
+              style="justify-content:flex-start;padding:12px 14px"
+              @click="handleScenarioChange(preset.key)"
+            >
+              {{ preset.label }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -227,21 +315,29 @@ import { chatApi } from '../api/index.js'
 const chat = useChatStore()
 const chars = useCharacterStore()
 
+const SCENE_PRESETS = {
+  general: { label: '通用对话', defaultRoles: [], defaultSpeaker: '' },
+  bar_chat: { label: '老友酒吧闲聊', defaultRoles: ['吉娜', '马可'], defaultSpeaker: '吉娜' },
+  business: { label: '商务谈判', defaultRoles: [], defaultSpeaker: '' },
+  hr_interview: { label: 'HR面试', defaultRoles: [], defaultSpeaker: '' },
+  counseling: { label: '心理咨询', defaultRoles: [], defaultSpeaker: '' },
+}
+
 const messagesEl = ref(null)
 const inputEl = ref(null)
 const inputText = ref('')
 const showRoleModal = ref(false)
+const showScenarioModal = ref(false)
 const showEmotionPanel = ref(false)
 const expandedIds = ref(new Set())
-const currentSpeaker = ref('用户')
+const analysisFocus = ref({ id: null, field: '' })
+const currentSpeaker = ref('')
 const currentCharId = ref(null)
 const selectedChars = ref([])
 const customRoleName = ref('')
-const trackingCharacter = ref('')
+const trackingPair = ref('')
 const emotionData = ref({ emotions: [], trend: 'stable', turning_point: null })
-
-// Active roles in current conversation
-const activeRoles = ref([{ name: '用户', color: '#00d4ff', id: null }])
+const activeRoles = ref([])
 
 const currentConvTitle = computed(() => {
   const c = chat.conversations.find(c => c.id === chat.activeConvId)
@@ -251,16 +347,40 @@ const currentScenario = computed(() => {
   const c = chat.conversations.find(c => c.id === chat.activeConvId)
   return c?.scenario || 'general'
 })
+const scenarioOptions = computed(() => Object.entries(SCENE_PRESETS).map(([key, value]) => ({ key, label: value.label })))
+const rolePairs = computed(() => {
+  const pairs = []
+  for (const source of activeRoles.value) {
+    for (const target of activeRoles.value) {
+      if (source.name === target.name) continue
+      pairs.push({ value: `${source.name}→${target.name}`, label: `${source.name} → ${target.name}` })
+    }
+  }
+  return pairs
+})
 
 onMounted(async () => {
   await Promise.all([chat.loadConversations(), chars.fetchAll()])
-  if (chat.conversations.length) selectConversation(chat.conversations[0].id)
+  if (chat.conversations.length) {
+    await selectConversation(chat.conversations[0].id)
+  } else {
+    applyScenePresetRoles('bar_chat')
+  }
 })
 
 watch(() => chat.messages.length, () => {
   nextTick(() => {
     if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight
   })
+})
+watch(rolePairs, (pairs) => {
+  if (!pairs.length) {
+    trackingPair.value = ''
+    return
+  }
+  if (!pairs.find(pair => pair.value === trackingPair.value)) {
+    trackingPair.value = pairs[0].value
+  }
 })
 
 function avatarLetter(name) { return (name || '?')[0].toUpperCase() }
@@ -279,6 +399,7 @@ function formatTime(dt) {
   if (!dt) return ''
   return new Date(dt).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' })
 }
+function scenarioLabel(key) { return SCENE_PRESETS[key]?.label || key }
 function emotionColor(score) {
   if (score < 0.3) return '#10b981'
   if (score < 0.6) return '#f59e0b'
@@ -286,6 +407,46 @@ function emotionColor(score) {
 }
 function trendLabel(t) { return { rising:'上升', falling:'下降', stable:'平稳', volatile:'波动' }[t] || t }
 function trendClass(t) { return { rising:'amber', falling:'red', stable:'green', volatile:'violet' }[t] || '' }
+function isFieldFocused(id, field) { return analysisFocus.value.id === id && analysisFocus.value.field === field }
+function getAnalysisTags(msg) {
+  return (msg.psychological_tag || '')
+    .split('|')
+    .map(tag => tag.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+}
+function needsReanalysis(msg) {
+  return msg.role === 'assistant' && !msg._streaming && !msg._error && !msg.inner_monologue && !!msg.parent_id
+}
+function focusAnalysis(id, field) {
+  analysisFocus.value = { id, field }
+  if (!expandedIds.value.has(id)) toggleAnalysis(id)
+}
+function handleSelectSpeaker(role) {
+  currentSpeaker.value = role.name
+  currentCharId.value = role.id
+}
+function resolveRoleByName(name) {
+  const char = chars.characters.find(item => item.name === name)
+  return {
+    id: char?.id ?? null,
+    name,
+    color: char?.avatar_color || getCharacterColor(name),
+  }
+}
+function applyScenePresetRoles(scenario, withDefaults = true) {
+  const preset = SCENE_PRESETS[scenario] || SCENE_PRESETS.general
+  const messageRoles = [...new Set(chat.messages.filter(msg => msg.role === 'user' && msg.character_name).map(msg => msg.character_name))]
+  const presetRoles = [...new Set([...(preset.defaultRoles || []), ...messageRoles])]
+  activeRoles.value = presetRoles.map(resolveRoleByName)
+  selectedChars.value = chars.characters.filter(char => activeRoles.value.some(role => role.id === char.id))
+  if (!withDefaults && currentSpeaker.value && activeRoles.value.find(role => role.name === currentSpeaker.value)) return
+  const nextSpeaker = preset.defaultSpeaker && activeRoles.value.find(role => role.name === preset.defaultSpeaker)
+    ? activeRoles.value.find(role => role.name === preset.defaultSpeaker)
+    : activeRoles.value[0]
+  currentSpeaker.value = nextSpeaker?.name || ''
+  currentCharId.value = nextSpeaker?.id || null
+}
 
 function toggleAnalysis(id) {
   const s = new Set(expandedIds.value)
@@ -294,29 +455,71 @@ function toggleAnalysis(id) {
 }
 function toggleEmotionPanel() {
   showEmotionPanel.value = !showEmotionPanel.value
-  if (showEmotionPanel.value && trackingCharacter.value) refreshEmotionCurve()
+  if (showEmotionPanel.value && trackingPair.value) refreshEmotionCurve()
 }
 
 async function selectConversation(id) {
   await chat.loadMessages(id)
+  applyScenePresetRoles(currentScenario.value, false)
 }
 async function handleNewConv() {
-  await chat.newConversation('新对话 ' + new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}))
+  const scenario = currentScenario.value === 'general' ? 'bar_chat' : currentScenario.value
+  await chat.newConversation('新对话 ' + new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}), scenario)
+  applyScenePresetRoles(scenario)
+}
+async function handleDeleteConv(id) {
+  if (!confirm('确定删除这个对话吗？')) return
+  await chat.deleteConversation(id)
+  if (chat.activeConvId === id) {
+    if (chat.conversations.length) {
+      await selectConversation(chat.conversations[0].id)
+    } else {
+      chat.activeConvId = null
+      chat.messages = []
+    }
+  }
+}
+async function handleScenarioChange(scenario) {
+  const confirmed = !chat.messages.length || confirm('切换场景将清空当前对话历史（不会删除已归档的角色记忆），是否继续？')
+  if (!confirmed) return
+  showScenarioModal.value = false
+  await chat.newConversation(`${SCENE_PRESETS[scenario]?.label || '新场景'} ${new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' })}`, scenario)
+  applyScenePresetRoles(scenario)
+}
+async function handleArchiveConversation() {
+  if (!chat.activeConvId || !activeRoles.value.length) return
+  const confirmed = confirm(`将当前对话归档到以下角色：${activeRoles.value.map(role => role.name).join('、')}。是否继续？`)
+  if (!confirmed) return
+  const res = await chatApi.archiveConversation(chat.activeConvId, {
+    role_names: activeRoles.value.map(role => role.name),
+  })
+  alert(`归档完成：${res.data.archived_roles.join('、')}${res.data.observations_created ? `，并生成 ${res.data.observations_created} 条待审核建议` : ''}`)
 }
 
 async function handleSend() {
+  if (chat.streaming) {
+    chat.cancelStreaming()
+    return
+  }
   const text = inputText.value.trim()
-  if (!text || chat.streaming) return
+  if (!text) return
+  if (!currentSpeaker.value) {
+    alert('请先选择发言角色')
+    return
+  }
   inputText.value = ''
   await nextTick()
   if (inputEl.value) inputEl.value.style.height = 'auto'
 
-  if (!chat.activeConvId) await chat.newConversation()
+  if (!chat.activeConvId) {
+    await chat.newConversation('新对话', currentScenario.value === 'general' ? 'bar_chat' : currentScenario.value)
+  }
 
   await chat.sendMessage({
     speaker: currentSpeaker.value,
     content: text,
     characterId: currentCharId.value,
+    activeCharacters: activeRoles.value.map(r => ({ id: r.id, name: r.name })),
   })
 }
 
@@ -325,6 +528,15 @@ function autoResize() {
   if (!el) return
   el.style.height = 'auto'
   el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+}
+
+function removeRole(name) {
+  activeRoles.value = activeRoles.value.filter(r => r.name !== name)
+  selectedChars.value = selectedChars.value.filter(c => c.name !== name)
+  if (currentSpeaker.value === name) {
+    currentSpeaker.value = activeRoles.value[0]?.name || ''
+    currentCharId.value = activeRoles.value[0]?.id || null
+  }
 }
 
 function addCustomRole() {
@@ -336,13 +548,22 @@ function addCustomRole() {
   customRoleName.value = ''
 }
 function confirmRoles() {
+  const selectedIds = selectedChars.value.map(c => c.id)
+  activeRoles.value = activeRoles.value.filter(r => {
+    if (r.id === null) return true
+    return selectedIds.includes(r.id)
+  })
+
   for (const c of selectedChars.value) {
     if (!activeRoles.value.find(r => r.name === c.name)) {
       activeRoles.value.push({ name: c.name, color: c.avatar_color, id: c.id })
     }
   }
-  if (!currentSpeaker.value && activeRoles.value.length) currentSpeaker.value = activeRoles.value[0].name
-  if (!trackingCharacter.value && activeRoles.value.length) trackingCharacter.value = activeRoles.value[0].name
+  const currentExists = activeRoles.value.find(r => r.name === currentSpeaker.value)
+  if (!currentExists) {
+    currentSpeaker.value = activeRoles.value[0]?.name || ''
+    currentCharId.value = activeRoles.value[0]?.id || null
+  }
   showRoleModal.value = false
 }
 
@@ -352,11 +573,28 @@ async function branchFrom(messageId) {
 }
 
 async function refreshEmotionCurve() {
-  if (!chat.activeConvId || !trackingCharacter.value) return
+  if (!chat.activeConvId || !trackingPair.value) return
   try {
-    const res = await chatApi.getEmotionCurve(chat.activeConvId, trackingCharacter.value)
+    const [source, target] = trackingPair.value.split('→')
+    const res = await chatApi.getEmotionTension(chat.activeConvId, source, target)
     emotionData.value = res.data
-  } catch {}
+  } catch {
+    emotionData.value = { emotions: [], trend: 'stable', turning_point: null }
+  }
+}
+async function reanalyzeMessage(msg) {
+  const res = await chatApi.reanalyzeMessage(msg.parent_id)
+  const index = chat.messages.findIndex(item => item.id === msg.id)
+  if (index >= 0) {
+    chat.messages[index] = { ...chat.messages[index], ...res.data }
+  }
+}
+function scrollToMessage(messageId) {
+  nextTick(() => {
+    const target = document.querySelector(`[data-msg-id="${messageId}"]`)
+    if (!target) return
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
 }
 </script>
 
@@ -391,6 +629,8 @@ async function refreshEmotionCurve() {
   cursor: pointer;
   transition: var(--transition);
   margin-bottom: 2px;
+  display: flex;
+  align-items: center;
 }
 .conv-item:hover { background: var(--bg-hover); }
 .conv-item.active { background: var(--cyan-dim); border: 1px solid rgba(0,212,255,0.2); }
@@ -476,6 +716,8 @@ async function refreshEmotionCurve() {
 .msg-bubble.streaming { border-color: var(--cyan); animation: pulse-cyan 1.5s infinite; }
 .msg-bubble.error { border-color: rgba(239,68,68,.4); background: rgba(239,68,68,.05); }
 .cursor-blink { animation: blink 1s step-end infinite; color: var(--cyan); }
+.analysis-tags { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+.tag-btn { background: rgba(124,58,237,.12); border-color: rgba(124,58,237,.25); color:#c4b5fd; cursor:pointer; }
 
 /* Analysis Layer */
 .analysis-layer { margin-top: 4px; }
@@ -506,6 +748,7 @@ async function refreshEmotionCurve() {
   gap: 8px;
 }
 .analysis-row { display:flex; align-items:flex-start; gap:10px; }
+.analysis-row.focused { border: 1px solid rgba(0, 212, 255, 0.22); border-radius: 8px; padding: 8px; background: rgba(0, 212, 255, 0.05); }
 .a-label {
   font-size: 10px; font-family: var(--font-mono);
   color: var(--text-muted);
@@ -600,10 +843,25 @@ async function refreshEmotionCurve() {
 .turning-point { font-size:11px; color:var(--amber); margin-bottom:12px; line-height:1.5; }
 .emotion-bars { display:flex; flex-direction:column; gap:8px; }
 .ebar-row { display:flex; align-items:center; gap:8px; }
+.ebar-row.clickable { cursor:pointer; }
 .ebar-label { font-size:11px; color:var(--text-muted); min-width:48px; font-family:var(--font-mono); }
 .ebar-track { flex:1; height:6px; background:var(--bg-base); border-radius:3px; overflow:hidden; }
 .ebar-fill { height:100%; border-radius:3px; transition:width .4s; }
 .ebar-pct { font-size:11px; font-family:var(--font-mono); color:var(--text-muted); min-width:30px; text-align:right; }
+.strategy-list { display:flex; flex-direction:column; gap:8px; }
+.strategy-item {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  text-align:left;
+  padding:10px 12px;
+  background:var(--bg-elevated);
+  border:1px solid var(--border);
+  border-radius:var(--radius-sm);
+  color:var(--text-secondary);
+  cursor:pointer;
+}
+.strategy-item small { color: var(--text-muted); line-height: 1.5; }
 
 /* Modal */
 .modal-overlay { position:fixed; inset:0; background:rgba(8,12,22,.7); backdrop-filter:blur(4px); z-index:1000; display:flex; align-items:center; justify-content:center; }

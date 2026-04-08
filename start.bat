@@ -8,7 +8,7 @@ set "BASE_DIR=%~dp0"
 
 REM Start backend (FastAPI)
 echo [1/2] Starting backend on port 8000...
-start "BtB Backend" cmd /k "cd /d "%BASE_DIR%backend" && set ANTHROPIC_API_KEY=sk-803936ec8add440db0dca13ec660f070  && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+start "BtB Backend" cmd /k "cd /d "%BASE_DIR%backend" && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
 REM Start frontend (Vue + Vite)
 echo [2/2] Starting frontend on port 5173...

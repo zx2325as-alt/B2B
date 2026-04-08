@@ -9,6 +9,9 @@ export const characterApi = {
   create: (data)               => api.post('/characters/', data),
   update: (id, data)           => api.put(`/characters/${id}`, data),
   delete: (id)                 => api.delete(`/characters/${id}`),
+  previewImport: (formData)    => api.post('/characters/imports/preview', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  commitImport: (data)         => api.post('/characters/imports/commit', data),
+  exportAll: ()                => api.get('/characters/exports/full'),
   suggestUpdate: (id)          => api.post(`/characters/${id}/suggest-update`),
   listObservations: (id)       => api.get(`/characters/${id}/observations`),
   reviewObservation: (cid, oid, status) =>
@@ -31,9 +34,13 @@ export const relationshipApi = {
 export const chatApi = {
   listConversations: ()        => api.get('/chat/conversations'),
   createConversation: (data)   => api.post('/chat/conversations', data),
+  deleteConversation: (id)     => api.delete(`/chat/conversations/${id}`),
   getMessages: (id)            => api.get(`/chat/conversations/${id}/messages`),
   createBranch: (cid, mid)     => api.post(`/chat/conversations/${cid}/branch/${mid}`),
   getEmotionCurve: (cid, name) => api.get(`/chat/conversations/${cid}/emotion-curve/${name}`),
+  getEmotionTension: (cid, source, target) => api.get(`/chat/conversations/${cid}/emotion-tension`, { params: { source, target } }),
+  reanalyzeMessage: (id)       => api.post(`/chat/messages/${id}/reanalyze`),
+  archiveConversation: (cid, data) => api.post(`/chat/conversations/${cid}/archive`, data),
 }
 
 /**
@@ -43,12 +50,13 @@ export const chatApi = {
  * @param {function} onDone    - 完成回调，传入完整结果
  * @param {function} onError   - 错误回调
  */
-export async function sendMessageStream(payload, { onDelta, onDone, onError }) {
+export async function sendMessageStream(payload, { onDelta, onDone, onError, signal }) {
   try {
     const response = await fetch('/api/v1/chat/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal,
     })
 
     const reader = response.body.getReader()
@@ -75,6 +83,7 @@ export async function sendMessageStream(payload, { onDelta, onDone, onError }) {
       }
     }
   } catch (err) {
+    if (err?.name === 'AbortError') return
     onError?.(err.message)
   }
 }

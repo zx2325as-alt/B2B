@@ -85,6 +85,57 @@ class CharacterObservation(Base):
     character = relationship("Character", back_populates="observations")
 
 
+class ImportFile(Base):
+    __tablename__ = "import_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), nullable=False)
+    file_type = Column(String(50), nullable=False)
+    content_type = Column(String(100), default="")
+    status = Column(String(30), default="previewed")
+    summary = Column(Text)
+    metadata_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    interaction_units = relationship("InteractionUnit", back_populates="import_file", cascade="all, delete-orphan")
+
+
+class InteractionUnit(Base):
+    __tablename__ = "interaction_units"
+
+    id = Column(Integer, primary_key=True, index=True)
+    import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=False)
+    source_line_index = Column(Integer, default=0)
+    source_text_snippet = Column(Text, default="")
+    speaker = Column(String(100), default="")
+    receiver = Column(String(100), default="")
+    receiver_confidence = Column(Float, default=0.0)
+    receiver_state = Column(String(20), default="inferred")
+    content = Column(Text, default="")
+    intent = Column(String(200), default="")
+    intent_confidence = Column(Float, default=0.0)
+    intent_state = Column(String(20), default="inferred")
+    strategy = Column(String(200), default="")
+    strategy_confidence = Column(Float, default=0.0)
+    strategy_state = Column(String(20), default="inferred")
+    emotion = Column(String(200), default="")
+    emotion_confidence = Column(Float, default=0.0)
+    emotion_state = Column(String(20), default="inferred")
+    interaction_type = Column(String(100), default="")
+    interaction_confidence = Column(Float, default=0.0)
+    interaction_state = Column(String(20), default="inferred")
+    analysis = Column(JSON, default=dict)
+    event_payload = Column(JSON, default=dict)
+    relationship_payload = Column(JSON, default=dict)
+    conversation_message_id = Column(Integer, nullable=True)
+    character_event_id = Column(Integer, nullable=True)
+    relationship_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    import_file = relationship("ImportFile", back_populates="interaction_units")
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 

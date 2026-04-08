@@ -41,6 +41,26 @@
 </template>
 
 <style scoped>
+.app-layout {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--bg-surface);
+  padding-top: 24px;
+}
+.main-content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
 .sidebar-logo {
   padding: 0 20px 24px;
   border-bottom: 1px solid var(--border);
