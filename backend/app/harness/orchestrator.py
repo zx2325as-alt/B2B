@@ -5,12 +5,14 @@ AI Harness: Orchestrator
 """
 import json
 import asyncio
+import logging
 import os
 import yaml
 from pathlib import Path
 from typing import AsyncGenerator, Any
 
 import openai
+import httpx
 
 from .prompt_templates import prompt_registry
 from .model_router import model_router, guardrails, GuardrailError
@@ -30,29 +32,72 @@ def load_config():
 
 config_data = load_config()
 ai_config = config_data.get("ai", {})
-default_provider_name = ai_config.get("default_provider", "deepseek")
-provider_config = ai_config.get("providers", {}).get(default_provider_name, {})
+providers_config = ai_config.get("providers", {})
+client_cache: dict[str, openai.AsyncOpenAI] = {}
+http_client_cache: dict[str, httpx.AsyncClient] = {}
+logger = logging.getLogger("import")
 
-# 优先使用环境变量，如果没有则使用 yaml 配置
-api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or provider_config.get("api_key")
-base_url = provider_config.get("base_url")
 
-import httpx
+def resolve_provider_name(task_name: str) -> str:
+    return model_router.resolve_provider(task_name)
 
-client_kwargs = {}
-if api_key:
-    client_kwargs["api_key"] = api_key
-if base_url:
-    client_kwargs["base_url"] = base_url
 
-# 添加自定义的 httpx 客户端以配置超时或代理，防止连接超时或拒绝连接
-http_client = httpx.AsyncClient(
-    timeout=httpx.Timeout(timeout=120.0, connect=30.0),
-    verify=False # 某些代理环境可能需要
-)
-client_kwargs["http_client"] = http_client
+def resolve_provider_config(provider_name: str) -> dict[str, Any]:
+    provider = providers_config.get(provider_name, {})
+    if provider:
+        return provider
+    return providers_config.get("deepseek", {})
 
-client = openai.AsyncOpenAI(**client_kwargs)
+
+def resolve_provider_api_key(provider_name: str, provider_config: dict[str, Any]) -> str | None:
+    env_keys = {
+        "deepseek": ["DEEPSEEK_API_KEY"],
+        "openai": ["OPENAI_API_KEY"],
+        "ollama": ["OLLAMA_API_KEY"],
+        "vllm": ["VLLM_API_KEY"],
+    }
+    for env_key in env_keys.get(provider_name, []):
+        value = os.environ.get(env_key)
+        if value:
+            return value
+    config_key = provider_config.get("api_key")
+    if config_key:
+        return config_key
+    if provider_name == "openai":
+        return os.environ.get("OPENAI_API_KEY")
+    if provider_name == "deepseek":
+        return os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    return None
+
+
+def get_async_http_client(provider_name: str) -> httpx.AsyncClient:
+    client = http_client_cache.get(provider_name)
+    if client is None:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout=180.0, connect=30.0),
+            verify=False,
+        )
+        http_client_cache[provider_name] = client
+    return client
+
+
+def get_openai_client(provider_name: str) -> openai.AsyncOpenAI:
+    client = client_cache.get(provider_name)
+    if client is not None:
+        return client
+    provider_config = resolve_provider_config(provider_name)
+    client_kwargs: dict[str, Any] = {
+        "http_client": get_async_http_client(provider_name),
+    }
+    api_key = resolve_provider_api_key(provider_name, provider_config)
+    base_url = provider_config.get("base_url")
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = openai.AsyncOpenAI(**client_kwargs)
+    client_cache[provider_name] = client
+    return client
 
 
 class AIOrchestrator:
@@ -80,6 +125,7 @@ class AIOrchestrator:
         prompt = prompt_registry.render(task_name, **template_kwargs)
         user_content = prompt["user"]
         model_cfg = model_router.route(task_name, len(user_content))
+        client = get_openai_client(model_cfg.provider)
 
         # 构建消息（含上下文历史）
         if conversation_id is not None:
@@ -95,21 +141,46 @@ class AIOrchestrator:
             try:
                 # 合并 system prompt 到 messages 中（OpenAI 格式）
                 openai_messages = [{"role": "system", "content": system}] + messages
-                
-                response = await client.chat.completions.create(
-                    model=model_cfg.model,
-                    max_tokens=model_cfg.max_tokens,
-                    temperature=model_cfg.temperature,
-                    messages=openai_messages,
-                )
+                request_kwargs: dict[str, Any] = {
+                    "model": model_cfg.model,
+                    "max_tokens": model_cfg.max_tokens,
+                    "temperature": model_cfg.temperature,
+                    "messages": openai_messages,
+                }
+                if model_router.requires_json_mode(task_name):
+                    request_kwargs["response_format"] = {"type": "json_object"}
+                response = await client.chat.completions.create(**request_kwargs)
                 raw = response.choices[0].message.content or ""
                 result = guardrails.process(task_name, raw)
+                logger.info(
+                    "AI 调用成功 task=%s provider=%s model=%s attempt=%s",
+                    task_name,
+                    model_cfg.provider,
+                    model_cfg.model,
+                    attempt + 1,
+                )
                 return result
             except GuardrailError as e:
+                logger.warning(
+                    "AI 输出校验失败 task=%s provider=%s model=%s attempt=%s error=%s",
+                    task_name,
+                    model_cfg.provider,
+                    model_cfg.model,
+                    attempt + 1,
+                    e,
+                )
                 if attempt == retries:
                     raise
                 await asyncio.sleep(0.5)
             except Exception as e:
+                logger.warning(
+                    "AI 调用异常 task=%s provider=%s model=%s attempt=%s error=%s",
+                    task_name,
+                    model_cfg.provider,
+                    model_cfg.model,
+                    attempt + 1,
+                    e,
+                )
                 if attempt == retries:
                     raise
                 await asyncio.sleep(1.0)
@@ -125,6 +196,7 @@ class AIOrchestrator:
         prompt = prompt_registry.render(task_name, **template_kwargs)
         user_content = prompt["user"]
         model_cfg = model_router.route(task_name, len(user_content))
+        client = get_openai_client(model_cfg.provider)
 
         if conversation_id is not None:
             ctx = get_context(conversation_id)
@@ -175,6 +247,7 @@ class AIOrchestrator:
             content=content,
         )
         surface_cfg = model_router.route("chat_surface_reply", len(content))
+        client = get_openai_client(surface_cfg.provider)
         ctx = get_context(conversation_id)
         messages, system = ctx.build_messages(
             surface_prompt["system"], surface_prompt["user"], "\n\n".join(
@@ -275,12 +348,14 @@ class AIOrchestrator:
         )
 
     async def parse_import_content(self, file_type: str, content_text: str) -> dict:
+        task_name = "import_narrative_parse" if file_type == "narrative" else "import_dialogue_parse"
         return await self.call(
-            "import_dialogue_parse",
+            task_name,
             {
                 "file_type": file_type,
                 "content_text": content_text[:12000],
             },
+            retries=0,
         )
 
     async def rebuild_import_analysis(self, interaction_unit: dict, context_payload: dict) -> dict:

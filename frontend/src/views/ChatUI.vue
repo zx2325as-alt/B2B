@@ -30,6 +30,7 @@
         <div class="conv-info">
           <span class="conv-name">{{ currentConvTitle }}</span>
           <span class="tag">{{ scenarioLabel(currentScenario) }}</span>
+          <span v-if="currentConversation?.is_readonly" class="tag amber">只读导入</span>
         </div>
         <div class="topbar-actions">
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="showScenarioModal = true">
@@ -71,6 +72,7 @@
             <div class="msg-body">
               <div class="msg-meta-top">
                 <span class="msg-author">{{ msg.character_name || msg.role }}</span>
+                <span v-if="msg.receiver_name" class="tag" style="font-size:10px;padding:1px 7px">{{ msg.character_name || msg.role }} → {{ msg.receiver_name }}</span>
                 <span class="msg-time">{{ formatTime(msg.created_at) }}</span>
                 <!-- Branch button -->
                 <button v-if="msg.role === 'user'" class="branch-btn" @click="branchFrom(msg.id)" title="从此处创建分支">
@@ -96,6 +98,12 @@
                 >
                   {{ tag }}
                 </button>
+              </div>
+
+              <div v-if="msg.role === 'user' && (msg.intent || msg.strategy || msg.emotion)" class="analysis-tags">
+                <span v-if="msg.intent" class="tag">意图 {{ msg.intent }}</span>
+                <span v-if="msg.strategy" class="tag">策略 {{ msg.strategy }}</span>
+                <span v-if="msg.emotion" class="tag">情绪 {{ msg.emotion }}</span>
               </div>
 
               <!-- Analysis Layer (AI messages only) -->
@@ -159,6 +167,7 @@
           </div>
         </div>
         <div v-if="!currentSpeaker" class="empty-hint" style="padding:0 0 10px;text-align:left">请先选择发言角色</div>
+        <div v-if="currentConversation?.is_readonly" class="empty-hint" style="padding:0 0 10px;text-align:left">当前对话为导入生成的只读对话，仅支持查看与分析，不支持继续发送。</div>
 
         <div class="input-row">
           <textarea
@@ -167,10 +176,11 @@
             class="chat-input"
             placeholder="输入消息…  Shift+Enter 换行，Enter 发送"
             rows="1"
+            :disabled="currentConversation?.is_readonly"
             @keydown.enter.exact.prevent="handleSend"
             @input="autoResize"
           />
-          <button class="send-btn" :disabled="!chat.streaming && !inputText.trim()" @click="handleSend">
+          <button class="send-btn" :disabled="currentConversation?.is_readonly || (!chat.streaming && !inputText.trim())" @click="handleSend">
             <svg v-if="!chat.streaming" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
               <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
             </svg>
@@ -235,6 +245,24 @@
               <span>{{ item.short_term || '短期策略未识别' }}</span>
               <small>{{ item.long_term || '长期模式未识别' }}</small>
             </button>
+          </div>
+        </div>
+        <div v-if="emotionData.emotion_heatmap?.length" style="margin-top:14px">
+          <div class="label">张力热力图</div>
+          <div class="emotion-bars">
+            <div v-for="item in emotionData.emotion_heatmap" :key="`heat-${item.message_id}`" class="ebar-row clickable" @click="scrollToMessage(item.message_id)">
+              <span class="ebar-label">#{{ item.message_id }}</span>
+              <div class="ebar-track">
+                <div class="ebar-fill" :style="{ width: (item.intended * 100) + '%', background: '#f59e0b' }"></div>
+              </div>
+              <span class="ebar-pct">{{ Math.round(item.actual * 100) }}%</span>
+            </div>
+          </div>
+        </div>
+        <div v-if="emotionData.emotion_keywords?.length" style="margin-top:14px">
+          <div class="label">情绪词云</div>
+          <div class="analysis-tags">
+            <span v-for="item in emotionData.emotion_keywords" :key="`kw-${item.label}`" class="tag">{{ item.label }} {{ item.weight }}</span>
           </div>
         </div>
       </div>
@@ -343,6 +371,7 @@ const currentConvTitle = computed(() => {
   const c = chat.conversations.find(c => c.id === chat.activeConvId)
   return c?.title || '选择或新建对话'
 })
+const currentConversation = computed(() => chat.conversations.find(c => c.id === chat.activeConvId) || null)
 const currentScenario = computed(() => {
   const c = chat.conversations.find(c => c.id === chat.activeConvId)
   return c?.scenario || 'general'
@@ -499,6 +528,10 @@ async function handleArchiveConversation() {
 async function handleSend() {
   if (chat.streaming) {
     chat.cancelStreaming()
+    return
+  }
+  if (currentConversation.value?.is_readonly) {
+    alert('当前为只读导入对话，不能继续发送新消息')
     return
   }
   const text = inputText.value.trim()

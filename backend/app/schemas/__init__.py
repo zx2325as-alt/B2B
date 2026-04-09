@@ -142,16 +142,28 @@ class ConversationCreate(BaseModel):
 
 class MessageOut(BaseModel):
     id: int
+    message_id: int
+    message_index: int
     conversation_id: int
     parent_id: Optional[int]
     role: str
+    speaker_id: Optional[int]
+    speaker_name: Optional[str]
     character_name: Optional[str]
+    receiver_id: Optional[int]
+    receiver_name: Optional[str]
     content: str
+    intent: Optional[str]
+    strategy: Optional[str]
+    emotion: Optional[str]
     inner_monologue: Optional[str]
     emotion_label: Optional[str]
     emotion_score: Optional[float]
     subtext: Optional[str]
     psychological_tag: Optional[str]
+    source_type: Optional[str]
+    readonly: Optional[bool]
+    timestamp: datetime
     created_at: datetime
 
     class Config:
@@ -179,7 +191,7 @@ class ImportCommitRequest(BaseModel):
     file_type: str
     import_file_id: Optional[int] = None
     scenario: str = "general"
-    create_readonly_conversation: bool = True
+    create_readonly_conversation: bool = False
     auto_archive: bool = True
     preview_payload: dict[str, Any]
     role_mappings: list[ImportRoleMapping] = []

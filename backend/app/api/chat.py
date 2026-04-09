@@ -61,6 +61,15 @@ def _parse_emotion_label(label: str | None) -> dict:
     }
 
 
+def _parse_strategy_text(strategy_text: str | None) -> dict:
+    lines = [line.strip() for line in (strategy_text or "").splitlines() if line.strip()]
+    return {
+        "short_term": next((line.replace("短期策略：", "").strip() for line in lines if line.startswith("短期策略：")), ""),
+        "long_term": next((line.replace("长期策略：", "").strip() for line in lines if line.startswith("长期策略：")), ""),
+        "consistency": next((line.replace("一致性说明：", "").strip() for line in lines if line.startswith("一致性说明：")), ""),
+    }
+
+
 def _emotion_polarity(label: str) -> int:
     positive = {"喜悦", "依恋", "信任", "安心", "感动", "期待", "亲近"}
     negative = {"愧疚", "恐惧", "愤怒", "厌烦", "警惕", "防御", "回避", "羞耻", "怀疑"}
@@ -314,7 +323,17 @@ def _build_listener_memory(
 @router.get("/conversations")
 def list_conversations(db: Session = Depends(get_db)):
     convs = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(20).all()
-    return [{"id": c.id, "title": c.title, "scenario": c.scenario, "updated_at": c.updated_at} for c in convs]
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "scenario": c.scenario,
+            "updated_at": c.updated_at,
+            "is_readonly": bool(getattr(c, "is_readonly", False)),
+            "source_import_file_id": getattr(c, "source_import_file_id", None),
+        }
+        for c in convs
+    ]
 
 
 @router.post("/conversations")
@@ -340,7 +359,12 @@ def delete_conversation(conv_id: int, db: Session = Depends(get_db)):
 
 @router.get("/conversations/{conv_id}/messages", response_model=list[MessageOut])
 def get_messages(conv_id: int, db: Session = Depends(get_db)):
-    return db.query(Message).filter_by(conversation_id=conv_id).order_by(Message.created_at).all()
+    rows = db.query(Message).filter_by(conversation_id=conv_id).order_by(Message.created_at).all()
+    for index, row in enumerate(rows, start=1):
+        if not row.message_index:
+            row.message_index = index
+    db.commit()
+    return rows
 
 
 # ─── Stream Chat ──────────────────────────────────────────────────────────────
@@ -352,17 +376,6 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
         raise HTTPException(404, "对话不存在")
     if not body.speaker:
         raise HTTPException(400, "请先选择发言角色")
-
-    user_msg = Message(
-        conversation_id=body.conversation_id,
-        role="user",
-        character_name=body.speaker,
-        character_id=body.character_id,
-        content=body.content,
-    )
-    db.add(user_msg)
-    db.commit()
-    db.refresh(user_msg)
 
     listeners, primary_listener = _select_primary_listener(
         db,
@@ -377,6 +390,26 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
         listeners,
         primary_listener,
     )
+    receiver_id = getattr(primary_listener, "id", None) if primary_listener else None
+    receiver_name = getattr(primary_listener, "name", "") if primary_listener else ""
+    next_message_index = db.query(Message).filter(
+        Message.conversation_id == body.conversation_id
+    ).count() + 1
+    user_msg = Message(
+        conversation_id=body.conversation_id,
+        role="user",
+        message_index=next_message_index,
+        character_name=body.speaker,
+        character_id=body.character_id,
+        receiver_id=receiver_id,
+        receiver_name=receiver_name,
+        content=body.content,
+        source_type="chat",
+        readonly=False,
+    )
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
 
     async def event_generator():
         full_result = None
@@ -398,16 +431,29 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
             yield f"data: {chunk}\n\n"
 
         if full_result:
+            strategy_payload = _parse_strategy_text(full_result.get("subtext"))
+            emotion_payload = _parse_emotion_label(full_result.get("emotion_label"))
+            user_msg.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
+            user_msg.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
+            user_msg.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
             ai_msg = Message(
                 conversation_id=body.conversation_id,
                 role="assistant",
+                message_index=next_message_index + 1,
                 character_name="AI分析",
+                receiver_id=receiver_id,
+                receiver_name=receiver_name,
                 content=full_result.get("reply", ""),
                 inner_monologue=full_result.get("inner_monologue"),
                 emotion_label=full_result.get("emotion_label"),
                 emotion_score=full_result.get("emotion_score"),
                 subtext=full_result.get("subtext"),
                 psychological_tag=full_result.get("psychological_tag"),
+                intent=user_msg.intent,
+                strategy=user_msg.strategy,
+                emotion=user_msg.emotion,
+                source_type="analysis",
+                readonly=False,
                 parent_id=user_msg.id,
             )
             db.add(ai_msg)
@@ -473,23 +519,43 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
 
     ai_msg = db.query(Message).filter(Message.parent_id == message.id).first()
     if ai_msg:
+        strategy_payload = _parse_strategy_text(result.get("subtext"))
+        emotion_payload = _parse_emotion_label(result.get("emotion_label"))
+        message.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
+        message.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
+        message.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
         ai_msg.content = result.get("reply", "")
         ai_msg.inner_monologue = result.get("inner_monologue")
         ai_msg.emotion_label = result.get("emotion_label")
         ai_msg.emotion_score = result.get("emotion_score")
         ai_msg.subtext = result.get("subtext")
         ai_msg.psychological_tag = result.get("psychological_tag")
+        ai_msg.intent = message.intent
+        ai_msg.strategy = message.strategy
+        ai_msg.emotion = message.emotion
     else:
+        strategy_payload = _parse_strategy_text(result.get("subtext"))
+        emotion_payload = _parse_emotion_label(result.get("emotion_label"))
+        message.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
+        message.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
+        message.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
         ai_msg = Message(
             conversation_id=conv.id,
             role="assistant",
+            message_index=(message.message_index or message.id or 0) + 1,
             character_name="AI分析",
+            receiver_id=message.receiver_id,
+            receiver_name=message.receiver_name,
             content=result.get("reply", ""),
             inner_monologue=result.get("inner_monologue"),
             emotion_label=result.get("emotion_label"),
             emotion_score=result.get("emotion_score"),
             subtext=result.get("subtext"),
             psychological_tag=result.get("psychological_tag"),
+            intent=message.intent,
+            strategy=message.strategy,
+            emotion=message.emotion,
+            source_type="analysis",
             parent_id=message.id,
         )
         db.add(ai_msg)
@@ -548,9 +614,12 @@ def get_emotion_tension(conv_id: int, source: str, target: str, db: Session = De
     deep_emotions = []
     strategy_trajectory = []
     dominant = []
+    emotion_keywords = {}
     for analysis in analysis_messages:
         parent = db.get(Message, analysis.parent_id)
         if not parent or parent.character_name != source:
+            continue
+        if target and parent.receiver_name and parent.receiver_name != target:
             continue
         parsed = _parse_emotion_label(analysis.emotion_label)
         if not parsed:
@@ -573,6 +642,9 @@ def get_emotion_tension(conv_id: int, source: str, target: str, db: Session = De
                 }
             )
             dominant.append(parsed["deep_label"])
+            emotion_keywords[parsed["deep_label"]] = emotion_keywords.get(parsed["deep_label"], 0) + parsed.get("deep_score", 0)
+        if parsed.get("intended_label"):
+            emotion_keywords[parsed["intended_label"]] = emotion_keywords.get(parsed["intended_label"], 0) + parsed.get("intended_score", 0)
         strategy_lines = [line.strip() for line in (analysis.subtext or "").splitlines() if line.strip()]
         short_line = next((line.replace("短期策略：", "").strip() for line in strategy_lines if line.startswith("短期策略：")), "")
         long_line = next((line.replace("长期策略：", "").strip() for line in strategy_lines if line.startswith("长期策略：")), "")
@@ -596,10 +668,27 @@ def get_emotion_tension(conv_id: int, source: str, target: str, db: Session = De
         elif max(e["score"] for e in emotions) - min(e["score"] for e in emotions) > 0.35:
             trend = "volatile"
 
+    heatmap = []
+    for item in emotions:
+        deep_item = next((deep for deep in deep_emotions if deep["message_id"] == item["message_id"]), None)
+        heatmap.append(
+            {
+                "message_id": item["message_id"],
+                "target": target,
+                "intended": item["score"],
+                "actual": deep_item["score"] if deep_item else 0,
+            }
+        )
+
     return {
         "emotions": emotions,
         "deep_emotions": deep_emotions,
         "strategy_trajectory": strategy_trajectory,
+        "emotion_heatmap": heatmap,
+        "emotion_keywords": [
+            {"label": label, "weight": weight}
+            for label, weight in sorted(emotion_keywords.items(), key=lambda item: item[1], reverse=True)
+        ][:12],
         "trend": trend,
         "turning_point": dominant[-1] if dominant else None,
     }
@@ -657,6 +746,8 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
         if not analysis:
             continue
         listeners = [name for name in role_names if name != user_message.character_name]
+        if user_message.receiver_name and user_message.receiver_name in role_map:
+            listeners = [user_message.receiver_name, *[name for name in listeners if name != user_message.receiver_name]]
         if not listeners:
             continue
         target_char = role_map.get(listeners[0])

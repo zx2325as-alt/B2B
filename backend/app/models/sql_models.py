@@ -93,6 +93,8 @@ class ImportFile(Base):
     file_type = Column(String(50), nullable=False)
     content_type = Column(String(100), default="")
     status = Column(String(30), default="previewed")
+    version = Column(Integer, default=1)
+    model_used = Column(String(100), default="ai-harness")
     summary = Column(Text)
     metadata_json = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -125,6 +127,8 @@ class InteractionUnit(Base):
     interaction_type = Column(String(100), default="")
     interaction_confidence = Column(Float, default=0.0)
     interaction_state = Column(String(20), default="inferred")
+    psychological_label = Column(String(200), default="")
+    context_window = Column(JSON, default=list)
     analysis = Column(JSON, default=dict)
     event_payload = Column(JSON, default=dict)
     relationship_payload = Column(JSON, default=dict)
@@ -142,6 +146,8 @@ class Conversation(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(200), default="新对话")
     scenario = Column(String(100), default="general")
+    is_readonly = Column(Boolean, default=False)
+    source_import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -157,9 +163,17 @@ class Message(Base):
     branch_label = Column(String(50), nullable=True)
 
     role = Column(String(20), nullable=False)          # user / assistant / system
+    message_index = Column(Integer, default=0)
     character_id = Column(Integer, ForeignKey("characters.id"), nullable=True)
     character_name = Column(String(100))
+    receiver_id = Column(Integer, ForeignKey("characters.id"), nullable=True)
+    receiver_name = Column(String(100))
     content = Column(Text, nullable=False)
+    intent = Column(String(200))
+    strategy = Column(String(200))
+    emotion = Column(String(200))
+    source_type = Column(String(20), default="chat")
+    readonly = Column(Boolean, default=False)
 
     # Analysis layer
     inner_monologue = Column(Text)
@@ -172,3 +186,19 @@ class Message(Base):
 
     conversation = relationship("Conversation", back_populates="messages")
     children = relationship("Message", foreign_keys=[parent_id])
+
+    @property
+    def message_id(self):
+        return self.id
+
+    @property
+    def speaker_id(self):
+        return self.character_id
+
+    @property
+    def speaker_name(self):
+        return self.character_name
+
+    @property
+    def timestamp(self):
+        return self.created_at

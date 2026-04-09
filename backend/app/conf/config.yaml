@@ -1,9 +1,34 @@
 ai:
-  # 默认使用的 AI 提供商
   default_provider: "deepseek"
+  task_providers:
+    chat_surface_reply: "deepseek"
+    chat_analysis: "deepseek"
+    import_dialogue_parse: "deepseek"
+    import_narrative_parse: "deepseek"
+    import_commit_review: "deepseek"
+    interaction_analysis_rebuild: "deepseek"
+    character_profile_gen: "deepseek"
+    relationship_analysis: "deepseek"
+    ai_suggest_update: "deepseek"
+    emotion_curve: "deepseek"
+  task_models:
+    import_dialogue_parse: "deepseek-chat"
+    import_narrative_parse: "deepseek-chat"
+    import_commit_review: "deepseek-chat"
+    interaction_analysis_rebuild: "deepseek-chat"
+  task_max_tokens:
+    chat_analysis: 2048
+    import_dialogue_parse: 4096
+    import_narrative_parse: 4096
+    import_commit_review: 3072
+    interaction_analysis_rebuild: 3072
+  task_temperatures:
+    import_dialogue_parse: 0.2
+    import_narrative_parse: 0.2
+    import_commit_review: 0.2
+    interaction_analysis_rebuild: 0.3
   
   providers:
-    # 1. 国外：OpenAI
     openai:
       base_url: "https://api.openai.com/v1"
       api_key: "sk-your-openai-key"
@@ -12,7 +37,6 @@ ai:
         medium: "gpt-4o"
         complex: "gpt-4o"
         
-    # 2. 国内：DeepSeek
     deepseek:
       base_url: "https://api.deepseek.com/v1"
       api_key: "sk-803936ec8add440db0dca13ec660f070"
@@ -21,16 +45,14 @@ ai:
         medium: "deepseek-chat"
         complex: "deepseek-reasoner"
         
-    # 3. 本地：Ollama
     ollama:
       base_url: "http://localhost:11434/v1"
-      api_key: "ollama" # Ollama 不需要真实的 API Key
+      api_key: "ollama"
       models:
         simple: "llama3"
         medium: "llama3"
         complex: "llama3"
         
-    # 4. 本地/集群：vLLM
     vllm:
       base_url: "http://localhost:8000/v1"
       api_key: "empty"

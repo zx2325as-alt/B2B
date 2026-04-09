@@ -5,7 +5,6 @@ AI Harness: Model Router + Guardrails
 """
 import json
 import re
-import os
 import yaml
 from pathlib import Path
 from dataclasses import dataclass
@@ -25,8 +24,11 @@ def load_config():
 config_data = load_config()
 ai_config = config_data.get("ai", {})
 default_provider_name = ai_config.get("default_provider", "deepseek")
-provider_config = ai_config.get("providers", {}).get(default_provider_name, {})
-models_config = provider_config.get("models", {})
+providers_config = ai_config.get("providers", {})
+task_providers = ai_config.get("task_providers", {})
+task_models = ai_config.get("task_models", {})
+task_max_tokens = ai_config.get("task_max_tokens", {})
+task_temperatures = ai_config.get("task_temperatures", {})
 
 # ─── Model Router ─────────────────────────────────────────────────────────────
 
@@ -38,28 +40,10 @@ class TaskComplexity(str, Enum):
 
 @dataclass
 class ModelConfig:
+    provider: str
     model: str
     max_tokens: int
     temperature: float
-
-
-MODEL_CONFIGS: dict[TaskComplexity, ModelConfig] = {
-    TaskComplexity.SIMPLE: ModelConfig(
-        model=models_config.get("simple", "deepseek-chat"),
-        max_tokens=512,
-        temperature=0.3,
-    ),
-    TaskComplexity.MEDIUM: ModelConfig(
-        model=models_config.get("medium", "deepseek-chat"),
-        max_tokens=1024,
-        temperature=0.5,
-    ),
-    TaskComplexity.COMPLEX: ModelConfig(
-        model=models_config.get("complex", "deepseek-reasoner"),
-        max_tokens=2048,
-        temperature=0.7,
-    ),
-}
 
 
 class ModelRouter:
@@ -73,12 +57,36 @@ class ModelRouter:
         "chat_analysis": TaskComplexity.MEDIUM,
         "import_dialogue_parse": TaskComplexity.COMPLEX,
         "import_narrative_parse": TaskComplexity.COMPLEX,
+        "import_commit_review": TaskComplexity.COMPLEX,
         "interaction_analysis_rebuild": TaskComplexity.COMPLEX,
         "character_profile_gen": TaskComplexity.COMPLEX,
         "relationship_analysis": TaskComplexity.MEDIUM,
         "ai_suggest_update": TaskComplexity.COMPLEX,
         "emotion_curve": TaskComplexity.SIMPLE,
     }
+
+    JSON_TASKS = {
+        "chat_analysis",
+        "import_dialogue_parse",
+        "import_narrative_parse",
+        "import_commit_review",
+        "interaction_analysis_rebuild",
+        "character_profile_gen",
+        "relationship_analysis",
+        "emotion_curve",
+    }
+
+    def resolve_provider(self, task_name: str) -> str:
+        candidate = task_providers.get(task_name) or default_provider_name or "deepseek"
+        if candidate in providers_config:
+            return candidate
+        if "deepseek" in providers_config:
+            return "deepseek"
+        return next(iter(providers_config.keys()), "deepseek")
+
+    def _provider_models(self, provider_name: str) -> dict[str, str]:
+        provider_cfg = providers_config.get(provider_name, {})
+        return provider_cfg.get("models", {})
 
     def route(self, task_name: str, content_length: int = 0) -> ModelConfig:
         complexity = self.TASK_MAP.get(task_name, TaskComplexity.MEDIUM)
@@ -89,7 +97,35 @@ class ModelRouter:
         elif content_length > 5000:
             complexity = TaskComplexity.COMPLEX
 
-        return MODEL_CONFIGS[complexity]
+        provider_name = self.resolve_provider(task_name)
+        models_config = self._provider_models(provider_name)
+        default_models = {
+            TaskComplexity.SIMPLE: "deepseek-chat",
+            TaskComplexity.MEDIUM: "deepseek-chat",
+            TaskComplexity.COMPLEX: "deepseek-reasoner",
+        }
+        model_name = task_models.get(task_name) or models_config.get(complexity.value) or default_models[complexity]
+        if task_name in self.JSON_TASKS and provider_name == "deepseek" and model_name == "deepseek-reasoner":
+            model_name = "deepseek-chat"
+        base_tokens = {
+            TaskComplexity.SIMPLE: 512,
+            TaskComplexity.MEDIUM: 1024,
+            TaskComplexity.COMPLEX: 2048,
+        }
+        base_temperatures = {
+            TaskComplexity.SIMPLE: 0.3,
+            TaskComplexity.MEDIUM: 0.5,
+            TaskComplexity.COMPLEX: 0.7,
+        }
+        return ModelConfig(
+            provider=provider_name,
+            model=model_name,
+            max_tokens=int(task_max_tokens.get(task_name, base_tokens[complexity])),
+            temperature=float(task_temperatures.get(task_name, base_temperatures[complexity])),
+        )
+
+    def requires_json_mode(self, task_name: str) -> bool:
+        return task_name in self.JSON_TASKS
 
 
 model_router = ModelRouter()

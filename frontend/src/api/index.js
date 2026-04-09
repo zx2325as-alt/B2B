@@ -11,6 +11,7 @@ export const characterApi = {
   delete: (id)                 => api.delete(`/characters/${id}`),
   previewImport: (formData)    => api.post('/characters/imports/preview', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
   commitImport: (data)         => api.post('/characters/imports/commit', data),
+  getImportStatus: (id)        => api.get(`/characters/imports/${id}/status`),
   exportAll: ()                => api.get('/characters/exports/full'),
   suggestUpdate: (id)          => api.post(`/characters/${id}/suggest-update`),
   listObservations: (id)       => api.get(`/characters/${id}/observations`),

@@ -1,0 +1,10 @@
+2026-04-09 16:08:29 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:09:02 | INFO | httpx | HTTP Request: POST http://testserver/api/v1/characters/imports/preview "HTTP/1.1 200 OK"
+2026-04-09 16:09:02 | INFO | openai._base_client | Retrying request to /chat/completions in 0.483564 seconds
+2026-04-09 16:09:03 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:09:18 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:09:30 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:09:42 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:09:52 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-04-09 16:10:04 | INFO | httpx | HTTP Request: POST http://testserver/api/v1/characters/imports/commit "HTTP/1.1 200 OK"
+2026-04-09 16:10:19 | INFO | httpx | HTTP Request: GET http://testserver/api/v1/characters/imports/42/status "HTTP/1.1 200 OK"

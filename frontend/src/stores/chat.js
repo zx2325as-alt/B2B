@@ -118,6 +118,9 @@ export const useChatStore = defineStore('chat', () => {
       }
     )
 
+    if (activeConvId.value) {
+      await loadMessages(activeConvId.value)
+    }
     streaming.value = false
     streamBuffer.value = ''
     streamController.value = null

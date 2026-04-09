@@ -131,6 +131,69 @@ PROMPT_REGISTRY: dict[str, dict] = {
         "user": "文件类型：{file_type}\n内容：\n{content_text}"
     },
 
+    "import_narrative_parse": {
+        "system": """你是 AI Harness 的统一导入解析引擎。你需要把叙事文本、文章、剧本或历史记录解析成统一语义协议。
+
+请返回严格 JSON：
+{{
+  "characters": [
+    {{
+      "name": "角色名",
+      "role": "可推断角色定位",
+      "background": "可推断背景",
+      "personality_tags": ["标签1"],
+      "status": "confirmed/ambiguous/new",
+      "confidence": 0.0
+    }}
+  ],
+  "interaction_units": [
+    {{
+      "speaker": "发言者或叙事主导者",
+      "receiver": "主要接收者",
+      "receiver_confidence": 0.0,
+      "receiver_state": "confirmed/inferred/ambiguous",
+      "content": "原文片段",
+      "intent": {{"value": "行为意图", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
+      "strategy": {{"value": "表达策略", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
+      "emotion": {{"value": "情绪倾向", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
+      "interaction_type": {{"value": "互动类型", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}}
+    }}
+  ],
+  "events": [
+    {{
+      "actor": "行为主体",
+      "action": "行为类型",
+      "time": "可推断时间",
+      "location": "可推断地点",
+      "participants": ["角色1", "角色2"],
+      "summary": "事件概述"
+    }}
+  ],
+  "relationships": [
+    {{
+      "source": "角色A",
+      "target": "角色B",
+      "rel_type": "ally/rival/friend/family/romantic/neutral",
+      "strength": 0.0,
+      "sentiment": -1.0,
+      "description": "关系依据"
+    }}
+  ],
+  "plot_summary": {{
+    "main_conflict": "主冲突",
+    "relationship_path": "关系演化路径",
+    "turning_points": ["转折点1"]
+  }}
+}}
+
+约束：
+- 叙事文本要优先抽取明确事件，再从事件里保守推断互动关系
+- 没有直接对白时，也可以从叙事动作中提炼 interaction_units，但不要过度猜测
+- 所有推断都要保守且可解释
+- 字段缺失时允许为空，不要臆造长篇背景""",
+        "user": "文件类型：{file_type}\n内容：\n{content_text}"
+    },
+
     "interaction_analysis_rebuild": {
         "system": """你是 AI Harness 的分析层重建引擎。你要为导入得到的 Interaction Unit 重建与页面1一致的分析层。
 
@@ -148,6 +211,56 @@ PROMPT_REGISTRY: dict[str, dict] = {
 - 强制结合人物特征、关系状态与上下文
 - 若信息有限，要保守推断但仍保持可解释性""",
         "user": "交互单元：{interaction_unit}\n角色画像与关系上下文：{context_payload}"
+    },
+
+    "import_commit_review": {
+        "system": """你是 AI Harness 的导入审核代理。你的任务是在正式入库前自动审核导入预览结果，尽量减少人工干预。
+
+请严格返回 JSON：
+{{
+  "summary": "审核结论摘要",
+  "reviewed_role_mappings": [
+    {{
+      "original_name": "原始角色名",
+      "resolved_name": "审核后的角色名",
+      "status": "confirmed/ambiguous/new",
+      "action": "create/link/skip",
+      "reason": "调整原因"
+    }}
+  ],
+  "reviewed_relationships": [
+    {{
+      "source": "角色A",
+      "target": "角色B",
+      "rel_type": "ally/rival/friend/family/romantic/neutral",
+      "strength": 0.0,
+      "sentiment": -1.0,
+      "description": "关系依据"
+    }}
+  ],
+  "reviewed_events": [
+    {{
+      "actor": "行为主体",
+      "action": "事件动作",
+      "time": "可推断时间",
+      "location": "可推断地点",
+      "participants": ["角色1", "角色2"],
+      "summary": "适合写入人物事迹时间线的详细事件总结"
+    }}
+  ],
+  "reviewed_plot_summary": {{
+    "main_conflict": "主冲突",
+    "relationship_path": "关系演化路径",
+    "turning_points": ["转折点1"]
+  }}
+}}
+
+要求：
+- 优先自动修正明显错误、歧义映射和弱关系
+- 尽量把多句对话总结成较完整事件，而不是逐句重复
+- 如果原始结果已足够稳定，可以保持不改
+- 不要输出解释文本，只输出 JSON""",
+        "user": "请审核以下导入预览压缩结果：\n{review_payload}"
     },
 
     # ─── 角色档案生成 ─────────────────────────────────────────

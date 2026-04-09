@@ -1,0 +1,10 @@
+2026-04-09 16:09:02 | INFO | import | AI 调用成功 task=import_dialogue_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:09:02 | INFO | import | 导入任务已排队 import_file_id=42 filename=sample.txt
+2026-04-09 16:09:02 | INFO | import | 导入任务开始 import_file_id=42 filename=sample.txt
+2026-04-09 16:09:18 | INFO | import | AI 调用成功 task=import_commit_review provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:09:18 | INFO | import | 导入事件创建完成 import_file_id=42 created_events=2
+2026-04-09 16:09:30 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:09:42 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:09:52 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:10:04 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1
+2026-04-09 16:10:04 | INFO | import | 导入任务完成 import_file_id=42 chars=2 units=4 events=2 rels=0

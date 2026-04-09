@@ -168,6 +168,7 @@
         <div v-if="activeTab === 'relations'" class="tab-content">
           <div class="rel-header">
             <div class="section-title" style="margin:0">关系网络</div>
+            <span v-if="importCompletionNotice" class="tag green" style="font-size:11px">{{ importCompletionNotice }}</span>
             <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="showRelModal = true">＋ 添加关系</button>
           </div>
           <div class="rel-list">
@@ -374,7 +375,7 @@
         </div>
       </div>
 
-      <div v-if="showImportModal" class="modal-overlay" @click.self="showImportModal = false">
+      <div v-if="showImportModal" class="modal-overlay">
         <div class="modal card fade-up" style="width:980px;max-height:88vh;overflow-y:auto">
           <div class="modal-header">
             <span>统一智能导入 / 导出</span>
@@ -385,11 +386,13 @@
               <div class="section-title">文件入口</div>
               <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
                 <input ref="importFileInput" type="file" class="input" accept=".txt,.md,.pdf,.docx,.json,.csv" style="max-width:340px" @change="handleImportFileChange"/>
-                <button class="btn btn-primary" :disabled="!selectedImportFile || importLoading" @click="previewImport">
+                <button type="button" class="btn btn-primary" :disabled="!selectedImportFile || importLoading" @click.prevent="previewImport">
                   {{ importLoading ? '解析中…' : '上传并预览' }}
                 </button>
-                <button class="btn btn-ghost" @click="downloadExport">导出全量 JSON</button>
+                <button type="button" class="btn btn-ghost" @click.prevent="downloadExport">导出全量 JSON</button>
               </div>
+              <div v-if="importError" class="tag red" style="width:fit-content">{{ importError }}</div>
+              <div v-else-if="importNotice" class="tag amber" style="width:fit-content">{{ importNotice }}</div>
               <div class="empty-hint" style="padding:8px 0 0;text-align:left">支持 TXT / MD / PDF / DOCX / JSON / CSV，统一进入 AI Harness 语义解析链路。</div>
             </div>
 
@@ -426,10 +429,11 @@
                         <span class="tag" :class="unit.receiver_confidence >= 0.6 ? 'green' : 'amber'">{{ Math.round((unit.receiver_confidence || 0) * 100) }}%</span>
                       </div>
                       <div class="obs-reason" style="margin-top:6px">{{ unit.content }}</div>
-                      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-                        <span class="tag">{{ unit.intent?.value || '意图待定' }}</span>
-                        <span class="tag">{{ unit.strategy?.value || '策略待定' }}</span>
-                        <span class="tag">{{ unit.emotion?.value || '情绪待定' }}</span>
+                      <div class="tag violet" style="margin-top:8px;width:fit-content">{{ unit.psychological_label || '心理标签待生成' }}</div>
+                      <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:8px">
+                        <input class="input" v-model="unit.intent.value" placeholder="编辑意图"/>
+                        <input class="input" v-model="unit.strategy.value" placeholder="编辑策略"/>
+                        <input class="input" v-model="unit.emotion.value" placeholder="编辑情绪"/>
                       </div>
                     </div>
                   </div>
@@ -441,6 +445,7 @@
                   <div class="section-title">事件 / 关系 / 剧情结构</div>
                   <div class="import-list">
                     <div class="import-item">
+                      <div><strong>导入版本</strong> v{{ importPreview.import_version?.version || 1 }}</div>
                       <div><strong>事件数</strong> {{ importPreview.events?.length || 0 }}</div>
                       <div><strong>关系数</strong> {{ importPreview.relationships?.length || 0 }}</div>
                       <div><strong>低置信交互</strong> {{ importPreview.low_confidence_units?.length || 0 }}</div>
@@ -461,8 +466,27 @@
                 </div>
 
                 <div class="card import-card">
+                  <div class="section-title">关系预览</div>
+                  <div v-if="!importPreview.relationships?.length" class="empty-hint">暂无关系</div>
+                  <div v-else class="import-list">
+                    <div v-for="(rel, idx) in importPreview.relationships.slice(0, 10)" :key="`rel-${idx}`" class="import-item">
+                      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                        <strong>{{ rel.source }} → {{ rel.target }}</strong>
+                        <span class="tag">{{ rel.rel_type || 'neutral' }}</span>
+                      </div>
+                      <div class="obs-reason" style="margin-top:6px">{{ rel.description || '暂无关系说明' }}</div>
+                      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+                        <span class="tag">强度 {{ Math.round((rel.strength || 0) * 100) }}%</span>
+                        <span class="tag">极性 {{ ((rel.sentiment || 0) > 0 ? '+' : '') + Number(rel.sentiment || 0).toFixed(2) }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card import-card">
                   <div class="section-title">写入选项</div>
                   <div style="display:flex;flex-direction:column;gap:10px">
+                    <div class="tag violet" style="width:fit-content">AI 审核代理会自动审核并后台入库</div>
                     <label class="check-row"><input type="checkbox" v-model="importOptions.create_readonly_conversation"/> 创建只读会话并接入页面1</label>
                     <label class="check-row"><input type="checkbox" v-model="importOptions.auto_archive"/> 导入后自动进入归档/关系更新流程</label>
                     <select class="input" v-model="importOptions.scenario">
@@ -472,10 +496,44 @@
                       <option value="hr_interview">HR面试</option>
                       <option value="counseling">心理咨询</option>
                     </select>
-                    <button class="btn btn-primary" :disabled="importLoading" @click="commitImport">
+                    <button type="button" class="btn btn-primary" :disabled="importLoading" @click.prevent="commitImport">
                       {{ importLoading ? '导入中…' : '确认导入并写入系统' }}
                     </button>
                     <div v-if="importResult" class="obs-reason">导入完成：角色 {{ importResult.created_characters?.length || 0 }} / 交互 {{ importResult.interaction_units || 0 }} / 关系 {{ importResult.relationships || 0 }}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="import-grid">
+                <div class="card import-card">
+                  <div class="section-title">伪对话上下文</div>
+                  <div v-if="!importPreview.pseudo_conversation?.messages?.length" class="empty-hint">暂无伪对话流</div>
+                  <div v-else class="import-list">
+                    <div v-for="item in importPreview.pseudo_conversation.messages.slice(0, 10)" :key="`pseudo-${item.message_index}`" class="import-item">
+                      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                        <strong>#{{ item.message_index }} {{ item.speaker }} → {{ item.receiver || '待推断' }}</strong>
+                        <span class="tag" :class="(item.receiver_confidence || 0) >= 0.6 ? 'green' : 'amber'">{{ Math.round((item.receiver_confidence || 0) * 100) }}%</span>
+                      </div>
+                      <div class="obs-reason" style="margin-top:6px">{{ item.content }}</div>
+                      <div class="obs-field" style="margin-top:8px">上下文窗口</div>
+                      <div class="obs-reason">{{ (item.context_window || []).map(ctx => `#${ctx.message_index} ${ctx.speaker}→${ctx.receiver || '待推断'}: ${ctx.content}`).join(' / ') || '无' }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card import-card">
+                  <div class="section-title">人格特征 / 行为模式</div>
+                  <div v-if="!Object.keys(importPreview.character_modeling || {}).length" class="empty-hint">暂无人格建模结果</div>
+                  <div v-else class="import-list">
+                    <div v-for="(model, name) in importPreview.character_modeling" :key="`model-${name}`" class="import-item">
+                      <strong>{{ name }}</strong>
+                      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+                        <span v-for="trait in model.traits || []" :key="`${name}-trait-${trait}`" class="tag green">{{ trait }}</span>
+                        <span v-for="trait in model.weak_traits || []" :key="`${name}-weak-${trait}`" class="tag amber">{{ trait }}</span>
+                      </div>
+                      <div class="obs-field" style="margin-top:8px">行为模式</div>
+                      <div class="obs-reason">{{ (model.behavior_patterns || []).join(' / ') || '暂无' }}</div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -507,11 +565,16 @@ const importFileInput = ref(null)
 const selectedImportFile = ref(null)
 const importPreview = ref(null)
 const importResult = ref(null)
+const importError = ref('')
+const importNotice = ref('')
+const importCompletionNotice = ref('')
+const importTaskId = ref(null)
 const importOptions = ref({
   scenario: 'general',
-  create_readonly_conversation: true,
+  create_readonly_conversation: false,
   auto_archive: true,
 })
+let importPollTimer = null
 
 const showCharModal = ref(false)
 const showRelModal = ref(false)
@@ -580,6 +643,9 @@ function openCreateModal() {
 }
 function openImportModal() {
   showImportModal.value = true
+}
+function closeImportModal() {
+  showImportModal.value = false
 }
 function openEditModal(c) {
   editingChar.value = c
@@ -665,16 +731,57 @@ async function handleImportFileChange(e) {
   selectedImportFile.value = e.target.files?.[0] || null
   importPreview.value = null
   importResult.value = null
+  importError.value = ''
+  importNotice.value = ''
+}
+async function pollImportStatus(taskId) {
+  if (!taskId) return
+  try {
+    const res = await characterApi.getImportStatus(taskId)
+    const data = res.data || {}
+    if (data.status === 'queued' || data.status === 'reviewing' || data.status === 'processing') {
+      importNotice.value = data.progress?.message || '导入任务正在后台处理中…'
+      importPollTimer = window.setTimeout(() => pollImportStatus(taskId), 1500)
+      return
+    }
+    if (data.status === 'committed') {
+      importTaskId.value = null
+      importResult.value = data.result || null
+      importNotice.value = data.progress?.message || '导入完成'
+      importCompletionNotice.value = `导入完成：关系 ${data.relationship_count || data.result?.relationships || 0}`
+      await chars.fetchAll()
+      if (activeChar.value) {
+        const refreshed = chars.characters.find(c => c.id === activeChar.value.id)
+        if (refreshed) {
+          activeChar.value = refreshed
+          await loadEvents(refreshed.id)
+        }
+      }
+      return
+    }
+    importTaskId.value = null
+    importError.value = data.progress?.message || '导入失败，请查看后台日志。'
+  } catch (err) {
+    importTaskId.value = null
+    importError.value = err?.response?.data?.detail || err?.message || '导入状态获取失败，请查看后台日志。'
+  }
 }
 async function previewImport() {
   if (!selectedImportFile.value || importLoading.value) return
   importLoading.value = true
   try {
+    importError.value = ''
+    importNotice.value = ''
     const formData = new FormData()
     formData.append('file', selectedImportFile.value)
     const res = await characterApi.previewImport(formData)
     importPreview.value = res.data
     importResult.value = null
+    importNotice.value = res.data?.warning_message || ''
+  } catch (err) {
+    importPreview.value = null
+    importResult.value = null
+    importError.value = err?.response?.data?.detail || err?.message || '导入预览失败，请检查后端服务或文件内容。'
   } finally {
     importLoading.value = false
   }
@@ -683,6 +790,7 @@ async function commitImport() {
   if (!importPreview.value || importLoading.value) return
   importLoading.value = true
   try {
+    importError.value = ''
     const res = await characterApi.commitImport({
       filename: selectedImportFile.value?.name || 'import.txt',
       file_type: importPreview.value.detected_type || 'dialogue',
@@ -699,25 +807,33 @@ async function commitImport() {
         action: item.action,
       })),
     })
-    importResult.value = res.data
-    await chars.fetchAll()
-    if (activeChar.value) {
-      const refreshed = chars.characters.find(c => c.id === activeChar.value.id)
-      if (refreshed) activeChar.value = refreshed
-    }
+    importResult.value = null
+    importTaskId.value = res.data?.import_file_id || null
+    importNotice.value = res.data?.message || '导入任务已提交，后台处理中…'
+    importCompletionNotice.value = ''
+    closeImportModal()
+    if (importPollTimer) window.clearTimeout(importPollTimer)
+    importPollTimer = window.setTimeout(() => pollImportStatus(importTaskId.value), 600)
+  } catch (err) {
+    importError.value = err?.response?.data?.detail || err?.message || '导入失败，请稍后重试。'
   } finally {
     importLoading.value = false
   }
 }
 async function downloadExport() {
-  const res = await characterApi.exportAll()
-  const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = `btb-export-${new Date().toISOString().slice(0,19).replace(/[:T]/g, '-')}.json`
-  link.click()
-  URL.revokeObjectURL(url)
+  try {
+    importError.value = ''
+    const res = await characterApi.exportAll()
+    const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `btb-export-${new Date().toISOString().slice(0,19).replace(/[:T]/g, '-')}.json`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    importError.value = err?.response?.data?.detail || err?.message || '导出失败，请稍后重试。'
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

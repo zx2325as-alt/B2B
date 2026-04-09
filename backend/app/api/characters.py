@@ -1,8 +1,10 @@
 import json
+import logging
 from pathlib import Path
+from typing import Any
 
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -18,9 +20,10 @@ from ..schemas import (
 )
 from ..harness.orchestrator import orchestrator
 from ..harness.import_engine import extract_text_from_file, build_import_preview
-from .deps import get_db
+from .deps import get_db, SessionLocal
 
 router = APIRouter(prefix="/characters", tags=["characters"])
+import_logger = logging.getLogger("import")
 
 
 def _safe_float(value, default=0.0):
@@ -90,6 +93,492 @@ def _infer_rel_type(sentiment: float, interaction_type: str) -> str:
     return "neutral"
 
 
+def _merge_metadata(import_file: ImportFile, extra: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(import_file.metadata_json or {})
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(metadata.get(key), dict):
+            merged_child = dict(metadata.get(key) or {})
+            merged_child.update(value)
+            metadata[key] = merged_child
+        else:
+            metadata[key] = value
+    return metadata
+
+
+def _update_import_status(db: Session, import_file: ImportFile, status: str, message: str, **extra: Any) -> None:
+    import_file.status = status
+    import_file.metadata_json = _merge_metadata(
+        import_file,
+        {
+            "progress": {
+                "message": message,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+            **extra,
+        },
+    )
+    db.add(import_file)
+    db.commit()
+    db.refresh(import_file)
+
+
+def _compact_preview_for_review(preview: dict[str, Any], role_mappings: list[Any]) -> dict[str, Any]:
+    return {
+        "characters": (preview.get("characters") or [])[:20],
+        "role_mappings": [
+            {
+                "original_name": getattr(item, "original_name", None) or item.get("original_name", ""),
+                "resolved_name": getattr(item, "resolved_name", None) or item.get("resolved_name", ""),
+                "status": getattr(item, "status", None) or item.get("status", "new"),
+                "action": getattr(item, "action", None) or item.get("action", "create"),
+            }
+            for item in role_mappings[:20]
+        ],
+        "interaction_units": [
+            {
+                "source_line_index": item.get("source_line_index", index),
+                "speaker": item.get("speaker", ""),
+                "receiver": item.get("receiver", ""),
+                "content": (item.get("content", "") or "")[:120],
+                "intent": item.get("intent", {}),
+                "strategy": item.get("strategy", {}),
+                "emotion": item.get("emotion", {}),
+            }
+            for index, item in enumerate((preview.get("interaction_units") or [])[:24], start=1)
+        ],
+        "relationships": (preview.get("relationships") or [])[:12],
+        "events": (preview.get("events") or [])[:12],
+        "plot_summary": preview.get("plot_summary", {}) or {},
+    }
+
+
+async def _auto_review_import(preview: dict[str, Any], role_mappings: list[Any], import_file_id: int) -> tuple[dict[str, Any], list[Any], str]:
+    review_payload = _compact_preview_for_review(preview, role_mappings)
+    try:
+        result = await orchestrator.call(
+            "import_commit_review",
+            {"review_payload": json.dumps(review_payload, ensure_ascii=False)},
+            retries=1,
+        )
+    except Exception as exc:
+        import_logger.warning("导入审核代理执行失败 import_file_id=%s error=%s", import_file_id, exc)
+        return preview, role_mappings, ""
+    if not isinstance(result, dict):
+        return preview, role_mappings, ""
+    reviewed_preview = dict(preview or {})
+    reviewed_role_mappings = list(role_mappings or [])
+    reviewed_mapping_lookup = {
+        item.get("original_name", ""): item
+        for item in (result.get("reviewed_role_mappings") or [])
+        if isinstance(item, dict)
+    }
+    if reviewed_mapping_lookup:
+        for item in reviewed_role_mappings:
+            original_name = getattr(item, "original_name", None) or item.get("original_name", "")
+            if original_name in reviewed_mapping_lookup:
+                reviewed = reviewed_mapping_lookup[original_name]
+                if hasattr(item, "resolved_name"):
+                    item.resolved_name = reviewed.get("resolved_name", item.resolved_name)
+                    item.action = reviewed.get("action", item.action)
+                    item.status = reviewed.get("status", item.status)
+                else:
+                    item.update(
+                        {
+                            "resolved_name": reviewed.get("resolved_name", item.get("resolved_name", original_name)),
+                            "action": reviewed.get("action", item.get("action", "create")),
+                            "status": reviewed.get("status", item.get("status", "new")),
+                        }
+                    )
+    if result.get("reviewed_relationships"):
+        reviewed_preview["relationships"] = result["reviewed_relationships"]
+    if result.get("reviewed_events"):
+        reviewed_preview["events"] = result["reviewed_events"]
+    if result.get("reviewed_plot_summary"):
+        reviewed_preview["plot_summary"] = result["reviewed_plot_summary"]
+    review_summary = (result.get("summary") or "").strip()
+    if review_summary:
+        reviewed_preview["review_summary"] = review_summary
+    return reviewed_preview, reviewed_role_mappings, review_summary
+
+
+def _dedupe_names(names: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for name in names:
+        name = (name or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]]:
+    preview_events = preview.get("events") or []
+    drafts = []
+    if preview_events:
+        for index, event in enumerate(preview_events[:20], start=1):
+            actors = _dedupe_names([event.get("actor", "")] + list(event.get("participants") or []))
+            if not actors:
+                continue
+            detail_parts = []
+            if event.get("summary"):
+                detail_parts.append(event["summary"])
+            if event.get("action"):
+                detail_parts.append(f"核心动作：{event['action']}")
+            if event.get("time"):
+                detail_parts.append(f"时间：{event['time']}")
+            if event.get("location"):
+                detail_parts.append(f"地点：{event['location']}")
+            drafts.append(
+                {
+                    "actors": actors,
+                    "title": f"{'、'.join(actors[:2])}事件记录",
+                    "description": "；".join(detail_parts)[:500],
+                    "event_date": event.get("time", "") or "",
+                    "emotion_label": "",
+                    "importance": 4,
+                    "source_indexes": [index],
+                }
+            )
+    if drafts:
+        return drafts
+
+    units = preview.get("interaction_units") or []
+    for start in range(0, len(units), 4):
+        cluster = units[start:start + 4]
+        if not cluster:
+            continue
+        actors = _dedupe_names(
+            [item.get("speaker", "") for item in cluster] +
+            [item.get("receiver", "") for item in cluster]
+        )
+        if not actors:
+            continue
+        detail_parts = []
+        for item in cluster:
+            speaker = item.get("speaker", "") or "某人"
+            receiver = item.get("receiver", "") or "相关人物"
+            action = (
+                ((item.get("intent") or {}).get("value") or "").strip() or
+                ((item.get("strategy") or {}).get("value") or "").strip() or
+                "展开互动"
+            )
+            content = (item.get("content", "") or "").strip()
+            detail_parts.append(f"{speaker}针对{receiver}{action}，核心内容为“{content[:60]}”")
+        drafts.append(
+            {
+                "actors": actors,
+                "title": f"{actors[0]}与{'、'.join(actors[1:3]) or '他人'}的阶段性事件",
+                "description": "；".join(detail_parts)[:500],
+                "event_date": "",
+                "emotion_label": ((cluster[-1].get("emotion") or {}).get("value") or "").strip(),
+                "importance": min(5, 3 + (1 if len(cluster) >= 3 else 0)),
+                "source_indexes": [int(item.get("source_line_index") or (start + offset + 1)) for offset, item in enumerate(cluster)],
+            }
+        )
+    return drafts
+
+
+def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: dict[str, Character], import_file_id: int) -> tuple[int, dict[tuple[str, int], int]]:
+    created_events = 0
+    source_event_map: dict[tuple[str, int], int] = {}
+    for draft in _build_timeline_event_drafts(preview):
+        for actor_name in draft.get("actors", []):
+            actor = resolved_chars.get(actor_name)
+            if not actor:
+                continue
+            event = CharacterEvent(
+                character_id=actor.id,
+                title=draft.get("title", "导入事件"),
+                description=draft.get("description", ""),
+                event_date=draft.get("event_date", ""),
+                emotion_label=draft.get("emotion_label", ""),
+                importance=int(draft.get("importance", 3) or 3),
+            )
+            db.add(event)
+            db.commit()
+            db.refresh(event)
+            created_events += 1
+            for source_index in draft.get("source_indexes", []):
+                key = (actor.name, int(source_index))
+                source_event_map.setdefault(key, event.id)
+    import_logger.info("导入事件创建完成 import_file_id=%s created_events=%s", import_file_id, created_events)
+    return created_events, source_event_map
+
+
+async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        body = ImportCommitRequest.model_validate(payload)
+        import_file = db.get(ImportFile, import_file_id)
+        if not import_file:
+            return
+        preview = dict(body.preview_payload or {})
+        role_mappings = list(body.role_mappings or [])
+
+        import_logger.info("导入任务开始 import_file_id=%s filename=%s", import_file.id, body.filename)
+        _update_import_status(db, import_file, "reviewing", "AI 审核代理正在自动审核导入结果…")
+        preview, role_mappings, review_summary = await _auto_review_import(preview, role_mappings, import_file.id)
+
+        resolved_chars = {}
+        parsed_characters = {item.get("name"): item for item in preview.get("characters", [])}
+        for original_name, parsed_char in parsed_characters.items():
+            mapping = _resolve_mapping(role_mappings, original_name)
+            if mapping["action"] == "skip":
+                continue
+            resolved_chars[original_name] = await _ensure_character_from_mapping(db, mapping, parsed_char)
+
+        conversation = None
+        if body.create_readonly_conversation:
+            conversation = Conversation(
+                title=f"只读导入 · {body.filename}",
+                scenario=body.scenario,
+                is_readonly=True,
+                source_import_file_id=import_file.id,
+            )
+            db.add(conversation)
+            db.commit()
+            db.refresh(conversation)
+
+        _update_import_status(
+            db,
+            import_file,
+            "processing",
+            "后台正在写入角色、事件、关系与分析层，请稍候…",
+            review_summary=review_summary,
+        )
+        created_events, source_event_map = _create_import_events(db, preview, resolved_chars, import_file.id)
+
+        committed_units = 0
+        created_relationships = 0
+        failures = {"characters": [], "events": [], "relationships": [], "analysis": []}
+
+        for index, unit in enumerate(preview.get("interaction_units", []), start=1):
+            try:
+                speaker_name = unit.get("speaker", "").strip()
+                if not speaker_name or speaker_name not in resolved_chars:
+                    continue
+                speaker_char = resolved_chars[speaker_name]
+                receiver_name = unit.get("receiver", "").strip()
+                resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
+                context_payload = {
+                    "speaker_profile": {
+                        "name": speaker_char.name,
+                        "role": speaker_char.role or "",
+                        "personality_tags": speaker_char.personality_tags or [],
+                        "motivation": speaker_char.motivation or "",
+                        "weakness": speaker_char.weakness or "",
+                        "speaking_style": speaker_char.speaking_style or "",
+                    },
+                    "receiver_profile": {
+                        "name": resolved_receiver.name if resolved_receiver else receiver_name,
+                        "role": resolved_receiver.role if resolved_receiver else "",
+                        "personality_tags": resolved_receiver.personality_tags if resolved_receiver else [],
+                        "motivation": resolved_receiver.motivation if resolved_receiver else "",
+                        "weakness": resolved_receiver.weakness if resolved_receiver else "",
+                        "speaking_style": resolved_receiver.speaking_style if resolved_receiver else "",
+                    },
+                    "relationship": {
+                        "description": "",
+                        "strength": 0.2,
+                        "sentiment": 0.0,
+                    },
+                }
+                analysis = await orchestrator.rebuild_import_analysis(unit, context_payload)
+                message_id = None
+                analysis_message_id = None
+                if conversation:
+                    message_index = db.query(Message).filter(
+                        Message.conversation_id == conversation.id
+                    ).count() + 1
+                    msg = Message(
+                        conversation_id=conversation.id,
+                        role="user",
+                        message_index=message_index,
+                        character_id=speaker_char.id,
+                        character_name=speaker_char.name,
+                        receiver_id=resolved_receiver.id if resolved_receiver else None,
+                        receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                        content=unit.get("content", ""),
+                        intent=(unit.get("intent") or {}).get("value", ""),
+                        strategy=(unit.get("strategy") or {}).get("value", ""),
+                        emotion=(unit.get("emotion") or {}).get("value", ""),
+                        source_type="import",
+                        readonly=True,
+                    )
+                    db.add(msg)
+                    db.commit()
+                    db.refresh(msg)
+                    message_id = msg.id
+
+                    analysis_msg = Message(
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        message_index=message_index + 1,
+                        character_name="AI分析",
+                        receiver_id=resolved_receiver.id if resolved_receiver else None,
+                        receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                        content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
+                        intent=(unit.get("intent") or {}).get("value", ""),
+                        strategy=(unit.get("strategy") or {}).get("value", ""),
+                        emotion=(unit.get("emotion") or {}).get("value", ""),
+                        inner_monologue=analysis.get("inner_monologue"),
+                        emotion_label=analysis.get("emotion_attribution"),
+                        emotion_score=0.6,
+                        subtext=analysis.get("strategy_explanation"),
+                        psychological_tag=analysis.get("analysis_tags"),
+                        source_type="import_analysis",
+                        readonly=True,
+                        parent_id=msg.id,
+                    )
+                    db.add(analysis_msg)
+                    db.commit()
+                    db.refresh(analysis_msg)
+                    analysis_message_id = analysis_msg.id
+
+                relationship_id = None
+                if resolved_receiver:
+                    intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
+                    sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
+                    interaction_type = (unit.get("interaction_type") or {}).get("value", "")
+                    rel = db.query(Relationship).filter(
+                        Relationship.source_id == speaker_char.id,
+                        Relationship.target_id == resolved_receiver.id,
+                    ).first()
+                    if not rel:
+                        rel = Relationship(
+                            source_id=speaker_char.id,
+                            target_id=resolved_receiver.id,
+                            rel_type=_infer_rel_type(sentiment, interaction_type),
+                            strength=max(0.2, min(1.0, intent_conf)),
+                            sentiment=max(-1.0, min(1.0, sentiment)),
+                            description=analysis.get("strategy_explanation", "")[:500],
+                            history=[],
+                        )
+                        db.add(rel)
+                        db.commit()
+                        db.refresh(rel)
+                        created_relationships += 1
+                    relationship_id = rel.id
+
+                source_line_index = int(unit.get("source_line_index", index) or index)
+                event_id = source_event_map.get((speaker_char.name, source_line_index))
+
+                iu = InteractionUnit(
+                    import_file_id=import_file.id,
+                    source_line_index=source_line_index,
+                    source_text_snippet=unit.get("content", "")[:500],
+                    speaker=speaker_char.name,
+                    receiver=resolved_receiver.name if resolved_receiver else receiver_name,
+                    receiver_confidence=_safe_float(unit.get("receiver_confidence"), 0.0),
+                    receiver_state=unit.get("receiver_state", "inferred"),
+                    content=unit.get("content", ""),
+                    intent=(unit.get("intent") or {}).get("value", ""),
+                    intent_confidence=_safe_float((unit.get("intent") or {}).get("confidence"), 0.0),
+                    intent_state=(unit.get("intent") or {}).get("state", "inferred"),
+                    strategy=(unit.get("strategy") or {}).get("value", ""),
+                    strategy_confidence=_safe_float((unit.get("strategy") or {}).get("confidence"), 0.0),
+                    strategy_state=(unit.get("strategy") or {}).get("state", "inferred"),
+                    emotion=(unit.get("emotion") or {}).get("value", ""),
+                    emotion_confidence=_safe_float((unit.get("emotion") or {}).get("confidence"), 0.0),
+                    emotion_state=(unit.get("emotion") or {}).get("state", "inferred"),
+                    interaction_type=(unit.get("interaction_type") or {}).get("value", ""),
+                    interaction_confidence=_safe_float((unit.get("interaction_type") or {}).get("confidence"), 0.0),
+                    interaction_state=(unit.get("interaction_type") or {}).get("state", "inferred"),
+                    psychological_label=unit.get("psychological_label", ""),
+                    context_window=((preview.get("pseudo_conversation", {}) or {}).get("messages", [])[max(0, index - 1):index] or [{}])[0].get("context_window", []),
+                    analysis=analysis,
+                    event_payload=preview.get("events", []),
+                    relationship_payload=preview.get("relationships", []),
+                    conversation_message_id=message_id or analysis_message_id,
+                    character_event_id=event_id,
+                    relationship_id=relationship_id,
+                )
+                db.add(iu)
+                db.commit()
+                committed_units += 1
+            except Exception as exc:
+                failures["analysis"].append({"index": index, "error": str(exc)})
+                import_logger.exception("导入交互写入失败 import_file_id=%s index=%s", import_file.id, index)
+                db.rollback()
+
+        for char_name, model_payload in (preview.get("character_modeling") or {}).items():
+            char = resolved_chars.get(char_name)
+            if not char:
+                continue
+            existing_tags = list(char.personality_tags or [])
+            for tag in model_payload.get("traits", []) + model_payload.get("weak_traits", []):
+                if tag and tag not in existing_tags:
+                    existing_tags.append(tag)
+            char.personality_tags = existing_tags[:10]
+            for pattern in model_payload.get("behavior_patterns", []):
+                if not pattern:
+                    continue
+                exists = db.query(CharacterObservation).filter(
+                    CharacterObservation.character_id == char.id,
+                    CharacterObservation.field == "behavior_pattern",
+                    CharacterObservation.new_value == pattern,
+                ).first()
+                if not exists:
+                    db.add(
+                        CharacterObservation(
+                            character_id=char.id,
+                            field="behavior_pattern",
+                            old_value="",
+                            new_value=pattern,
+                            reason=f"导入文本识别到重复行为模式：{pattern}",
+                        )
+                    )
+
+        import_file.summary = (preview.get("plot_summary", {}) or {}).get("main_conflict", import_file.summary)
+        _update_import_status(
+            db,
+            import_file,
+            "committed",
+            "导入完成",
+            result={
+                "conversation_id": conversation.id if conversation else None,
+                "created_characters": [char.name for char in resolved_chars.values()],
+                "interaction_units": committed_units,
+                "events": created_events,
+                "relationships": created_relationships,
+                "failures": failures,
+                "plot_summary": preview.get("plot_summary", {}),
+            },
+            role_count=len(resolved_chars),
+            interaction_count=committed_units,
+            event_count=created_events,
+            relationship_count=created_relationships,
+            failures=failures,
+            plot_summary=preview.get("plot_summary", {}),
+            pseudo_conversation=preview.get("pseudo_conversation", {}),
+            completed_at=datetime.utcnow().isoformat(),
+        )
+        import_logger.info(
+            "导入任务完成 import_file_id=%s chars=%s units=%s events=%s rels=%s",
+            import_file.id,
+            len(resolved_chars),
+            committed_units,
+            created_events,
+            created_relationships,
+        )
+    except Exception as exc:
+        import_logger.exception("导入任务失败 import_file_id=%s error=%s", import_file_id, exc)
+        db.rollback()
+        import_file = db.get(ImportFile, import_file_id)
+        if import_file:
+            _update_import_status(
+                db,
+                import_file,
+                "failed",
+                f"导入失败：{exc}",
+                failures={"task": [{"error": str(exc)}]},
+                completed_at=datetime.utcnow().isoformat(),
+            )
+    finally:
+        db.close()
+
+
 # ─── Characters CRUD ──────────────────────────────────────────────────────────
 
 @router.get("/", response_model=list[CharacterOut])
@@ -155,235 +644,125 @@ def delete_character(char_id: int, db: Session = Depends(get_db)):
 
 @router.post("/imports/preview")
 async def preview_import(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    content = await file.read()
-    content_text = await extract_text_from_file(file.filename or "unknown.txt", content)
-    existing_characters = [
-        {"id": char.id, "name": char.name, "role": char.role or ""}
-        for char in db.query(Character).all()
-    ]
-    preview = await build_import_preview(file.filename or "unknown.txt", content_text, existing_characters)
-    import_file = ImportFile(
-        filename=file.filename or "unknown.txt",
-        file_type=preview.get("detected_type", Path(file.filename or "").suffix.lower().lstrip(".")),
-        content_type=file.content_type or "",
-        status="previewed",
-        summary=(preview.get("plot_summary", {}) or {}).get("main_conflict", ""),
-        metadata_json={
-            "role_count": len(preview.get("characters", [])),
-            "interaction_count": len(preview.get("interaction_units", [])),
-            "event_count": len(preview.get("events", [])),
-            "relationship_count": len(preview.get("relationships", [])),
-        },
-    )
-    db.add(import_file)
-    db.commit()
-    db.refresh(import_file)
-    preview["import_file_id"] = import_file.id
-    return preview
+    try:
+        content = await file.read()
+        content_text = await extract_text_from_file(file.filename or "unknown.txt", content)
+        latest_same_file = db.query(ImportFile).filter(
+            ImportFile.filename == (file.filename or "unknown.txt")
+        ).order_by(ImportFile.created_at.desc()).first()
+        next_version = (latest_same_file.version if latest_same_file else 0) + 1
+        existing_characters = [
+            {"id": char.id, "name": char.name, "role": char.role or ""}
+            for char in db.query(Character).all()
+        ]
+        preview = await build_import_preview(file.filename or "unknown.txt", content_text, existing_characters)
+        import_file = ImportFile(
+            filename=file.filename or "unknown.txt",
+            file_type=preview.get("detected_type", Path(file.filename or "").suffix.lower().lstrip(".")),
+            content_type=file.content_type or "",
+            status="previewed",
+            version=next_version,
+            model_used="ai-harness",
+            summary=(preview.get("plot_summary", {}) or {}).get("main_conflict", ""),
+            metadata_json={
+                "import_version": {
+                    "file_id": None,
+                    "version": next_version,
+                    "model_used": "ai-harness",
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+                "role_count": len(preview.get("characters", [])),
+                "interaction_count": len(preview.get("interaction_units", [])),
+                "event_count": len(preview.get("events", [])),
+                "relationship_count": len(preview.get("relationships", [])),
+            },
+        )
+        db.add(import_file)
+        db.commit()
+        db.refresh(import_file)
+        preview["import_file_id"] = import_file.id
+        preview["import_version"] = {
+            "file_id": import_file.id,
+            "version": import_file.version,
+            "model_used": import_file.model_used,
+            "timestamp": import_file.created_at.isoformat() if import_file.created_at else datetime.utcnow().isoformat(),
+        }
+        return preview
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"导入预览失败：{exc}") from exc
 
 
 @router.post("/imports/commit")
-async def commit_import(body: ImportCommitRequest, db: Session = Depends(get_db)):
+async def commit_import(body: ImportCommitRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     preview = body.preview_payload or {}
     import_file = db.get(ImportFile, body.import_file_id) if body.import_file_id else None
     if not import_file:
+        latest_same_file = db.query(ImportFile).filter(
+            ImportFile.filename == body.filename
+        ).order_by(ImportFile.created_at.desc()).first()
         import_file = ImportFile(
             filename=body.filename,
             file_type=body.file_type,
             content_type="",
             status="committed",
+            version=((latest_same_file.version if latest_same_file else 0) + 1),
+            model_used="ai-harness",
             summary=(preview.get("plot_summary", {}) or {}).get("main_conflict", ""),
             metadata_json={},
         )
         db.add(import_file)
         db.commit()
         db.refresh(import_file)
-
-    resolved_chars = {}
-    role_mappings = body.role_mappings or []
-    parsed_characters = {item.get("name"): item for item in preview.get("characters", [])}
-    for original_name, parsed_char in parsed_characters.items():
-        mapping = _resolve_mapping(role_mappings, original_name)
-        if mapping["action"] == "skip":
-            continue
-        resolved_chars[original_name] = await _ensure_character_from_mapping(db, mapping, parsed_char)
-
-    conversation = None
-    if body.create_readonly_conversation:
-        conversation = Conversation(
-            title=f"只读导入 · {body.filename}",
-            scenario=body.scenario,
-        )
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
-
-    committed_units = 0
-    created_events = 0
-    created_relationships = 0
-    failures = {"characters": [], "events": [], "relationships": [], "analysis": []}
-
-    for index, unit in enumerate(preview.get("interaction_units", []), start=1):
-        try:
-            speaker_name = unit.get("speaker", "").strip()
-            if not speaker_name or speaker_name not in resolved_chars:
-                continue
-            speaker_char = resolved_chars[speaker_name]
-            receiver_name = unit.get("receiver", "").strip()
-            resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
-            context_payload = {
-                "speaker_profile": {
-                    "name": speaker_char.name,
-                    "role": speaker_char.role or "",
-                    "personality_tags": speaker_char.personality_tags or [],
-                    "motivation": speaker_char.motivation or "",
-                    "weakness": speaker_char.weakness or "",
-                    "speaking_style": speaker_char.speaking_style or "",
-                },
-                "receiver_profile": {
-                    "name": resolved_receiver.name if resolved_receiver else receiver_name,
-                    "role": resolved_receiver.role if resolved_receiver else "",
-                    "personality_tags": resolved_receiver.personality_tags if resolved_receiver else [],
-                    "motivation": resolved_receiver.motivation if resolved_receiver else "",
-                    "weakness": resolved_receiver.weakness if resolved_receiver else "",
-                    "speaking_style": resolved_receiver.speaking_style if resolved_receiver else "",
-                },
-                "relationship": {
-                    "description": "",
-                    "strength": 0.2,
-                    "sentiment": 0.0,
-                },
-            }
-            analysis = await orchestrator.rebuild_import_analysis(unit, context_payload)
-            message_id = None
-            analysis_message_id = None
-            if conversation:
-                msg = Message(
-                    conversation_id=conversation.id,
-                    role="user",
-                    character_id=speaker_char.id,
-                    character_name=speaker_char.name,
-                    content=unit.get("content", ""),
-                )
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
-                message_id = msg.id
-
-                analysis_msg = Message(
-                    conversation_id=conversation.id,
-                    role="assistant",
-                    character_name="AI分析",
-                    content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
-                    inner_monologue=analysis.get("inner_monologue"),
-                    emotion_label=analysis.get("emotion_attribution"),
-                    emotion_score=0.6,
-                    subtext=analysis.get("strategy_explanation"),
-                    psychological_tag=analysis.get("analysis_tags"),
-                    parent_id=msg.id,
-                )
-                db.add(analysis_msg)
-                db.commit()
-                db.refresh(analysis_msg)
-                analysis_message_id = analysis_msg.id
-
-            event_id = None
-            event = CharacterEvent(
-                character_id=speaker_char.id,
-                title=f"导入事件 #{index}",
-                description=unit.get("content", ""),
-                event_date="",
-                emotion_label=(unit.get("emotion") or {}).get("value", ""),
-                importance=3,
-            )
-            db.add(event)
-            db.commit()
-            db.refresh(event)
-            event_id = event.id
-            created_events += 1
-
-            relationship_id = None
-            if resolved_receiver:
-                intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
-                sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
-                interaction_type = (unit.get("interaction_type") or {}).get("value", "")
-                rel = db.query(Relationship).filter(
-                    Relationship.source_id == speaker_char.id,
-                    Relationship.target_id == resolved_receiver.id,
-                ).first()
-                if not rel:
-                    rel = Relationship(
-                        source_id=speaker_char.id,
-                        target_id=resolved_receiver.id,
-                        rel_type=_infer_rel_type(sentiment, interaction_type),
-                        strength=max(0.2, min(1.0, intent_conf)),
-                        sentiment=max(-1.0, min(1.0, sentiment)),
-                        description=analysis.get("strategy_explanation", "")[:500],
-                        history=[],
-                    )
-                    db.add(rel)
-                    db.commit()
-                    db.refresh(rel)
-                    created_relationships += 1
-                relationship_id = rel.id
-
-            iu = InteractionUnit(
-                import_file_id=import_file.id,
-                source_line_index=unit.get("source_line_index", index),
-                source_text_snippet=unit.get("content", "")[:500],
-                speaker=speaker_char.name,
-                receiver=resolved_receiver.name if resolved_receiver else receiver_name,
-                receiver_confidence=_safe_float(unit.get("receiver_confidence"), 0.0),
-                receiver_state=unit.get("receiver_state", "inferred"),
-                content=unit.get("content", ""),
-                intent=(unit.get("intent") or {}).get("value", ""),
-                intent_confidence=_safe_float((unit.get("intent") or {}).get("confidence"), 0.0),
-                intent_state=(unit.get("intent") or {}).get("state", "inferred"),
-                strategy=(unit.get("strategy") or {}).get("value", ""),
-                strategy_confidence=_safe_float((unit.get("strategy") or {}).get("confidence"), 0.0),
-                strategy_state=(unit.get("strategy") or {}).get("state", "inferred"),
-                emotion=(unit.get("emotion") or {}).get("value", ""),
-                emotion_confidence=_safe_float((unit.get("emotion") or {}).get("confidence"), 0.0),
-                emotion_state=(unit.get("emotion") or {}).get("state", "inferred"),
-                interaction_type=(unit.get("interaction_type") or {}).get("value", ""),
-                interaction_confidence=_safe_float((unit.get("interaction_type") or {}).get("confidence"), 0.0),
-                interaction_state=(unit.get("interaction_type") or {}).get("state", "inferred"),
-                analysis=analysis,
-                event_payload=preview.get("events", []),
-                relationship_payload=preview.get("relationships", []),
-                conversation_message_id=message_id or analysis_message_id,
-                character_event_id=event_id,
-                relationship_id=relationship_id,
-            )
-            db.add(iu)
-            db.commit()
-            committed_units += 1
-        except Exception as exc:
-            failures["analysis"].append({"index": index, "error": str(exc)})
-            db.rollback()
-
-    import_file.status = "committed"
-    import_file.summary = (preview.get("plot_summary", {}) or {}).get("main_conflict", import_file.summary)
-    import_file.metadata_json = {
-        "role_count": len(resolved_chars),
-        "interaction_count": committed_units,
-        "event_count": created_events,
-        "relationship_count": created_relationships,
-        "failures": failures,
-        "plot_summary": preview.get("plot_summary", {}),
-    }
-    db.commit()
-
+    _update_import_status(
+        db,
+        import_file,
+        "queued",
+        "导入任务已进入后台队列，正在准备自动审核与入库…",
+        import_version={
+            "file_id": import_file.id,
+            "version": import_file.version,
+            "model_used": import_file.model_used,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        request_options={
+            "scenario": body.scenario,
+            "create_readonly_conversation": body.create_readonly_conversation,
+            "auto_archive": body.auto_archive,
+        },
+    )
+    import_logger.info("导入任务已排队 import_file_id=%s filename=%s", import_file.id, body.filename)
+    background_tasks.add_task(_process_import_commit, import_file.id, body.model_dump(mode="json"))
     return {
         "ok": True,
+        "async_started": True,
         "import_file_id": import_file.id,
-        "conversation_id": conversation.id if conversation else None,
-        "created_characters": [char.name for char in resolved_chars.values()],
-        "interaction_units": committed_units,
-        "events": created_events,
-        "relationships": created_relationships,
-        "failures": failures,
-        "plot_summary": preview.get("plot_summary", {}),
+        "status": "queued",
+        "message": "导入任务已提交，后台正在自动审核并入库。",
+    }
+
+
+@router.get("/imports/{import_file_id}/status")
+def get_import_status(import_file_id: int, db: Session = Depends(get_db)):
+    import_file = db.get(ImportFile, import_file_id)
+    if not import_file:
+        raise HTTPException(404, "导入任务不存在")
+    metadata = import_file.metadata_json or {}
+    return {
+        "import_file_id": import_file.id,
+        "filename": import_file.filename,
+        "status": import_file.status,
+        "summary": import_file.summary,
+        "progress": metadata.get("progress", {}),
+        "review_summary": metadata.get("review_summary", ""),
+        "result": metadata.get("result", {}),
+        "event_count": metadata.get("event_count", 0),
+        "relationship_count": metadata.get("relationship_count", 0),
+        "failures": metadata.get("failures", {}),
+        "updated_at": import_file.updated_at.isoformat() if import_file.updated_at else "",
     }
 
 
@@ -394,6 +773,22 @@ def export_all_data(db: Session = Depends(get_db)):
         "events": [EventOut.model_validate(event).model_dump(mode="json") for event in db.query(CharacterEvent).all()],
         "relationships": [RelationshipOut.model_validate(rel).model_dump(mode="json") for rel in db.query(Relationship).all()],
         "observations": [ObservationOut.model_validate(obs).model_dump(mode="json") for obs in db.query(CharacterObservation).all()],
+        "conversations": [
+            {
+                "id": conv.id,
+                "title": conv.title,
+                "scenario": conv.scenario,
+                "is_readonly": getattr(conv, "is_readonly", False),
+                "source_import_file_id": getattr(conv, "source_import_file_id", None),
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+                "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+            }
+            for conv in db.query(Conversation).order_by(Conversation.created_at).all()
+        ],
+        "messages": [
+            MessageOut.model_validate(message).model_dump(mode="json")
+            for message in db.query(Message).order_by(Message.created_at).all()
+        ],
         "imports": [
             {
                 "file": {
@@ -401,6 +796,8 @@ def export_all_data(db: Session = Depends(get_db)):
                     "filename": item.filename,
                     "file_type": item.file_type,
                     "status": item.status,
+                    "version": item.version,
+                    "model_used": item.model_used,
                     "summary": item.summary,
                     "metadata_json": item.metadata_json or {},
                 },
@@ -418,6 +815,8 @@ def export_all_data(db: Session = Depends(get_db)):
                         "strategy": {"value": unit.strategy, "confidence": unit.strategy_confidence, "state": unit.strategy_state},
                         "emotion": {"value": unit.emotion, "confidence": unit.emotion_confidence, "state": unit.emotion_state},
                         "interaction_type": {"value": unit.interaction_type, "confidence": unit.interaction_confidence, "state": unit.interaction_state},
+                        "psychological_label": unit.psychological_label,
+                        "context_window": unit.context_window or [],
                         "analysis": unit.analysis or {},
                         "character_event_id": unit.character_event_id,
                         "relationship_id": unit.relationship_id,
