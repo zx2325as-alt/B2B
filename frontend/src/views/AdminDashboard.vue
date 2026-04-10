@@ -76,61 +76,135 @@
             </div>
           </div>
 
-          <!-- Big 5 Traits -->
-          <div v-if="activeChar.core_traits && Object.keys(activeChar.core_traits).length" class="section">
-            <div class="section-title">大五人格</div>
-            <div class="traits-grid">
-              <div v-for="(val, key) in activeChar.core_traits" :key="key" class="trait-row">
-                <span class="trait-name">{{ traitLabel(key) }}</span>
-                <div class="trait-bar-track">
-                  <div class="trait-bar-fill" :style="{ width: (val*100)+'%', background: traitColor(val) }"></div>
-                </div>
-                <span class="trait-val">{{ Math.round(val*100) }}</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Core info -->
           <div class="section">
-            <div class="section-title">核心信息</div>
+            <div class="section-title">基础信息</div>
             <div class="info-grid">
-              <div class="info-item" v-if="activeChar.motivation">
-                <div class="info-label">深层动机</div>
-                <div class="info-value">{{ activeChar.motivation }}</div>
+              <div class="info-item">
+                <div class="info-label">名字</div>
+                <div class="info-value">{{ currentProfile.basic_info?.name || activeChar.name }}</div>
               </div>
-              <div class="info-item" v-if="activeChar.weakness">
-                <div class="info-label">核心弱点</div>
-                <div class="info-value">{{ activeChar.weakness }}</div>
+              <div class="info-item">
+                <div class="info-label">身份</div>
+                <div class="info-value">{{ currentProfile.basic_info?.role || '—' }}</div>
               </div>
-              <div class="info-item" v-if="activeChar.speaking_style">
-                <div class="info-label">说话风格</div>
-                <div class="info-value">{{ activeChar.speaking_style }}</div>
+              <div class="info-item">
+                <div class="info-label">年龄</div>
+                <div class="info-value">{{ currentProfile.basic_info?.age ?? '—' }}</div>
               </div>
-              <div class="info-item" v-if="activeChar.background">
+              <div class="info-item">
                 <div class="info-label">背景故事</div>
-                <div class="info-value">{{ activeChar.background }}</div>
+                <div class="info-value">{{ currentProfile.basic_info?.background || '—' }}</div>
               </div>
             </div>
           </div>
 
-          <!-- AI Observations -->
-          <div v-if="observations.length" class="section">
-            <div class="section-title">AI 建议更新 <span class="tag amber" style="font-size:10px">{{ pendingObs.length }} 待审核</span></div>
-            <div class="obs-list">
-              <div v-for="obs in observations" :key="obs.id" class="obs-item" :class="obs.status">
-                <div class="obs-field">{{ obs.field }}</div>
-                <div class="obs-diff">
-                  <span class="obs-old">{{ obs.old_value || '—' }}</span>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-                  <span class="obs-new">{{ obs.new_value }}</span>
+          <div class="section">
+            <div class="section-title">人格模型</div>
+            <div class="info-grid">
+              <div class="info-item">
+                <div class="info-label">人格特征</div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  <span v-for="tag in (currentProfile.personality_model?.tags || [])" :key="`trait-${tag}`" class="tag">{{ tag }}</span>
+                  <span v-if="!(currentProfile.personality_model?.tags || []).length" class="empty-hint" style="padding:0">暂无人格特征</span>
                 </div>
-                <div class="obs-reason">{{ obs.reason }}</div>
-                <div v-if="obs.status === 'pending'" class="obs-actions">
-                  <button class="btn btn-primary" style="padding:4px 12px;font-size:11px" @click="reviewObs(obs.id, 'approved')">采纳</button>
-                  <button class="btn btn-danger" style="padding:4px 12px;font-size:11px" @click="reviewObs(obs.id, 'rejected')">拒绝</button>
-                </div>
-                <span v-else class="tag" :class="obs.status === 'approved' ? 'green' : 'red'" style="font-size:10px">{{ obs.status === 'approved' ? '已采纳' : '已拒绝' }}</span>
               </div>
+              <div class="info-item">
+                <div class="info-label">大五人格</div>
+                <div class="traits-grid">
+                  <div v-for="(val, key) in (currentProfile.personality_model?.core_traits || {})" :key="key" class="trait-row">
+                    <span class="trait-name">{{ traitLabel(key) }}</span>
+                    <div class="trait-bar-track">
+                      <div class="trait-bar-fill" :style="{ width: `${Math.max(0, Number(val || 0)) * 100}%`, background: traitColor(Number(val || 0)) }"></div>
+                    </div>
+                    <span class="trait-val">{{ val == null ? '—' : Math.round(Number(val) * 100) }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">行为模式</div>
+            <div class="behavior-grid">
+              <div v-for="(items, category) in behaviorPatternGroups" :key="category" class="behavior-group card">
+                <div class="obs-field">{{ category }}</div>
+                <div v-if="!items.length" class="empty-hint" style="padding:16px 0">暂无标签</div>
+                <div v-else style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button
+                    v-for="item in items"
+                    :key="`behavior-${category}-${item.id || item.label}`"
+                    type="button"
+                    class="tag behavior-tag-btn"
+                    @click="toggleBehaviorItem(`${category}-${item.id || item.label}`)"
+                  >
+                    {{ item.label }}
+                  </button>
+                </div>
+                <div v-for="item in items" :key="`behavior-detail-${category}-${item.id || item.label}`">
+                  <div v-if="isBehaviorExpanded(`${category}-${item.id || item.label}`)" class="obs-reason" style="margin-top:8px">
+                    <div>来源：{{ item.source || 'AI自动识别' }}</div>
+                    <div>依据：{{ item.evidence || '暂无' }}</div>
+                    <div>置信度：{{ Number(item.confidence || 0).toFixed(2) }}</div>
+                    <div v-if="item.trigger">触发：{{ item.trigger }}</div>
+                    <div v-if="item.example">示例：{{ item.example }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">核心动机</div>
+            <div class="card section-card">{{ currentProfile.core_motivation || '—' }}</div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">核心弱点</div>
+            <div class="card section-card">{{ currentProfile.core_weakness || '—' }}</div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">说话风格</div>
+            <div class="card section-card">
+              <div>{{ currentProfile.speaking_style?.summary || '—' }}</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+                <span v-for="tag in (currentProfile.speaking_style?.tags || [])" :key="`style-${tag}`" class="tag">{{ tag }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">关系网络</div>
+            <div class="card section-card">
+              <div v-if="!(currentProfile.relationship_network || []).length">—</div>
+              <div v-else style="display:flex;gap:8px;flex-wrap:wrap">
+                <span v-for="rel in currentProfile.relationship_network" :key="`profile-rel-${rel.id || rel.target_name}`" class="tag">
+                  {{ rel.target_name }} · {{ relTypeLabel(rel.rel_type) }}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">事件时间线</div>
+            <div class="card section-card">
+              <div v-if="!(currentProfile.event_timeline || []).length">—</div>
+              <div v-else class="compact-list">
+                <div v-for="event in currentProfile.event_timeline.slice(0, 5)" :key="`profile-event-${event.id || event.title}`">
+                  {{ event.title }}{{ event.event_date ? ` · ${event.event_date}` : '' }}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">AI自动更新</div>
+            <div class="card section-card update-summary-card">
+              <div>
+                <div style="font-size:16px;font-weight:700;color:var(--text-primary)">✔ 本次更新：{{ aiUpdateSummary.total || 0 }}项</div>
+                <div class="obs-reason" style="margin-top:6px">已自动应用 {{ aiUpdateSummary.approved || 0 }} 项，待确认 {{ aiUpdateSummary.pending || 0 }} 项</div>
+              </div>
+              <button class="btn btn-primary" @click="openAiUpdates">查看详情</button>
             </div>
           </div>
         </div>
@@ -286,6 +360,33 @@
               <label class="label">说话风格</label>
               <input class="input" v-model="charForm.speaking_style" placeholder="如：直接犀利、绕弯子、喜欢问反问句…"/>
             </div>
+            <div>
+              <label class="label">人格特征（逗号分隔）</label>
+              <input class="input" v-model="charForm.personality_tags_text" placeholder="如：自信, 控制欲, 攻击性"/>
+            </div>
+            <div>
+              <label class="label">行为模式（可编辑）</label>
+              <div style="display:flex;flex-direction:column;gap:10px">
+                <div v-for="(pattern, idx) in charForm.behavior_patterns" :key="pattern.localId" class="card" style="padding:12px;border:1px solid var(--border)">
+                  <div style="display:grid;grid-template-columns:1fr 120px 100px;gap:8px">
+                    <input class="input" v-model="pattern.new_value" placeholder="行为模式名称"/>
+                    <select class="input" v-model="pattern.category">
+                      <option value="攻击型行为">攻击型行为</option>
+                      <option value="防御型行为">防御型行为</option>
+                      <option value="互动策略">互动策略</option>
+                    </select>
+                    <input class="input" v-model.number="pattern.confidence" type="number" min="0" max="1" step="0.01" placeholder="置信度"/>
+                  </div>
+                  <input class="input" v-model="pattern.source" placeholder="来源，如：AI自动识别 / 手动编辑" style="margin-top:8px"/>
+                  <input class="input" v-model="pattern.trigger" placeholder="触发条件，如：被挑战时" style="margin-top:8px"/>
+                  <input class="input" v-model="pattern.example" placeholder="示例" style="margin-top:8px"/>
+                  <div style="display:flex;justify-content:flex-end;margin-top:8px">
+                    <button class="btn btn-danger" style="padding:4px 10px;font-size:11px" @click="removeBehaviorPatternForm(idx)">删除</button>
+                  </div>
+                </div>
+                <button class="btn btn-ghost" style="width:fit-content" @click="addBehaviorPatternForm">＋ 新增行为模式</button>
+              </div>
+            </div>
             <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
               <button class="btn btn-ghost" @click="showCharModal = false">取消</button>
               <button class="btn btn-primary" @click="submitChar" :disabled="!charForm.name.trim()">
@@ -379,7 +480,7 @@
         <div class="modal card fade-up" style="width:980px;max-height:88vh;overflow-y:auto">
           <div class="modal-header">
             <span>统一智能导入 / 导出</span>
-            <button class="btn-close" @click="showImportModal = false">✕</button>
+            <button class="btn-close" @click="closeImportModal">✕</button>
           </div>
           <div style="padding:20px;display:flex;flex-direction:column;gap:18px">
             <div class="section" style="margin-bottom:0">
@@ -387,7 +488,16 @@
               <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
                 <input ref="importFileInput" type="file" class="input" accept=".txt,.md,.pdf,.docx,.json,.csv" style="max-width:340px" @change="handleImportFileChange"/>
                 <button type="button" class="btn btn-primary" :disabled="!selectedImportFile || importLoading" @click.prevent="previewImport">
-                  {{ importLoading ? '解析中…' : '上传并预览' }}
+                  {{ importLoading ? '解析中…' : (importPreviewPending ? 'AI增强处理中…' : '上传并预览') }}
+                </button>
+                <button
+                  v-if="importPreviewPending"
+                  type="button"
+                  class="btn btn-ghost"
+                  :disabled="importLoading || !importTaskId"
+                  @click.prevent="refreshPreviewStatus"
+                >
+                  手动刷新 AI 结果
                 </button>
                 <button type="button" class="btn btn-ghost" @click.prevent="downloadExport">导出全量 JSON</button>
               </div>
@@ -429,7 +539,7 @@
                         <span class="tag" :class="unit.receiver_confidence >= 0.6 ? 'green' : 'amber'">{{ Math.round((unit.receiver_confidence || 0) * 100) }}%</span>
                       </div>
                       <div class="obs-reason" style="margin-top:6px">{{ unit.content }}</div>
-                      <div class="tag violet" style="margin-top:8px;width:fit-content">{{ unit.psychological_label || '心理标签待生成' }}</div>
+                      <div v-if="unit.psychological_label" class="tag violet" style="margin-top:8px;width:fit-content">{{ unit.psychological_label }}</div>
                       <div style="display:grid;grid-template-columns:1fr;gap:8px;margin-top:8px">
                         <input class="input" v-model="unit.intent.value" placeholder="编辑意图"/>
                         <input class="input" v-model="unit.strategy.value" placeholder="编辑策略"/>
@@ -496,8 +606,8 @@
                       <option value="hr_interview">HR面试</option>
                       <option value="counseling">心理咨询</option>
                     </select>
-                    <button type="button" class="btn btn-primary" :disabled="importLoading" @click.prevent="commitImport">
-                      {{ importLoading ? '导入中…' : '确认导入并写入系统' }}
+                    <button type="button" class="btn btn-primary" :disabled="importLoading || importPreviewPending" @click.prevent="commitImport">
+                      {{ importLoading ? '导入中…' : (importPreviewPending ? '等待 AI 预览增强完成…' : '确认导入并写入系统') }}
                     </button>
                     <div v-if="importResult" class="obs-reason">导入完成：角色 {{ importResult.created_characters?.length || 0 }} / 交互 {{ importResult.interaction_units || 0 }} / 关系 {{ importResult.relationships || 0 }}</div>
                   </div>
@@ -522,17 +632,27 @@
                 </div>
 
                 <div class="card import-card">
-                  <div class="section-title">人格特征 / 行为模式</div>
-                  <div v-if="!Object.keys(importPreview.character_modeling || {}).length" class="empty-hint">暂无人格建模结果</div>
+                  <div class="section-title">角色档案预览（8模块）</div>
+                  <div v-if="!Object.keys(importPreview.character_profiles || {}).length" class="empty-hint">暂无角色档案结果</div>
                   <div v-else class="import-list">
-                    <div v-for="(model, name) in importPreview.character_modeling" :key="`model-${name}`" class="import-item">
+                    <div v-for="(profile, name) in importPreview.character_profiles" :key="`model-${name}`" class="import-item">
                       <strong>{{ name }}</strong>
                       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-                        <span v-for="trait in model.traits || []" :key="`${name}-trait-${trait}`" class="tag green">{{ trait }}</span>
-                        <span v-for="trait in model.weak_traits || []" :key="`${name}-weak-${trait}`" class="tag amber">{{ trait }}</span>
+                        <span v-for="trait in profile.basic_info?.tags || []" :key="`${name}-tag-${trait}`" class="tag">{{ trait }}</span>
+                        <span v-for="trait in (profile.personality_model?.traits || []).filter(item => item?.name)" :key="`${name}-trait-${trait.name}`" class="tag green">
+                          {{ trait.name }} · {{ Number(trait.intensity || 0).toFixed(2) }}
+                        </span>
                       </div>
+                      <div class="obs-reason" style="margin-top:8px">身份：{{ profile.basic_info?.identity || 'null' }}</div>
+                      <div class="obs-reason">核心动机：{{ (profile.core_motivation || []).map(item => item.motivation).filter(Boolean).join(' / ') || 'null' }}</div>
+                      <div class="obs-reason">核心弱点：{{ (profile.core_weakness || []).map(item => item.weakness).filter(Boolean).join(' / ') || 'null' }}</div>
+                      <div class="obs-reason">说话风格：{{ [...(profile.speech_style?.tone || []), ...(profile.speech_style?.structure || []), ...(profile.speech_style?.features || [])].join(' / ') || 'null' }}</div>
+                      <div class="obs-reason">关系网络：{{ (profile.relationships || []).filter(item => item?.target).length }} 条</div>
+                      <div class="obs-reason">事件时间线：{{ (profile.event_timeline || []).length }} 条</div>
                       <div class="obs-field" style="margin-top:8px">行为模式</div>
-                      <div class="obs-reason">{{ (model.behavior_patterns || []).join(' / ') || '暂无' }}</div>
+                      <div v-for="item in (profile.behavior_patterns || []).filter(item => item?.pattern)" :key="`${name}-${item.category}-${item.pattern}`" class="obs-reason">
+                        {{ item.category || '未分类' }}：{{ item.pattern }}（频次 {{ item.frequency || 0 }}）
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -547,16 +667,21 @@
 
 <script setup>
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useCharacterStore } from '../stores/characters.js'
 import { characterApi, relationshipApi } from '../api/index.js'
 
 const chars = useCharacterStore()
+const router = useRouter()
+const route = useRoute()
 
 const searchQ = ref('')
 const activeChar = ref(null)
 const activeTab = ref('profile')
 const events = ref([])
 const observations = ref([])
+const profileView = ref(null)
+const aiUpdateSummary = ref({ total: 0, approved: 0, pending: 0 })
 const relAnalysis = ref(null)
 const loadingSuggest = ref(false)
 const importLoading = ref(false)
@@ -569,6 +694,7 @@ const importError = ref('')
 const importNotice = ref('')
 const importCompletionNotice = ref('')
 const importTaskId = ref(null)
+const importPreviewPending = ref(false)
 const importOptions = ref({
   scenario: 'general',
   create_readonly_conversation: false,
@@ -584,6 +710,7 @@ const editingRel = ref(null)
 
 const graphCanvas = ref(null)
 let animFrame = null
+const expandedBehaviorKeys = ref([])
 
 const tabs = [
   { key: 'profile', label: '角色档案' },
@@ -591,7 +718,7 @@ const tabs = [
   { key: 'relations', label: '关系' },
 ]
 
-const charForm = ref({ name:'', role:'', background:'', age:null, avatar_color:'#00d4ff', motivation:'', weakness:'', speaking_style:'' })
+const charForm = ref({ name:'', role:'', background:'', age:null, avatar_color:'#00d4ff', motivation:'', weakness:'', speaking_style:'', personality_tags_text:'', behavior_patterns:[] })
 const relForm = ref({ source_id:null, target_id:null, rel_type:'neutral', strength:0.5, sentiment:0.0, description:'' })
 const eventForm = ref({ title:'', description:'', event_date:'', emotion_label:'', importance:3 })
 
@@ -610,10 +737,32 @@ const charRelationships = computed(() => {
 })
 
 const pendingObs = computed(() => observations.value.filter(o => o.status === 'pending'))
-const sortedEvents = computed(() => [...events.value].sort((a, b) => (a.event_date || '').localeCompare(b.event_date || '')))
+const autoAppliedObs = computed(() => observations.value.filter(o => o.status === 'approved'))
+const appliedBehaviorPatterns = computed(() => observations.value.filter(o => o.field === 'behavior_pattern' && o.status === 'approved'))
+const behaviorPatternGroups = computed(() => profileView.value?.behavior_patterns || { '攻击型行为': [], '防御型行为': [], '互动策略': [] })
+const currentProfile = computed(() => profileView.value || {
+  basic_info: { name: activeChar.value?.name || '', role: activeChar.value?.role || null, background: activeChar.value?.background || null, age: activeChar.value?.age ?? null },
+  personality_model: { tags: activeChar.value?.personality_tags || [], core_traits: activeChar.value?.core_traits || {} },
+  behavior_patterns: { '攻击型行为': [], '防御型行为': [], '互动策略': [] },
+  core_motivation: activeChar.value?.motivation || null,
+  core_weakness: activeChar.value?.weakness || null,
+  speaking_style: { summary: activeChar.value?.speaking_style || null, tags: [] },
+  relationship_network: [],
+  event_timeline: [],
+})
+const sortedEvents = computed(() => [...events.value].sort((a, b) => {
+  const aKey = a.event_date || a.created_at || ''
+  const bKey = b.event_date || b.created_at || ''
+  return bKey.localeCompare(aKey)
+}))
 
 onMounted(async () => {
   await chars.fetchAll()
+  const routeCharId = Number(route.query.charId || 0)
+  if (routeCharId) {
+    const matched = chars.characters.find(item => item.id === routeCharId)
+    if (matched) selectChar(matched)
+  }
   nextTick(renderGraph)
 })
 
@@ -624,8 +773,11 @@ watch(() => chars.characters, () => nextTick(renderGraph), { deep: true })
 function selectChar(c) {
   activeChar.value = c
   activeTab.value = 'profile'
+  router.replace({ path: '/admin', query: { charId: c.id } })
   loadEvents(c.id)
   loadObservations(c.id)
+  loadProfileView(c.id)
+  loadAiUpdateSummary(c.id)
 }
 async function loadEvents(id) {
   const res = await characterApi.listEvents(id)
@@ -635,29 +787,76 @@ async function loadObservations(id) {
   const res = await characterApi.listObservations(id)
   observations.value = res.data
 }
+async function loadProfileView(id) {
+  const res = await characterApi.getProfileView(id)
+  profileView.value = res.data
+}
+async function loadAiUpdateSummary(id) {
+  const res = await characterApi.getAiUpdateLog(id)
+  aiUpdateSummary.value = res.data?.summary || { total: 0, approved: 0, pending: 0 }
+}
 
 function openCreateModal() {
   editingChar.value = null
-  charForm.value = { name:'', role:'', background:'', age:null, avatar_color:'#00d4ff', motivation:'', weakness:'', speaking_style:'' }
+  charForm.value = { name:'', role:'', background:'', age:null, avatar_color:'#00d4ff', motivation:'', weakness:'', speaking_style:'', personality_tags_text:'', behavior_patterns:[] }
   showCharModal.value = true
 }
 function openImportModal() {
   showImportModal.value = true
 }
 function closeImportModal() {
+  if (importPollTimer) {
+    window.clearTimeout(importPollTimer)
+    importPollTimer = null
+  }
   showImportModal.value = false
 }
 function openEditModal(c) {
   editingChar.value = c
-  charForm.value = { ...c }
+  charForm.value = {
+    ...c,
+    personality_tags_text: (c.personality_tags || []).join(', '),
+    behavior_patterns: observations.value
+      .filter(item => item.field === 'behavior_pattern' && item.status === 'approved')
+      .map(item => ({ id:item.id, ...parseBehaviorPattern(item), new_value:item.new_value, localId:`existing-${item.id}` })),
+  }
   showCharModal.value = true
 }
+function addBehaviorPatternForm() {
+  charForm.value.behavior_patterns.push({
+    localId: `new-${Date.now()}-${Math.random()}`,
+    new_value: '',
+    source: '手动编辑',
+    confidence: 1,
+    category: '互动策略',
+    trigger: '',
+    example: '',
+  })
+}
+function removeBehaviorPatternForm(idx) {
+  charForm.value.behavior_patterns.splice(idx, 1)
+}
 async function submitChar() {
+  const personalityTags = (charForm.value.personality_tags_text || '')
+    .split(/[,，]/)
+    .map(item => item.trim())
+    .filter(Boolean)
   if (editingChar.value) {
-    const updated = await chars.update(editingChar.value.id, charForm.value)
+    const updated = await chars.update(editingChar.value.id, {
+      ...charForm.value,
+      personality_tags: personalityTags,
+    })
+    await syncBehaviorPatterns(editingChar.value.id)
     activeChar.value = updated
+    await loadObservations(editingChar.value.id)
+      await loadProfileView(editingChar.value.id)
+      await loadAiUpdateSummary(editingChar.value.id)
   } else {
-    const created = await chars.create(charForm.value)
+    const created = await chars.create({
+      ...charForm.value,
+      personality_tags: personalityTags,
+    })
+    await syncBehaviorPatterns(created.id)
     selectChar(created)
   }
   showCharModal.value = false
@@ -673,6 +872,7 @@ async function handleSuggestUpdate() {
   try {
     await characterApi.suggestUpdate(activeChar.value.id)
     await loadObservations(activeChar.value.id)
+    await loadAiUpdateSummary(activeChar.value.id)
   } finally {
     loadingSuggest.value = false
   }
@@ -680,11 +880,40 @@ async function handleSuggestUpdate() {
 async function reviewObs(obsId, status) {
   await characterApi.reviewObservation(activeChar.value.id, obsId, status)
   await loadObservations(activeChar.value.id)
+  await loadAiUpdateSummary(activeChar.value.id)
   if (status === 'approved') {
     const updated = await characterApi.get(activeChar.value.id)
     activeChar.value = updated.data
     const idx = chars.characters.findIndex(c => c.id === activeChar.value.id)
     if (idx >= 0) chars.characters[idx] = updated.data
+    await loadProfileView(activeChar.value.id)
+  }
+}
+async function syncBehaviorPatterns(charId) {
+  const existing = observations.value.filter(item => item.field === 'behavior_pattern' && item.status === 'approved')
+  const existingMap = new Map(existing.map(item => [item.id, item]))
+  const formPatterns = (charForm.value.behavior_patterns || [])
+    .map(item => ({
+      id: item.id,
+      new_value: (item.new_value || '').trim(),
+      source: item.source || '手动编辑',
+      confidence: Number(item.confidence || 1),
+      category: item.category || '互动策略',
+      trigger: item.trigger || '',
+      example: item.example || '',
+    }))
+    .filter(item => item.new_value)
+
+  for (const pattern of formPatterns) {
+    if (pattern.id && existingMap.has(pattern.id)) {
+      await characterApi.updateBehaviorPattern(charId, pattern.id, pattern)
+      existingMap.delete(pattern.id)
+    } else {
+      await characterApi.createBehaviorPattern(charId, pattern)
+    }
+  }
+  for (const stale of existingMap.values()) {
+    await characterApi.deleteBehaviorPattern(charId, stale.id)
   }
 }
 
@@ -699,6 +928,7 @@ async function submitEvent() {
 async function deleteEvent(eid) {
   await characterApi.deleteEvent(activeChar.value.id, eid)
   await loadEvents(activeChar.value.id)
+  await loadProfileView(activeChar.value.id)
 }
 
 // ── Relationship Actions ───────────────────────────────────────────────────
@@ -733,6 +963,35 @@ async function handleImportFileChange(e) {
   importResult.value = null
   importError.value = ''
   importNotice.value = ''
+  importPreviewPending.value = false
+}
+async function refreshPreviewStatus() {
+  await pollPreviewStatus(importTaskId.value, false)
+}
+async function pollPreviewStatus(taskId, scheduleNext = false) {
+  if (!taskId) return
+  try {
+    const res = await characterApi.getImportStatus(taskId)
+    const data = res.data || {}
+    if (data.status === 'preview_processing') {
+      importNotice.value = `${data.progress?.message || 'AI 预览增强正在后台处理中…'} 当前已停止实时监测，请手动刷新查看结果。`
+      if (scheduleNext) {
+        importPollTimer = window.setTimeout(() => pollPreviewStatus(taskId, true), 1500)
+      }
+      return
+    }
+    if (data.status === 'preview_ready') {
+      importPreviewPending.value = false
+      importPreview.value = data.preview_payload || importPreview.value
+      importNotice.value = data.preview_warning || data.progress?.message || 'AI 预览增强完成'
+      importPollTimer = null
+      return
+    }
+    importPreviewPending.value = false
+  } catch (err) {
+    importPreviewPending.value = false
+    importError.value = err?.response?.data?.detail || err?.message || '预览增强状态获取失败。'
+  }
 }
 async function pollImportStatus(taskId) {
   if (!taskId) return
@@ -755,6 +1014,9 @@ async function pollImportStatus(taskId) {
         if (refreshed) {
           activeChar.value = refreshed
           await loadEvents(refreshed.id)
+          await loadObservations(refreshed.id)
+          await loadProfileView(refreshed.id)
+          await loadAiUpdateSummary(refreshed.id)
         }
       }
       return
@@ -772,16 +1034,25 @@ async function previewImport() {
   try {
     importError.value = ''
     importNotice.value = ''
+    importPreviewPending.value = false
     const formData = new FormData()
     formData.append('file', selectedImportFile.value)
     const res = await characterApi.previewImport(formData)
     importPreview.value = res.data
     importResult.value = null
     importNotice.value = res.data?.warning_message || ''
+    importPreviewPending.value = res.data?.preview_status === 'preview_processing'
+    importTaskId.value = res.data?.import_file_id || null
+    if (importPreviewPending.value) {
+      if (importPollTimer) window.clearTimeout(importPollTimer)
+      importPollTimer = null
+      importNotice.value = 'AI 预览增强已转为后台处理，已停止实时监测；如需查看增强结果，请点击“手动刷新 AI 结果”。'
+    }
   } catch (err) {
     importPreview.value = null
     importResult.value = null
     importError.value = err?.response?.data?.detail || err?.message || '导入预览失败，请检查后端服务或文件内容。'
+    importPreviewPending.value = false
   } finally {
     importLoading.value = false
   }
@@ -840,6 +1111,30 @@ async function downloadExport() {
 function getCharName(id) { return chars.characterMap[id]?.name || '未知' }
 function getCharColor(id) { return chars.characterMap[id]?.avatar_color || '#475569' }
 function getCharLetter(id) { return (chars.characterMap[id]?.name || '?')[0] }
+function parseBehaviorPattern(obs) {
+  const lines = (obs.reason || '').split('\n').map(line => line.trim()).filter(Boolean)
+  const getValue = (prefix) => (lines.find(line => line.startsWith(prefix)) || '').replace(prefix, '').trim()
+  return {
+    source: getValue('来源：') || 'AI自动识别',
+    confidence: getValue('置信度：') || '1.00',
+    evidence: getValue('依据：'),
+    category: getValue('分类：') || '互动策略',
+    trigger: getValue('触发：'),
+    example: getValue('示例：'),
+  }
+}
+function toggleBehaviorItem(key) {
+  expandedBehaviorKeys.value = expandedBehaviorKeys.value.includes(key)
+    ? expandedBehaviorKeys.value.filter(item => item !== key)
+    : [...expandedBehaviorKeys.value, key]
+}
+function isBehaviorExpanded(key) {
+  return expandedBehaviorKeys.value.includes(key)
+}
+function openAiUpdates() {
+  if (!activeChar.value) return
+  router.push({ path: '/ai-updates', query: { charId: activeChar.value.id } })
+}
 
 const traitLabels = { openness:'开放性', conscientiousness:'尽责性', extraversion:'外向性', agreeableness:'宜人性', neuroticism:'神经质' }
 function traitLabel(k) { return traitLabels[k] || k }
@@ -1048,6 +1343,12 @@ function renderGraph() {
 .info-item { background:var(--bg-elevated); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 14px; }
 .info-label { font-size:10px; font-family:var(--font-mono); color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; margin-bottom:4px; }
 .info-value { font-size:13px; color:var(--text-secondary); line-height:1.6; }
+.section-card { padding:14px; font-size:13px; color:var(--text-secondary); line-height:1.7; }
+.behavior-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }
+.behavior-group { padding:12px; }
+.behavior-tag-btn { border:none; cursor:pointer; }
+.compact-list { display:flex; flex-direction:column; gap:8px; }
+.update-summary-card { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 
 /* Observations */
 .obs-list { display:flex; flex-direction:column; gap:8px; }

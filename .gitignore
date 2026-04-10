@@ -3,5 +3,7 @@ frontend/node_modules/
 __pycache__/
 backend/btb.db
 *.db
-backend/222222222222.txt
-修改记录.md
+.idea/
+backend/app/logs/
+btb-export-2026-04-10-13-58-20.json
+tes22t.txt

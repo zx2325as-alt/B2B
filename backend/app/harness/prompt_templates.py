@@ -69,129 +69,168 @@ PROMPT_REGISTRY: dict[str, dict] = {
     },
 
     "import_dialogue_parse": {
-        "system": """你是 AI Harness 的统一导入解析引擎。你需要把输入内容解析成统一语义协议。
+        "system": """你是 AI Harness 的统一导入解析引擎。你的任务是输出可解析、可落库、可预览的紧凑 JSON，不要输出解释、注释或 markdown。
 
-请返回严格 JSON：
-{{
-  "characters": [
-    {{
-      "name": "角色名",
-      "role": "可推断角色定位",
-      "background": "可推断背景",
-      "personality_tags": ["标签1"],
-      "status": "confirmed/ambiguous/new",
-      "confidence": 0.0
-    }}
-  ],
-  "interaction_units": [
-    {{
-      "speaker": "发言者",
-      "receiver": "接收者",
-      "receiver_confidence": 0.0,
-      "receiver_state": "confirmed/inferred/ambiguous",
-      "content": "原文",
-      "intent": {{"value": "行为意图", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "strategy": {{"value": "表达策略", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "emotion": {{"value": "情绪倾向", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "interaction_type": {{"value": "互动类型", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}}
-    }}
-  ],
-  "events": [
-    {{
-      "actor": "行为主体",
-      "action": "行为类型",
-      "time": "可推断时间",
-      "location": "可推断地点",
-      "participants": ["角色1", "角色2"],
-      "summary": "事件概述"
-    }}
-  ],
-  "relationships": [
-    {{
-      "source": "角色A",
-      "target": "角色B",
-      "rel_type": "ally/rival/friend/family/romantic/neutral",
-      "strength": 0.0,
-      "sentiment": -1.0,
-      "description": "关系依据"
-    }}
-  ],
-  "plot_summary": {{
-    "main_conflict": "主冲突",
-    "relationship_path": "关系演化路径",
-    "turning_points": ["转折点1"]
-  }}
-}}
+严格返回一个 JSON 对象，顶层必须包含：
+- characters
+- interaction_units
+- events
+- relationships
+- plot_summary
+
+字段要求：
+- 所有键必须存在；未知时填 null、[]、0 或空对象
+- 只基于证据推断，禁止臆测
+- 对话场景优先使用说话人标签
+- 共现不等于强关系，只有直接互动或明显情绪指向才建立关系
 
 约束：
-- 所有推断都要保守且可解释
-- 共现不是强关系，只有直接互动、明确指向或明显情绪指向时才建立关系
-- 对话格式时优先使用说话人标签
-- 字段缺失时允许为空，不要臆造长篇背景""",
+- interaction_units 优先保留关键互动
+- events 只保留关键事件摘要
+- relationships 只保留高价值关系
+
+输出规模限制：
+- characters 最多 6 个
+- interaction_units 最多 18 条
+- events 最多 8 条
+- relationships 最多 10 条
+
+如果内容很多，请优先保留最核心角色与关键事件，确保 JSON 完整闭合。""",
         "user": "文件类型：{file_type}\n内容：\n{content_text}"
     },
 
     "import_narrative_parse": {
-        "system": """你是 AI Harness 的统一导入解析引擎。你需要把叙事文本、文章、剧本或历史记录解析成统一语义协议。
+        "system": """你是 AI Harness 的统一导入解析引擎。你的任务是输出可解析、可落库、可预览的紧凑 JSON，不要输出解释、注释或 markdown。
 
-请返回严格 JSON：
-{{
-  "characters": [
-    {{
-      "name": "角色名",
-      "role": "可推断角色定位",
-      "background": "可推断背景",
-      "personality_tags": ["标签1"],
-      "status": "confirmed/ambiguous/new",
-      "confidence": 0.0
-    }}
-  ],
-  "interaction_units": [
-    {{
-      "speaker": "发言者或叙事主导者",
-      "receiver": "主要接收者",
-      "receiver_confidence": 0.0,
-      "receiver_state": "confirmed/inferred/ambiguous",
-      "content": "原文片段",
-      "intent": {{"value": "行为意图", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "strategy": {{"value": "表达策略", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "emotion": {{"value": "情绪倾向", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}},
-      "interaction_type": {{"value": "互动类型", "confidence": 0.0, "state": "confirmed/inferred/ambiguous"}}
-    }}
-  ],
-  "events": [
-    {{
-      "actor": "行为主体",
-      "action": "行为类型",
-      "time": "可推断时间",
-      "location": "可推断地点",
-      "participants": ["角色1", "角色2"],
-      "summary": "事件概述"
-    }}
-  ],
-  "relationships": [
-    {{
-      "source": "角色A",
-      "target": "角色B",
-      "rel_type": "ally/rival/friend/family/romantic/neutral",
-      "strength": 0.0,
-      "sentiment": -1.0,
-      "description": "关系依据"
-    }}
-  ],
-  "plot_summary": {{
-    "main_conflict": "主冲突",
-    "relationship_path": "关系演化路径",
-    "turning_points": ["转折点1"]
-  }}
-}}
+严格返回一个 JSON 对象，顶层必须包含：
+- characters
+- interaction_units
+- events
+- relationships
+- plot_summary
+
+字段要求：
+- 所有键必须存在；未知时填 null、[]、0 或空对象
+- 只基于证据推断，禁止臆测
+- 叙事文本优先抽取明确事件，再从事件中保守推断关系
+- 没有直接对白时，可以从动作中提炼 interaction_units，但不要过度猜测
 
 约束：
-- 叙事文本要优先抽取明确事件，再从事件里保守推断互动关系
-- 没有直接对白时，也可以从叙事动作中提炼 interaction_units，但不要过度猜测
-- 所有推断都要保守且可解释
-- 字段缺失时允许为空，不要臆造长篇背景""",
+- interaction_units 优先保留关键互动
+- events 只保留关键事件摘要
+- relationships 只保留高价值关系
+
+输出规模限制：
+- characters 最多 6 个
+- interaction_units 最多 18 条
+- events 最多 8 条
+- relationships 最多 10 条
+
+如果内容很多，请优先保留最核心角色与关键事件，确保 JSON 完整闭合。""",
         "user": "文件类型：{file_type}\n内容：\n{content_text}"
+    },
+
+    "import_profile_synthesis": {
+        "system": """你是 AI Harness 的角色档案建模引擎。请基于已解析的角色、互动、事件、关系摘要，为核心角色生成完整 8 大模块角色档案。
+
+严格返回 JSON：
+{{
+  "character_profiles": [
+    {{
+      "character_name": "角色名",
+      "source": "imported_text",
+      "confidence_overall": 0.0,
+      "basic_info": {{
+        "identity": "角色身份",
+        "background": "背景",
+        "tags": ["标签1"],
+        "certainty": 0.0
+      }},
+      "personality_model": {{
+        "traits": [
+          {{
+            "name": "人格特征",
+            "intensity": 0.0,
+            "evidence_count": 0
+          }}
+        ],
+        "emotional_patterns": [
+          {{
+            "pattern": "情绪模式",
+            "trigger": "触发条件",
+            "response": "典型反应"
+          }}
+        ]
+      }},
+      "behavior_patterns": [
+        {{
+          "category": "行为分类",
+          "pattern": "可复现行为模式",
+          "trigger": "触发条件",
+          "goal": "行为目的",
+          "frequency": 0,
+          "confidence": 0.0
+        }}
+      ],
+      "core_motivation": [
+        {{
+          "motivation": "长期驱动",
+          "priority": 1,
+          "evidence": ["证据1", "证据2"]
+        }}
+      ],
+      "core_weakness": [
+        {{
+          "weakness": "核心弱点",
+          "type": "emotional | cognitive | relational",
+          "evidence": ["证据1", "证据2"]
+        }}
+      ],
+      "speech_style": {{
+        "tone": ["语气"],
+        "structure": ["句式"],
+        "features": ["语言特征"],
+        "examples": ["例句"]
+      }},
+      "relationships": [
+        {{
+          "target": "对象",
+          "type": "关系类型",
+          "intensity": 0.0,
+          "emotional_polarity": 0.0,
+          "key_events": ["关键事件"],
+          "evidence_count": 0
+        }}
+      ],
+      "event_timeline": [
+        {{
+          "event_id": "事件ID",
+          "type": "action | emotion | relationship",
+          "summary": "事件总结",
+          "participants": ["角色1"],
+          "impact": "影响",
+          "emotional_weight": 0.0
+        }}
+      ]
+    }}
+  ]
+}}
+
+强制规则：
+- 必须输出完整8大模块，禁止缺字段
+- 无法确定的字段必须明确填 null、[]、0 或空对象，禁止省略键
+- 所有结论必须基于提供的解析摘要，禁止臆测
+- traits 至少2项；可确认项 evidence_count >= 2
+- behavior_patterns 仅保留可复现模式；可确认项 frequency >= 2，且必须有 trigger、goal
+- core_motivation / core_weakness 的可确认项必须至少2条 evidence
+- event_timeline 至少5条；证据不足时用占位项补齐
+
+输出规模限制：
+- character_profiles 最多 6 个
+- 每个角色：traits 最多 3 条，emotional_patterns 最多 3 条，behavior_patterns 最多 3 条，core_motivation 最多 2 条，core_weakness 最多 2 条，relationships 最多 4 条，event_timeline 最多 5 条
+
+如果信息很多，请优先保留核心角色与关键事件，确保 JSON 完整闭合。""",
+        "user": "请基于以下导入解析摘要生成角色档案：\n{preview_payload}"
     },
 
     "interaction_analysis_rebuild": {

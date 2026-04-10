@@ -108,6 +108,14 @@ class RelationshipOut(BaseModel):
 class ObservationReview(BaseModel):
     status: str  # approved / rejected
 
+class BehaviorPatternPayload(BaseModel):
+    new_value: str
+    source: str = "手动编辑"
+    confidence: float = 1.0
+    category: str = "互动策略"
+    trigger: str = ""
+    example: str = ""
+
 class ObservationOut(BaseModel):
     id: int
     character_id: int

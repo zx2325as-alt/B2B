@@ -57,6 +57,7 @@ class ModelRouter:
         "chat_analysis": TaskComplexity.MEDIUM,
         "import_dialogue_parse": TaskComplexity.COMPLEX,
         "import_narrative_parse": TaskComplexity.COMPLEX,
+        "import_profile_synthesis": TaskComplexity.COMPLEX,
         "import_commit_review": TaskComplexity.COMPLEX,
         "interaction_analysis_rebuild": TaskComplexity.COMPLEX,
         "character_profile_gen": TaskComplexity.COMPLEX,
@@ -69,6 +70,7 @@ class ModelRouter:
         "chat_analysis",
         "import_dialogue_parse",
         "import_narrative_parse",
+        "import_profile_synthesis",
         "import_commit_review",
         "interaction_analysis_rebuild",
         "character_profile_gen",
@@ -102,10 +104,10 @@ class ModelRouter:
         default_models = {
             TaskComplexity.SIMPLE: "deepseek-chat",
             TaskComplexity.MEDIUM: "deepseek-chat",
-            TaskComplexity.COMPLEX: "deepseek-reasoner",
+            TaskComplexity.COMPLEX: "deepseek-chat",
         }
         model_name = task_models.get(task_name) or models_config.get(complexity.value) or default_models[complexity]
-        if task_name in self.JSON_TASKS and provider_name == "deepseek" and model_name == "deepseek-reasoner":
+        if task_name in self.JSON_TASKS and provider_name == "deepseek" and model_name == "deepseek-chat":
             model_name = "deepseek-chat"
         base_tokens = {
             TaskComplexity.SIMPLE: 512,
@@ -150,6 +152,9 @@ class OutputGuardrails:
         "character_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation"],
         "relationship_analysis": ["relationship_summary", "predicted_trend"],
         "emotion_curve": ["emotions", "trend"],
+        "import_dialogue_parse": ["characters", "interaction_units", "events", "relationships", "plot_summary"],
+        "import_narrative_parse": ["characters", "interaction_units", "events", "relationships", "plot_summary"],
+        "import_profile_synthesis": ["character_profiles"],
         "ai_suggest_update": [],  # array
     }
 
@@ -166,6 +171,12 @@ class OutputGuardrails:
         try:
             return json.loads(clean)
         except json.JSONDecodeError:
+            open_braces = clean.count("{")
+            close_braces = clean.count("}")
+            open_brackets = clean.count("[")
+            close_brackets = clean.count("]")
+            if open_braces > close_braces or open_brackets > close_brackets:
+                raise GuardrailError(f"模型 JSON 输出疑似被截断，无法完整闭合：{text[:200]}")
             # 尝试找第一个 { 或 [
             match = re.search(r"[\[\{].*[\]\}]", clean, re.DOTALL)
             if match:
@@ -183,7 +194,65 @@ class OutputGuardrails:
             for f in required:
                 if f not in output:
                     raise GuardrailError(f"输出缺少必填字段: {f}")
+        if task_name in {"import_profile_synthesis"}:
+            self._validate_import_profiles(output)
         return output
+
+    def _validate_import_profiles(self, output: dict[str, Any]) -> None:
+        profiles = output.get("character_profiles")
+        if not isinstance(profiles, list):
+            raise GuardrailError("character_profiles 必须为数组")
+        required_modules = [
+            "character_name",
+            "source",
+            "confidence_overall",
+            "basic_info",
+            "personality_model",
+            "behavior_patterns",
+            "core_motivation",
+            "core_weakness",
+            "speech_style",
+            "relationships",
+            "event_timeline",
+        ]
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                raise GuardrailError("character_profiles 元素必须为对象")
+            for field in required_modules:
+                if field not in profile:
+                    raise GuardrailError(f"角色档案缺少模块: {field}")
+            if not isinstance(profile.get("event_timeline"), list) or len(profile.get("event_timeline") or []) < 5:
+                raise GuardrailError("event_timeline 少于5条")
+            for item in profile.get("behavior_patterns") or []:
+                if not isinstance(item, dict):
+                    raise GuardrailError("behavior_patterns 元素必须为对象")
+                pattern = (item.get("pattern") or "").strip()
+                if pattern:
+                    if int(item.get("frequency") or 0) < 2:
+                        raise GuardrailError("behavior_patterns.frequency 小于2")
+                    if not (item.get("trigger") or "").strip():
+                        raise GuardrailError("behavior_patterns.trigger 不能为空")
+                    if not (item.get("goal") or "").strip():
+                        raise GuardrailError("behavior_patterns.goal 不能为空")
+            for item in profile.get("core_motivation") or []:
+                if not isinstance(item, dict):
+                    raise GuardrailError("core_motivation 元素必须为对象")
+                if (item.get("motivation") or "").strip() and len(item.get("evidence") or []) < 2:
+                    raise GuardrailError("core_motivation.evidence 少于2条")
+            for item in profile.get("core_weakness") or []:
+                if not isinstance(item, dict):
+                    raise GuardrailError("core_weakness 元素必须为对象")
+                if (item.get("weakness") or "").strip() and len(item.get("evidence") or []) < 2:
+                    raise GuardrailError("core_weakness.evidence 少于2条")
+            concrete_traits = [
+                item for item in (profile.get("personality_model") or {}).get("traits", [])
+                if isinstance(item, dict) and (item.get("name") or "").strip()
+            ]
+            if concrete_traits and len(concrete_traits) < 2:
+                raise GuardrailError("traits 少于2项")
+            for item in concrete_traits:
+                if int(item.get("evidence_count") or 0) < 2:
+                    raise GuardrailError("trait.evidence_count 小于2")
 
     def check_safety(self, text: str) -> bool:
         lower = text.lower()

@@ -110,6 +110,17 @@ class AIOrchestrator:
     - 上下文管理
     """
 
+    def _resolve_request_max_tokens(self, task_name: str, base_max_tokens: int, attempt: int) -> int:
+        if task_name in {"import_dialogue_parse", "import_narrative_parse"}:
+            if attempt >= 1:
+                return max(base_max_tokens, 8192)
+            return max(base_max_tokens, 6144)
+        if task_name == "import_profile_synthesis":
+            if attempt >= 1:
+                return max(base_max_tokens, 12000)
+            return max(base_max_tokens, 8192)
+        return base_max_tokens
+
     async def call(
         self,
         task_name: str,
@@ -140,10 +151,17 @@ class AIOrchestrator:
         for attempt in range(retries + 1):
             try:
                 # 合并 system prompt 到 messages 中（OpenAI 格式）
-                openai_messages = [{"role": "system", "content": system}] + messages
+                retry_system = system
+                if attempt > 0 and task_name in {"import_dialogue_parse", "import_narrative_parse", "import_profile_synthesis"}:
+                    retry_system = (
+                        system
+                        + "\n\n重试要求：上一次输出未通过校验。你必须进一步压缩结果规模，优先保留核心角色与关键事件，确保 JSON 一次性完整闭合，不要输出半截数组或半截对象。"
+                    )
+                openai_messages = [{"role": "system", "content": retry_system}] + messages
+                request_max_tokens = self._resolve_request_max_tokens(task_name, model_cfg.max_tokens, attempt)
                 request_kwargs: dict[str, Any] = {
                     "model": model_cfg.model,
-                    "max_tokens": model_cfg.max_tokens,
+                    "max_tokens": request_max_tokens,
                     "temperature": model_cfg.temperature,
                     "messages": openai_messages,
                 }
@@ -151,6 +169,11 @@ class AIOrchestrator:
                     request_kwargs["response_format"] = {"type": "json_object"}
                 response = await client.chat.completions.create(**request_kwargs)
                 raw = response.choices[0].message.content or ""
+                finish_reason = response.choices[0].finish_reason or ""
+                if finish_reason == "length":
+                    raise GuardrailError(
+                        f"模型输出因长度被截断，max_tokens={request_max_tokens}，需提高输出上限或压缩结果。"
+                    )
                 result = guardrails.process(task_name, raw)
                 logger.info(
                     "AI 调用成功 task=%s provider=%s model=%s attempt=%s",
@@ -355,7 +378,33 @@ class AIOrchestrator:
                 "file_type": file_type,
                 "content_text": content_text[:12000],
             },
-            retries=0,
+            retries=1,
+        )
+
+    async def synthesize_import_profiles(self, preview_payload: dict[str, Any]) -> dict:
+        compact_payload = {
+            "characters": (preview_payload.get("characters") or [])[:6],
+            "interaction_units": [
+                {
+                    "speaker": item.get("speaker", ""),
+                    "receiver": item.get("receiver", ""),
+                    "content": (item.get("content", "") or "")[:120],
+                    "intent": item.get("intent", {}),
+                    "strategy": item.get("strategy", {}),
+                    "emotion": item.get("emotion", {}),
+                }
+                for item in (preview_payload.get("interaction_units") or [])[:18]
+            ],
+            "events": (preview_payload.get("events") or [])[:8],
+            "relationships": (preview_payload.get("relationships") or [])[:10],
+            "plot_summary": preview_payload.get("plot_summary", {}) or {},
+        }
+        return await self.call(
+            "import_profile_synthesis",
+            {
+                "preview_payload": json.dumps(compact_payload, ensure_ascii=False),
+            },
+            retries=1,
         )
 
     async def rebuild_import_analysis(self, interaction_unit: dict, context_payload: dict) -> dict:

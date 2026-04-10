@@ -21,6 +21,13 @@
           </svg>
           <span>角色管理</span>
         </router-link>
+
+        <router-link to="/ai-updates" class="nav-link" :class="{ active: $route.path === '/ai-updates' }">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M7 4h10l3 3v13H4V4h3z"/><path d="M8 9h8M8 13h8M8 17h5"/>
+          </svg>
+          <span>AI更新记录</span>
+        </router-link>
       </div>
 
       <div class="sidebar-footer">

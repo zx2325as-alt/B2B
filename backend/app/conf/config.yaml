@@ -43,7 +43,7 @@ ai:
       models:
         simple: "deepseek-chat"
         medium: "deepseek-chat"
-        complex: "deepseek-reasoner"
+        complex: "deepseek-chat"
         
     ollama:
       base_url: "http://localhost:11434/v1"

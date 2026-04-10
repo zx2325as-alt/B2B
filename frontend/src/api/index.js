@@ -15,8 +15,13 @@ export const characterApi = {
   exportAll: ()                => api.get('/characters/exports/full'),
   suggestUpdate: (id)          => api.post(`/characters/${id}/suggest-update`),
   listObservations: (id)       => api.get(`/characters/${id}/observations`),
+  getProfileView: (id)         => api.get(`/characters/${id}/profile-view`),
+  getAiUpdateLog: (id)         => api.get(`/characters/${id}/ai-update-log`),
   reviewObservation: (cid, oid, status) =>
     api.post(`/characters/${cid}/observations/${oid}/review`, { status }),
+  createBehaviorPattern: (cid, data) => api.post(`/characters/${cid}/behavior-patterns`, data),
+  updateBehaviorPattern: (cid, oid, data) => api.put(`/characters/${cid}/behavior-patterns/${oid}`, data),
+  deleteBehaviorPattern: (cid, oid) => api.delete(`/characters/${cid}/behavior-patterns/${oid}`),
   listEvents: (id)             => api.get(`/characters/${id}/events`),
   createEvent: (id, data)      => api.post(`/characters/${id}/events`, data),
   deleteEvent: (cid, eid)      => api.delete(`/characters/${cid}/events/${eid}`),
