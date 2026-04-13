@@ -57,7 +57,6 @@ class ModelRouter:
         "chat_analysis": TaskComplexity.MEDIUM,
         "import_dialogue_parse": TaskComplexity.COMPLEX,
         "import_narrative_parse": TaskComplexity.COMPLEX,
-        "import_profile_synthesis": TaskComplexity.COMPLEX,
         "import_commit_review": TaskComplexity.COMPLEX,
         "interaction_analysis_rebuild": TaskComplexity.COMPLEX,
         "character_profile_gen": TaskComplexity.COMPLEX,
@@ -70,7 +69,6 @@ class ModelRouter:
         "chat_analysis",
         "import_dialogue_parse",
         "import_narrative_parse",
-        "import_profile_synthesis",
         "import_commit_review",
         "interaction_analysis_rebuild",
         "character_profile_gen",
@@ -152,9 +150,6 @@ class OutputGuardrails:
         "character_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation"],
         "relationship_analysis": ["relationship_summary", "predicted_trend"],
         "emotion_curve": ["emotions", "trend"],
-        "import_dialogue_parse": ["characters", "interaction_units", "events", "relationships", "plot_summary"],
-        "import_narrative_parse": ["characters", "interaction_units", "events", "relationships", "plot_summary"],
-        "import_profile_synthesis": ["character_profiles"],
         "ai_suggest_update": [],  # array
     }
 
@@ -164,26 +159,72 @@ class OutputGuardrails:
         r"jailbreak",
     ]
 
+    def _balance_json_suffix(self, text: str) -> str:
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for char in text:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char in {"}", "]"} and stack and stack[-1] == char:
+                stack.pop()
+        suffix = '"' if in_string else ""
+        suffix += "".join(reversed(stack))
+        return suffix
+
+    def _repair_partial_json(self, text: str) -> Any | None:
+        boundary_indexes = [
+            index
+            for index, char in enumerate(text)
+            if char in {",", "}", "]"}
+        ]
+        boundary_indexes.append(len(text) - 1)
+        tried = set()
+        for index in reversed(boundary_indexes[-80:]):
+            candidate = text[: index + 1].rstrip()
+            if not candidate:
+                continue
+            if candidate[-1] == ",":
+                candidate = candidate[:-1].rstrip()
+            candidate = candidate + self._balance_json_suffix(candidate)
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            try:
+                return json.loads(candidate)
+            except Exception:
+                continue
+        return None
+
     def extract_json(self, text: str) -> Any:
-        """从模型输出中提取 JSON，容忍 markdown 包装"""
-        # 去掉 ```json ... ```
         clean = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
         try:
             return json.loads(clean)
         except json.JSONDecodeError:
-            open_braces = clean.count("{")
-            close_braces = clean.count("}")
-            open_brackets = clean.count("[")
-            close_brackets = clean.count("]")
-            if open_braces > close_braces or open_brackets > close_brackets:
-                raise GuardrailError(f"模型 JSON 输出疑似被截断，无法完整闭合：{text[:200]}")
-            # 尝试找第一个 { 或 [
             match = re.search(r"[\[\{].*[\]\}]", clean, re.DOTALL)
             if match:
                 try:
                     return json.loads(match.group())
                 except Exception:
                     pass
+            start_match = re.search(r"[\[\{]", clean)
+            if start_match:
+                repaired = self._repair_partial_json(clean[start_match.start():])
+                if repaired is not None:
+                    return repaired
             raise GuardrailError(f"无法解析 JSON 输出: {text[:200]}")
 
     def validate(self, task_name: str, output: Any) -> Any:
@@ -194,65 +235,7 @@ class OutputGuardrails:
             for f in required:
                 if f not in output:
                     raise GuardrailError(f"输出缺少必填字段: {f}")
-        if task_name in {"import_profile_synthesis"}:
-            self._validate_import_profiles(output)
         return output
-
-    def _validate_import_profiles(self, output: dict[str, Any]) -> None:
-        profiles = output.get("character_profiles")
-        if not isinstance(profiles, list):
-            raise GuardrailError("character_profiles 必须为数组")
-        required_modules = [
-            "character_name",
-            "source",
-            "confidence_overall",
-            "basic_info",
-            "personality_model",
-            "behavior_patterns",
-            "core_motivation",
-            "core_weakness",
-            "speech_style",
-            "relationships",
-            "event_timeline",
-        ]
-        for profile in profiles:
-            if not isinstance(profile, dict):
-                raise GuardrailError("character_profiles 元素必须为对象")
-            for field in required_modules:
-                if field not in profile:
-                    raise GuardrailError(f"角色档案缺少模块: {field}")
-            if not isinstance(profile.get("event_timeline"), list) or len(profile.get("event_timeline") or []) < 5:
-                raise GuardrailError("event_timeline 少于5条")
-            for item in profile.get("behavior_patterns") or []:
-                if not isinstance(item, dict):
-                    raise GuardrailError("behavior_patterns 元素必须为对象")
-                pattern = (item.get("pattern") or "").strip()
-                if pattern:
-                    if int(item.get("frequency") or 0) < 2:
-                        raise GuardrailError("behavior_patterns.frequency 小于2")
-                    if not (item.get("trigger") or "").strip():
-                        raise GuardrailError("behavior_patterns.trigger 不能为空")
-                    if not (item.get("goal") or "").strip():
-                        raise GuardrailError("behavior_patterns.goal 不能为空")
-            for item in profile.get("core_motivation") or []:
-                if not isinstance(item, dict):
-                    raise GuardrailError("core_motivation 元素必须为对象")
-                if (item.get("motivation") or "").strip() and len(item.get("evidence") or []) < 2:
-                    raise GuardrailError("core_motivation.evidence 少于2条")
-            for item in profile.get("core_weakness") or []:
-                if not isinstance(item, dict):
-                    raise GuardrailError("core_weakness 元素必须为对象")
-                if (item.get("weakness") or "").strip() and len(item.get("evidence") or []) < 2:
-                    raise GuardrailError("core_weakness.evidence 少于2条")
-            concrete_traits = [
-                item for item in (profile.get("personality_model") or {}).get("traits", [])
-                if isinstance(item, dict) and (item.get("name") or "").strip()
-            ]
-            if concrete_traits and len(concrete_traits) < 2:
-                raise GuardrailError("traits 少于2项")
-            for item in concrete_traits:
-                if int(item.get("evidence_count") or 0) < 2:
-                    raise GuardrailError("trait.evidence_count 小于2")
 
     def check_safety(self, text: str) -> bool:
         lower = text.lower()

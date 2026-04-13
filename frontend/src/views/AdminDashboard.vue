@@ -480,7 +480,7 @@
         <div class="modal card fade-up" style="width:980px;max-height:88vh;overflow-y:auto">
           <div class="modal-header">
             <span>统一智能导入 / 导出</span>
-            <button class="btn-close" @click="closeImportModal">✕</button>
+            <button class="btn-close" @click="showImportModal = false">✕</button>
           </div>
           <div style="padding:20px;display:flex;flex-direction:column;gap:18px">
             <div class="section" style="margin-bottom:0">
@@ -489,15 +489,6 @@
                 <input ref="importFileInput" type="file" class="input" accept=".txt,.md,.pdf,.docx,.json,.csv" style="max-width:340px" @change="handleImportFileChange"/>
                 <button type="button" class="btn btn-primary" :disabled="!selectedImportFile || importLoading" @click.prevent="previewImport">
                   {{ importLoading ? '解析中…' : (importPreviewPending ? 'AI增强处理中…' : '上传并预览') }}
-                </button>
-                <button
-                  v-if="importPreviewPending"
-                  type="button"
-                  class="btn btn-ghost"
-                  :disabled="importLoading || !importTaskId"
-                  @click.prevent="refreshPreviewStatus"
-                >
-                  手动刷新 AI 结果
                 </button>
                 <button type="button" class="btn btn-ghost" @click.prevent="downloadExport">导出全量 JSON</button>
               </div>
@@ -638,20 +629,16 @@
                     <div v-for="(profile, name) in importPreview.character_profiles" :key="`model-${name}`" class="import-item">
                       <strong>{{ name }}</strong>
                       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-                        <span v-for="trait in profile.basic_info?.tags || []" :key="`${name}-tag-${trait}`" class="tag">{{ trait }}</span>
-                        <span v-for="trait in (profile.personality_model?.traits || []).filter(item => item?.name)" :key="`${name}-trait-${trait.name}`" class="tag green">
-                          {{ trait.name }} · {{ Number(trait.intensity || 0).toFixed(2) }}
-                        </span>
+                        <span v-for="trait in profile.personality_model?.tags || []" :key="`${name}-trait-${trait}`" class="tag green">{{ trait }}</span>
                       </div>
-                      <div class="obs-reason" style="margin-top:8px">身份：{{ profile.basic_info?.identity || 'null' }}</div>
-                      <div class="obs-reason">核心动机：{{ (profile.core_motivation || []).map(item => item.motivation).filter(Boolean).join(' / ') || 'null' }}</div>
-                      <div class="obs-reason">核心弱点：{{ (profile.core_weakness || []).map(item => item.weakness).filter(Boolean).join(' / ') || 'null' }}</div>
-                      <div class="obs-reason">说话风格：{{ [...(profile.speech_style?.tone || []), ...(profile.speech_style?.structure || []), ...(profile.speech_style?.features || [])].join(' / ') || 'null' }}</div>
-                      <div class="obs-reason">关系网络：{{ (profile.relationships || []).filter(item => item?.target).length }} 条</div>
+                      <div class="obs-reason" style="margin-top:8px">核心动机：{{ profile.core_motivation || 'null' }}</div>
+                      <div class="obs-reason">核心弱点：{{ profile.core_weakness || 'null' }}</div>
+                      <div class="obs-reason">说话风格：{{ profile.speaking_style?.summary || 'null' }}</div>
+                      <div class="obs-reason">关系网络：{{ (profile.relationship_network || []).length }} 条</div>
                       <div class="obs-reason">事件时间线：{{ (profile.event_timeline || []).length }} 条</div>
                       <div class="obs-field" style="margin-top:8px">行为模式</div>
-                      <div v-for="item in (profile.behavior_patterns || []).filter(item => item?.pattern)" :key="`${name}-${item.category}-${item.pattern}`" class="obs-reason">
-                        {{ item.category || '未分类' }}：{{ item.pattern }}（频次 {{ item.frequency || 0 }}）
+                      <div v-for="(items, category) in profile.behavior_patterns || {}" :key="`${name}-${category}`" class="obs-reason">
+                        {{ category }}：{{ (items || []).map(item => item.label).join(' / ') || 'null' }}
                       </div>
                     </div>
                   </div>
@@ -805,10 +792,6 @@ function openImportModal() {
   showImportModal.value = true
 }
 function closeImportModal() {
-  if (importPollTimer) {
-    window.clearTimeout(importPollTimer)
-    importPollTimer = null
-  }
   showImportModal.value = false
 }
 function openEditModal(c) {
@@ -841,21 +824,28 @@ async function submitChar() {
     .split(/[,，]/)
     .map(item => item.trim())
     .filter(Boolean)
+    
+  const payload = {
+    name: charForm.value.name,
+    role: charForm.value.role,
+    background: charForm.value.background,
+    age: charForm.value.age === '' ? null : charForm.value.age,
+    avatar_color: charForm.value.avatar_color,
+    motivation: charForm.value.motivation,
+    weakness: charForm.value.weakness,
+    speaking_style: charForm.value.speaking_style,
+    personality_tags: personalityTags
+  }
+
   if (editingChar.value) {
-    const updated = await chars.update(editingChar.value.id, {
-      ...charForm.value,
-      personality_tags: personalityTags,
-    })
+    const updated = await chars.update(editingChar.value.id, payload)
     await syncBehaviorPatterns(editingChar.value.id)
     activeChar.value = updated
     await loadObservations(editingChar.value.id)
-      await loadProfileView(editingChar.value.id)
-      await loadAiUpdateSummary(editingChar.value.id)
+    await loadProfileView(editingChar.value.id)
+    await loadAiUpdateSummary(editingChar.value.id)
   } else {
-    const created = await chars.create({
-      ...charForm.value,
-      personality_tags: personalityTags,
-    })
+    const created = await chars.create(payload)
     await syncBehaviorPatterns(created.id)
     selectChar(created)
   }
@@ -965,26 +955,20 @@ async function handleImportFileChange(e) {
   importNotice.value = ''
   importPreviewPending.value = false
 }
-async function refreshPreviewStatus() {
-  await pollPreviewStatus(importTaskId.value, false)
-}
-async function pollPreviewStatus(taskId, scheduleNext = false) {
+async function pollPreviewStatus(taskId) {
   if (!taskId) return
   try {
     const res = await characterApi.getImportStatus(taskId)
     const data = res.data || {}
     if (data.status === 'preview_processing') {
-      importNotice.value = `${data.progress?.message || 'AI 预览增强正在后台处理中…'} 当前已停止实时监测，请手动刷新查看结果。`
-      if (scheduleNext) {
-        importPollTimer = window.setTimeout(() => pollPreviewStatus(taskId, true), 1500)
-      }
+      importNotice.value = data.progress?.message || 'AI 预览增强正在后台处理中…'
+      importPollTimer = window.setTimeout(() => pollPreviewStatus(taskId), 1500)
       return
     }
     if (data.status === 'preview_ready') {
       importPreviewPending.value = false
       importPreview.value = data.preview_payload || importPreview.value
       importNotice.value = data.preview_warning || data.progress?.message || 'AI 预览增强完成'
-      importPollTimer = null
       return
     }
     importPreviewPending.value = false
@@ -1045,8 +1029,7 @@ async function previewImport() {
     importTaskId.value = res.data?.import_file_id || null
     if (importPreviewPending.value) {
       if (importPollTimer) window.clearTimeout(importPollTimer)
-      importPollTimer = null
-      importNotice.value = 'AI 预览增强已转为后台处理，已停止实时监测；如需查看增强结果，请点击“手动刷新 AI 结果”。'
+      importPollTimer = window.setTimeout(() => pollPreviewStatus(importTaskId.value), 600)
     }
   } catch (err) {
     importPreview.value = null

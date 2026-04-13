@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -73,7 +74,7 @@ async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_char
         speaking_style="",
     )
     db.add(char)
-    db.commit()
+    db.flush()
     db.refresh(char)
     try:
         profile = await orchestrator.generate_character_profile(
@@ -86,7 +87,7 @@ async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_char
         char.weakness = profile.get("weakness", "") or char.weakness
         char.motivation = profile.get("motivation", "") or char.motivation
         char.speaking_style = profile.get("speaking_style", "") or char.speaking_style
-        db.commit()
+        db.flush()
         db.refresh(char)
     except Exception:
         pass
@@ -191,7 +192,7 @@ def _normalize_core_traits(value: Any) -> dict[str, Any]:
             source = {}
     else:
         source = {}
-    return source
+    return {key: source.get(key, None) for key in BIG_FIVE_KEYS}
 
 
 def _build_observation_reason(
@@ -470,76 +471,8 @@ def _build_ai_update_log(observations: list[CharacterObservation]) -> dict[str, 
     }
 
 
-def _normalize_profile_payload_map(profile_payload: Any) -> dict[str, dict[str, Any]]:
-    if isinstance(profile_payload, dict):
-        return {
-            str(key).strip(): value
-            for key, value in profile_payload.items()
-            if str(key).strip() and isinstance(value, dict)
-        }
-    if isinstance(profile_payload, list):
-        normalized = {}
-        for item in profile_payload:
-            if not isinstance(item, dict):
-                continue
-            name = (item.get("character_name") or "").strip()
-            if name:
-                normalized[name] = item
-        return normalized
-    return {}
-
-
-def _build_fast_import_analysis(unit: dict[str, Any]) -> dict[str, Any]:
-    intent = ((unit.get("intent") or {}).get("value") or "").strip()
-    strategy = ((unit.get("strategy") or {}).get("value") or "").strip()
-    emotion = ((unit.get("emotion") or {}).get("value") or "").strip()
-    receiver = (unit.get("receiver") or "").strip() or "相关对象"
-    content = (unit.get("content") or "").strip()
-    tendency = strategy or intent or "继续观察"
-    summary_parts = [part for part in [f"目标:{intent}" if intent else "", f"策略:{strategy}" if strategy else "", f"情绪:{emotion}" if emotion else ""] if part]
-    return {
-        "inner_monologue": f"第一反应：围绕{receiver}调整应对\n防御反应：基于当前内容保持谨慎\n行为倾向：{tendency or '继续互动'}",
-        "emotion_attribution": f"试图激发:{emotion or '未知'}｜表层:{emotion or '未知'}｜深层:待补充｜压抑:待补充",
-        "strategy_explanation": " / ".join(summary_parts) if summary_parts else (content[:120] or "导入规则分析"),
-        "behavior_tendency": tendency or "继续观察",
-        "analysis_tags": "|".join([part for part in [intent, strategy, emotion] if part]) or "导入规则",
-    }
-
-
-def _should_run_deep_import_analysis(index: int, total_units: int, unit: dict[str, Any]) -> bool:
-    if index <= 6:
-        return True
-    if total_units <= 12:
-        return True
-    if not (unit.get("psychological_label") or "").strip():
-        return True
-    if _safe_float(unit.get("receiver_confidence"), 0.0) < 0.6:
-        return True
-    interaction_type = ((unit.get("interaction_type") or {}).get("value") or "").strip()
-    emotion = ((unit.get("emotion") or {}).get("value") or "").strip()
-    return interaction_type in {"conflict", "对抗"} or emotion in {"愤怒", "警惕", "防御", "怀疑"}
-
-
-async def _ensure_strong_character_profiles(preview: dict[str, Any], import_file_id: int) -> tuple[dict[str, Any], str]:
-    profile_map = _normalize_profile_payload_map(preview.get("character_profiles"))
-    if profile_map and preview.get("profile_generation_mode") == "strong_ai":
-        return preview, ""
-    try:
-        result = await orchestrator.synthesize_import_profiles(preview)
-        ai_profiles = _normalize_profile_payload_map((result or {}).get("character_profiles"))
-        if ai_profiles:
-            updated_preview = dict(preview or {})
-            updated_preview["character_profiles"] = ai_profiles
-            updated_preview["profile_generation_mode"] = "strong_ai"
-            return updated_preview, ""
-    except Exception as exc:
-        import_logger.warning("角色档案强建模失败 import_file_id=%s error=%s", import_file_id, exc)
-        return preview, f"角色档案强建模失败，已保留轻量档案。原因：{exc}"
-    return preview, "角色档案强建模未返回有效结果，已保留轻量档案。"
-
-
 def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_chars: dict[str, Character]) -> int:
-    profile_payload = _normalize_profile_payload_map(preview.get("character_profiles"))
+    profile_payload = preview.get("character_profiles") or {}
     total_changes = 0
     for original_name, char in resolved_chars.items():
         profile = profile_payload.get(original_name) or {}
@@ -548,35 +481,27 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
         personality_model = profile.get("personality_model") or {}
         speaking_style = profile.get("speaking_style") or {}
 
-        basic_field_map = {
-            "role": basic_info.get("identity"),
-            "background": basic_info.get("background"),
-        }
-        for field, new_value in basic_field_map.items():
+        for field in ("role", "background"):
+            new_value = basic_info.get(field)
             old_value = getattr(char, field, "")
-            if new_value and str(new_value).strip() and new_value != old_value:
-                setattr(char, field, str(new_value).strip())
+            if new_value and new_value != old_value:
+                setattr(char, field, new_value)
                 _create_change_observation(
                     db,
                     char.id,
                     field,
                     old_value,
-                    str(new_value).strip(),
+                    new_value,
                     "导入文本",
                     f"{field} 已由导入档案补全",
-                    _safe_float(basic_info.get("certainty"), 0.78),
+                    0.78,
                     "基础信息",
                     _infer_change_type(old_value, new_value, prefer_override=True),
                 )
                 changed = True
                 total_changes += 1
 
-        trait_names = [
-            (item.get("name") or "").strip()
-            for item in (personality_model.get("traits") or [])
-            if isinstance(item, dict) and (item.get("name") or "").strip()
-        ]
-        new_tags = _normalize_tag_list((basic_info.get("tags") or []) + trait_names)
+        new_tags = _normalize_tag_list(personality_model.get("tags"))
         merged_tags = list(char.personality_tags or [])
         for tag in new_tags:
             if tag and tag not in merged_tags:
@@ -598,60 +523,41 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
             changed = True
             total_changes += 1
 
-        trait_intensity_map = {
-            (item.get("name") or "").strip(): _safe_float(item.get("intensity"), 0.0)
-            for item in (personality_model.get("traits") or [])
-            if isinstance(item, dict) and (item.get("name") or "").strip()
+        new_core_traits = {
+            key: value
+            for key, value in _normalize_core_traits(personality_model.get("core_traits")).items()
+            if value is not None
         }
         merged_core_traits = dict(char.core_traits or {})
-        if trait_intensity_map and trait_intensity_map != dict(char.core_traits or {}):
+        for key, value in new_core_traits.items():
+            merged_core_traits[key] = value
+        if merged_core_traits != dict(char.core_traits or {}):
             _create_change_observation(
                 db,
                 char.id,
                 "core_traits",
                 dict(char.core_traits or {}),
-                trait_intensity_map,
+                merged_core_traits,
                 "导入文本",
                 "导入文本补全了人格模型量化结构",
                 0.74,
                 "人格模型",
-                _infer_change_type(char.core_traits, trait_intensity_map),
+                _infer_change_type(char.core_traits, merged_core_traits),
             )
-            char.core_traits = trait_intensity_map
+            char.core_traits = merged_core_traits
             changed = True
             total_changes += 1
 
-        motivation_value = " / ".join(
-            [
-                (item.get("motivation") or "").strip()
-                for item in (profile.get("core_motivation") or [])
-                if isinstance(item, dict) and (item.get("motivation") or "").strip()
-            ][:3]
-        )
-        weakness_value = " / ".join(
-            [
-                (item.get("weakness") or "").strip()
-                for item in (profile.get("core_weakness") or [])
-                if isinstance(item, dict) and (item.get("weakness") or "").strip()
-            ][:3]
-        )
-        speech_value = " / ".join(
-            [
-                *[item for item in (speaking_style.get("tone") or []) if item],
-                *[item for item in (speaking_style.get("structure") or []) if item],
-                *[item for item in (speaking_style.get("features") or []) if item],
-            ][:6]
-        )
         profile_fields = [
-            ("motivation", motivation_value, "核心动机"),
-            ("weakness", weakness_value, "核心弱点"),
-            ("speaking_style", speech_value, "说话风格"),
+            ("motivation", profile.get("core_motivation"), "核心动机"),
+            ("weakness", profile.get("core_weakness"), "核心弱点"),
+            ("speaking_style", speaking_style.get("summary"), "说话风格"),
         ]
         for field, new_value, module in profile_fields:
             old_value = getattr(char, field, "")
             if new_value and new_value != old_value:
                 setattr(char, field, new_value)
-                evidence = " / ".join(speaking_style.get("examples") or []) if field == "speaking_style" else f"{module} 已由导入解析补全"
+                evidence = speaking_style.get("summary") if field == "speaking_style" else f"{module} 已由导入解析补全"
                 _create_change_observation(
                     db,
                     char.id,
@@ -667,35 +573,34 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
                 changed = True
                 total_changes += 1
 
-        for item in (profile.get("behavior_patterns") or []):
-            if not isinstance(item, dict):
-                continue
-            label = (item.get("pattern") or "").strip()
-            if not label:
-                continue
-            if db.query(CharacterObservation).filter(
-                CharacterObservation.character_id == char.id,
-                CharacterObservation.field == "behavior_pattern",
-                CharacterObservation.new_value == label,
-            ).first():
-                continue
-            _create_change_observation(
-                db,
-                char.id,
-                "behavior_pattern",
-                "",
-                label,
-                "导入文本",
-                (item.get("goal") or "").strip() or "导入文本识别出的稳定行为模式",
-                _safe_float(item.get("confidence"), 0.8),
-                "行为模式",
-                "新增",
-                category=(item.get("category") or "").strip(),
-                trigger=(item.get("trigger") or "").strip(),
-                example=f"出现频次：{int(item.get('frequency') or 0)}",
-            )
-            changed = True
-            total_changes += 1
+        for category, items in (profile.get("behavior_patterns") or {}).items():
+            for item in items or []:
+                label = (item.get("label") or "").strip()
+                if not label:
+                    continue
+                if db.query(CharacterObservation).filter(
+                    CharacterObservation.character_id == char.id,
+                    CharacterObservation.field == "behavior_pattern",
+                    CharacterObservation.new_value == label,
+                ).first():
+                    continue
+                _create_change_observation(
+                    db,
+                    char.id,
+                    "behavior_pattern",
+                    "",
+                    label,
+                    item.get("source") or "导入文本",
+                    item.get("evidence") or item.get("example") or "导入文本识别出的稳定行为模式",
+                    _safe_float(item.get("confidence"), 0.8),
+                    "行为模式",
+                    "新增",
+                    category=category,
+                    trigger=item.get("trigger") or "",
+                    example=item.get("example") or "",
+                )
+                changed = True
+                total_changes += 1
 
         if changed:
             char.version += 1
@@ -716,13 +621,7 @@ async def _enhance_import_preview(import_file_id: int, filename: str, content_te
             for char in db.query(Character).all()
         ]
         import_logger.info("导入预览 AI 增强开始 import_file_id=%s filename=%s", import_file_id, filename)
-        preview = await build_import_preview(
-            filename,
-            content_text,
-            existing_characters,
-            enable_ai=True,
-            include_character_profiles=False,
-        )
+        preview = await build_import_preview(filename, content_text, existing_characters, enable_ai=True)
         import_file.summary = (preview.get("plot_summary", {}) or {}).get("main_conflict", import_file.summary)
         warning_message = (preview.get("warning_message") or "").strip()
         progress_message = warning_message or "AI 预览增强完成"
@@ -917,6 +816,7 @@ def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]
 def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: dict[str, Character], import_file_id: int) -> tuple[int, dict[tuple[str, int], int]]:
     created_events = 0
     source_event_map: dict[tuple[str, int], int] = {}
+    created_records: list[tuple[Character, dict[str, Any]]] = []
     for draft in _build_timeline_event_drafts(preview):
         for actor_name in draft.get("actors", []):
             actor = resolved_chars.get(actor_name)
@@ -932,6 +832,8 @@ def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: 
             )
             db.add(event)
             db.flush()
+            db.refresh(event)
+            created_records.append((actor, draft))
             created_events += 1
             for source_index in draft.get("source_indexes", []):
                 key = (actor.name, int(source_index))
@@ -949,8 +851,57 @@ def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: 
                 "新增",
                 example=draft.get("description", "")[:120],
             )
+    db.commit()
     import_logger.info("导入事件创建完成 import_file_id=%s created_events=%s", import_file_id, created_events)
     return created_events, source_event_map
+
+
+async def _rebuild_import_analyses(preview: dict[str, Any], resolved_chars: dict[str, Character], concurrency: int = 3) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    analyses: dict[int, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+
+    async def _analyze(index: int, unit: dict[str, Any]) -> None:
+        speaker_name = (unit.get("speaker") or "").strip()
+        if not speaker_name or speaker_name not in resolved_chars:
+            return
+        speaker_char = resolved_chars[speaker_name]
+        receiver_name = (unit.get("receiver") or "").strip()
+        resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
+        context_payload = {
+            "speaker_profile": {
+                "name": speaker_char.name,
+                "role": speaker_char.role or "",
+                "personality_tags": speaker_char.personality_tags or [],
+                "motivation": speaker_char.motivation or "",
+                "weakness": speaker_char.weakness or "",
+                "speaking_style": speaker_char.speaking_style or "",
+            },
+            "receiver_profile": {
+                "name": resolved_receiver.name if resolved_receiver else receiver_name,
+                "role": resolved_receiver.role if resolved_receiver else "",
+                "personality_tags": resolved_receiver.personality_tags if resolved_receiver else [],
+                "motivation": resolved_receiver.motivation if resolved_receiver else "",
+                "weakness": resolved_receiver.weakness if resolved_receiver else "",
+                "speaking_style": resolved_receiver.speaking_style if resolved_receiver else "",
+            },
+            "relationship": {
+                "description": "",
+                "strength": 0.2,
+                "sentiment": 0.0,
+            },
+        }
+        try:
+            async with semaphore:
+                analyses[index] = await orchestrator.rebuild_import_analysis(unit, context_payload)
+        except Exception as exc:
+            failures.append({"index": index, "error": str(exc)})
+
+    await asyncio.gather(*[
+        _analyze(index, unit)
+        for index, unit in enumerate(preview.get("interaction_units", []), start=1)
+    ])
+    return analyses, failures
 
 
 def _cleanup_legacy_import_artifacts(db: Session, resolved_chars: dict[str, Character]) -> None:
@@ -1013,7 +964,7 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 source_import_file_id=import_file.id,
             )
             db.add(conversation)
-            db.commit()
+            db.flush()
             db.refresh(conversation)
 
         _cleanup_legacy_import_artifacts(db, resolved_chars)
@@ -1024,29 +975,16 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
             "后台正在写入角色、事件、关系与分析层，请稍候…",
             review_summary=review_summary,
         )
-        preview, profile_warning = await _ensure_strong_character_profiles(preview, import_file.id)
-        if profile_warning:
-            review_summary = f"{review_summary}｜{profile_warning}".strip("｜")
         profile_change_count = _apply_character_profiles(db, preview, resolved_chars)
         created_events, source_event_map = _create_import_events(db, preview, resolved_chars, import_file.id)
-        db.commit()
 
         committed_units = 0
         created_relationships = 0
         failures = {"characters": [], "events": [], "relationships": [], "analysis": []}
-        relationship_lookup = {
-            (rel.source_id, rel.target_id): rel
-            for rel in db.query(Relationship).filter(
-                Relationship.source_id.in_([char.id for char in resolved_chars.values()]),
-                Relationship.target_id.in_([char.id for char in resolved_chars.values()]),
-            ).all()
-        }
-        message_index = 0
-        if conversation:
-            message_index = db.query(Message).filter(
-                Message.conversation_id == conversation.id
-            ).count()
-        total_units = len(preview.get("interaction_units", []) or [])
+        preview_messages = ((preview.get("pseudo_conversation", {}) or {}).get("messages", []))
+        analysis_map, analysis_failures = await _rebuild_import_analyses(preview, resolved_chars)
+        failures["analysis"].extend(analysis_failures)
+        next_message_index = 1
 
         for index, unit in enumerate(preview.get("interaction_units", []), start=1):
             try:
@@ -1056,162 +994,138 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 speaker_char = resolved_chars[speaker_name]
                 receiver_name = unit.get("receiver", "").strip()
                 resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
-                context_payload = {
-                    "speaker_profile": {
-                        "name": speaker_char.name,
-                        "role": speaker_char.role or "",
-                        "personality_tags": speaker_char.personality_tags or [],
-                        "motivation": speaker_char.motivation or "",
-                        "weakness": speaker_char.weakness or "",
-                        "speaking_style": speaker_char.speaking_style or "",
-                    },
-                    "receiver_profile": {
-                        "name": resolved_receiver.name if resolved_receiver else receiver_name,
-                        "role": resolved_receiver.role if resolved_receiver else "",
-                        "personality_tags": resolved_receiver.personality_tags if resolved_receiver else [],
-                        "motivation": resolved_receiver.motivation if resolved_receiver else "",
-                        "weakness": resolved_receiver.weakness if resolved_receiver else "",
-                        "speaking_style": resolved_receiver.speaking_style if resolved_receiver else "",
-                    },
-                    "relationship": {
-                        "description": "",
-                        "strength": 0.2,
-                        "sentiment": 0.0,
-                    },
-                }
-                if _should_run_deep_import_analysis(index, total_units, unit):
-                    analysis = await orchestrator.rebuild_import_analysis(unit, context_payload)
-                else:
-                    analysis = _build_fast_import_analysis(unit)
+                analysis = analysis_map.get(index)
+                if not isinstance(analysis, dict):
+                    continue
                 message_id = None
                 analysis_message_id = None
-                if conversation:
-                    message_index += 1
-                    msg = Message(
-                        conversation_id=conversation.id,
-                        role="user",
-                        message_index=message_index,
-                        character_id=speaker_char.id,
-                        character_name=speaker_char.name,
-                        receiver_id=resolved_receiver.id if resolved_receiver else None,
-                        receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                message_step = 2 if conversation else 0
+                created_relationship = False
+                with db.begin_nested():
+                    message_index = next_message_index
+                    if conversation:
+                        msg = Message(
+                            conversation_id=conversation.id,
+                            role="user",
+                            message_index=message_index,
+                            character_id=speaker_char.id,
+                            character_name=speaker_char.name,
+                            receiver_id=resolved_receiver.id if resolved_receiver else None,
+                            receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                            content=unit.get("content", ""),
+                            intent=(unit.get("intent") or {}).get("value", ""),
+                            strategy=(unit.get("strategy") or {}).get("value", ""),
+                            emotion=(unit.get("emotion") or {}).get("value", ""),
+                            source_type="import",
+                            readonly=True,
+                        )
+                        db.add(msg)
+                        db.flush()
+                        message_id = msg.id
+
+                        analysis_msg = Message(
+                            conversation_id=conversation.id,
+                            role="assistant",
+                            message_index=message_index + 1,
+                            character_name="AI分析",
+                            receiver_id=resolved_receiver.id if resolved_receiver else None,
+                            receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                            content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
+                            intent=(unit.get("intent") or {}).get("value", ""),
+                            strategy=(unit.get("strategy") or {}).get("value", ""),
+                            emotion=(unit.get("emotion") or {}).get("value", ""),
+                            inner_monologue=analysis.get("inner_monologue"),
+                            emotion_label=analysis.get("emotion_attribution"),
+                            emotion_score=0.6,
+                            subtext=analysis.get("strategy_explanation"),
+                            psychological_tag=analysis.get("analysis_tags"),
+                            source_type="import_analysis",
+                            readonly=True,
+                            parent_id=msg.id,
+                        )
+                        db.add(analysis_msg)
+                        db.flush()
+                        analysis_message_id = analysis_msg.id
+
+                    relationship_id = None
+                    if resolved_receiver:
+                        intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
+                        sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
+                        interaction_type = (unit.get("interaction_type") or {}).get("value", "")
+                        rel = db.query(Relationship).filter(
+                            Relationship.source_id == speaker_char.id,
+                            Relationship.target_id == resolved_receiver.id,
+                        ).first()
+                        if not rel:
+                            rel = Relationship(
+                                source_id=speaker_char.id,
+                                target_id=resolved_receiver.id,
+                                rel_type=_infer_rel_type(sentiment, interaction_type),
+                                strength=max(0.2, min(1.0, intent_conf)),
+                                sentiment=max(-1.0, min(1.0, sentiment)),
+                                description=analysis.get("strategy_explanation", "")[:500],
+                                history=[],
+                            )
+                            db.add(rel)
+                            db.flush()
+                            created_relationship = True
+                            _create_change_observation(
+                                db,
+                                speaker_char.id,
+                                "relationship_network",
+                                "",
+                                f"{speaker_char.name} → {resolved_receiver.name}（{rel.rel_type}）",
+                                "导入文本",
+                                unit.get("psychological_label", "") or analysis.get("strategy_explanation", "")[:160] or "导入文本识别出的关系变化",
+                                max(0.6, min(0.95, intent_conf)),
+                                "关系网络",
+                                "新增",
+                                example=(unit.get("content", "") or "")[:120],
+                            )
+                        relationship_id = rel.id
+
+                    source_line_index = int(unit.get("source_line_index", index) or index)
+                    event_id = source_event_map.get((speaker_char.name, source_line_index))
+
+                    iu = InteractionUnit(
+                        import_file_id=import_file.id,
+                        source_line_index=source_line_index,
+                        source_text_snippet=unit.get("content", "")[:500],
+                        speaker=speaker_char.name,
+                        receiver=resolved_receiver.name if resolved_receiver else receiver_name,
+                        receiver_confidence=_safe_float(unit.get("receiver_confidence"), 0.0),
+                        receiver_state=unit.get("receiver_state", "inferred"),
                         content=unit.get("content", ""),
                         intent=(unit.get("intent") or {}).get("value", ""),
+                        intent_confidence=_safe_float((unit.get("intent") or {}).get("confidence"), 0.0),
+                        intent_state=(unit.get("intent") or {}).get("state", "inferred"),
                         strategy=(unit.get("strategy") or {}).get("value", ""),
+                        strategy_confidence=_safe_float((unit.get("strategy") or {}).get("confidence"), 0.0),
+                        strategy_state=(unit.get("strategy") or {}).get("state", "inferred"),
                         emotion=(unit.get("emotion") or {}).get("value", ""),
-                        source_type="import",
-                        readonly=True,
+                        emotion_confidence=_safe_float((unit.get("emotion") or {}).get("confidence"), 0.0),
+                        emotion_state=(unit.get("emotion") or {}).get("state", "inferred"),
+                        interaction_type=(unit.get("interaction_type") or {}).get("value", ""),
+                        interaction_confidence=_safe_float((unit.get("interaction_type") or {}).get("confidence"), 0.0),
+                        interaction_state=(unit.get("interaction_type") or {}).get("state", "inferred"),
+                        psychological_label=unit.get("psychological_label", ""),
+                        context_window=(preview_messages[max(0, index - 1):index] or [{}])[0].get("context_window", []),
+                        analysis=analysis,
+                        event_payload=preview.get("events", []),
+                        relationship_payload=preview.get("relationships", []),
+                        conversation_message_id=message_id or analysis_message_id,
+                        character_event_id=event_id,
+                        relationship_id=relationship_id,
                     )
-                    db.add(msg)
+                    db.add(iu)
                     db.flush()
-                    message_id = msg.id
-
-                    message_index += 1
-                    analysis_msg = Message(
-                        conversation_id=conversation.id,
-                        role="assistant",
-                        message_index=message_index,
-                        character_name="AI分析",
-                        receiver_id=resolved_receiver.id if resolved_receiver else None,
-                        receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
-                        content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
-                        intent=(unit.get("intent") or {}).get("value", ""),
-                        strategy=(unit.get("strategy") or {}).get("value", ""),
-                        emotion=(unit.get("emotion") or {}).get("value", ""),
-                        inner_monologue=analysis.get("inner_monologue"),
-                        emotion_label=analysis.get("emotion_attribution"),
-                        emotion_score=0.6,
-                        subtext=analysis.get("strategy_explanation"),
-                        psychological_tag=analysis.get("analysis_tags"),
-                        source_type="import_analysis",
-                        readonly=True,
-                        parent_id=msg.id,
-                    )
-                    db.add(analysis_msg)
-                    db.flush()
-                    analysis_message_id = analysis_msg.id
-
-                relationship_id = None
-                if resolved_receiver:
-                    intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
-                    sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
-                    interaction_type = (unit.get("interaction_type") or {}).get("value", "")
-                    rel = relationship_lookup.get((speaker_char.id, resolved_receiver.id))
-                    if not rel:
-                        rel = Relationship(
-                            source_id=speaker_char.id,
-                            target_id=resolved_receiver.id,
-                            rel_type=_infer_rel_type(sentiment, interaction_type),
-                            strength=max(0.2, min(1.0, intent_conf)),
-                            sentiment=max(-1.0, min(1.0, sentiment)),
-                            description=analysis.get("strategy_explanation", "")[:500],
-                            history=[],
-                        )
-                        db.add(rel)
-                        db.flush()
-                        relationship_lookup[(speaker_char.id, resolved_receiver.id)] = rel
-                        created_relationships += 1
-                        _create_change_observation(
-                            db,
-                            speaker_char.id,
-                            "relationship_network",
-                            "",
-                            f"{speaker_char.name} → {resolved_receiver.name}（{rel.rel_type}）",
-                            "导入文本",
-                            unit.get("psychological_label", "") or analysis.get("strategy_explanation", "")[:160] or "导入文本识别出的关系变化",
-                            max(0.6, min(0.95, intent_conf)),
-                            "关系网络",
-                            "新增",
-                            example=(unit.get("content", "") or "")[:120],
-                        )
-                    relationship_id = rel.id
-
-                source_line_index = int(unit.get("source_line_index", index) or index)
-                event_id = source_event_map.get((speaker_char.name, source_line_index))
-
-                iu = InteractionUnit(
-                    import_file_id=import_file.id,
-                    source_line_index=source_line_index,
-                    source_text_snippet=unit.get("content", "")[:500],
-                    speaker=speaker_char.name,
-                    receiver=resolved_receiver.name if resolved_receiver else receiver_name,
-                    receiver_confidence=_safe_float(unit.get("receiver_confidence"), 0.0),
-                    receiver_state=unit.get("receiver_state", "inferred"),
-                    content=unit.get("content", ""),
-                    intent=(unit.get("intent") or {}).get("value", ""),
-                    intent_confidence=_safe_float((unit.get("intent") or {}).get("confidence"), 0.0),
-                    intent_state=(unit.get("intent") or {}).get("state", "inferred"),
-                    strategy=(unit.get("strategy") or {}).get("value", ""),
-                    strategy_confidence=_safe_float((unit.get("strategy") or {}).get("confidence"), 0.0),
-                    strategy_state=(unit.get("strategy") or {}).get("state", "inferred"),
-                    emotion=(unit.get("emotion") or {}).get("value", ""),
-                    emotion_confidence=_safe_float((unit.get("emotion") or {}).get("confidence"), 0.0),
-                    emotion_state=(unit.get("emotion") or {}).get("state", "inferred"),
-                    interaction_type=(unit.get("interaction_type") or {}).get("value", ""),
-                    interaction_confidence=_safe_float((unit.get("interaction_type") or {}).get("confidence"), 0.0),
-                    interaction_state=(unit.get("interaction_type") or {}).get("state", "inferred"),
-                    psychological_label=unit.get("psychological_label", ""),
-                    context_window=((preview.get("pseudo_conversation", {}) or {}).get("messages", [])[max(0, index - 1):index] or [{}])[0].get("context_window", []),
-                    analysis=analysis,
-                    event_payload=preview.get("events", []),
-                    relationship_payload=preview.get("relationships", []),
-                    conversation_message_id=message_id or analysis_message_id,
-                    character_event_id=event_id,
-                    relationship_id=relationship_id,
-                )
-                db.add(iu)
                 committed_units += 1
+                if created_relationship:
+                    created_relationships += 1
+                next_message_index += message_step
             except Exception as exc:
                 failures["analysis"].append({"index": index, "error": str(exc)})
                 import_logger.exception("导入交互写入失败 import_file_id=%s index=%s", import_file.id, index)
-                db.rollback()
-                relationship_lookup = {
-                    (rel.source_id, rel.target_id): rel
-                    for rel in db.query(Relationship).filter(
-                        Relationship.source_id.in_([char.id for char in resolved_chars.values()]),
-                        Relationship.target_id.in_([char.id for char in resolved_chars.values()]),
-                    ).all()
-                }
 
         db.commit()
 
@@ -1230,7 +1144,6 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 "profile_changes": profile_change_count,
                 "failures": failures,
                 "plot_summary": preview.get("plot_summary", {}),
-                "profile_generation_mode": preview.get("profile_generation_mode", ""),
             },
             role_count=len(resolved_chars),
             interaction_count=committed_units,
@@ -1241,7 +1154,6 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
             plot_summary=preview.get("plot_summary", {}),
             pseudo_conversation=preview.get("pseudo_conversation", {}),
             character_profiles=preview.get("character_profiles", {}),
-            profile_generation_mode=preview.get("profile_generation_mode", ""),
             completed_at=datetime.utcnow().isoformat(),
         )
         import_logger.info(
@@ -1374,13 +1286,7 @@ async def preview_import(background_tasks: BackgroundTasks, file: UploadFile = F
             {"id": char.id, "name": char.name, "role": char.role or ""}
             for char in db.query(Character).all()
         ]
-        preview = await build_import_preview(
-            file.filename or "unknown.txt",
-            content_text,
-            existing_characters,
-            enable_ai=False,
-            include_character_profiles=False,
-        )
+        preview = await build_import_preview(file.filename or "unknown.txt", content_text, existing_characters, enable_ai=False)
         preview_status = "preview_ready" if preview.get("detected_type") == "structured" else "preview_processing"
         import_file = ImportFile(
             filename=file.filename or "unknown.txt",

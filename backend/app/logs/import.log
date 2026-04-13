@@ -184,3 +184,121 @@
 2026-04-11 00:00:32 | INFO | import | 导入预览 AI 增强开始 import_file_id=10 filename=tes22t.txt
 2026-04-11 00:03:06 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
 2026-04-11 00:03:06 | INFO | import | 导入预览 AI 增强完成 import_file_id=10
+2026-04-11 00:20:04 | INFO | import | 导入预览 AI 增强开始 import_file_id=11 filename=tes22t.txt
+2026-04-11 00:20:41 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:20:41 | INFO | import | 导入预览 AI 增强完成 import_file_id=11
+2026-04-11 00:21:55 | INFO | import | 导入预览 AI 增强开始 import_file_id=12 filename=tes22t.txt
+2026-04-11 00:22:36 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:22:36 | INFO | import | 导入预览 AI 增强完成 import_file_id=12
+2026-04-11 00:29:54 | INFO | import | 导入预览 AI 增强开始 import_file_id=13 filename=tes22t.txt
+2026-04-11 00:30:27 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:30:27 | INFO | import | 导入预览 AI 增强完成 import_file_id=13
+2026-04-11 00:36:08 | INFO | import | 导入预览 AI 增强开始 import_file_id=14 filename=tes22t.txt
+2026-04-11 00:36:42 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:36:42 | INFO | import | 导入预览 AI 增强完成 import_file_id=14
+2026-04-11 00:45:36 | INFO | import | 导入预览 AI 增强开始 import_file_id=15 filename=tes22t.txt
+2026-04-11 00:46:13 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:46:13 | INFO | import | 导入预览 AI 增强完成 import_file_id=15
+2026-04-11 00:54:06 | INFO | import | 导入预览 AI 增强开始 import_file_id=16 filename=tes22t.txt
+2026-04-11 00:54:39 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 00:54:39 | INFO | import | 导入预览 AI 增强完成 import_file_id=16
+2026-04-11 01:00:55 | INFO | import | 导入预览 AI 增强开始 import_file_id=1 filename=tes22t.txt
+2026-04-11 01:01:32 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 01:01:32 | INFO | import | 导入预览 AI 增强完成 import_file_id=1
+2026-04-11 01:07:07 | INFO | import | 导入预览 AI 增强开始 import_file_id=2 filename=tes22t.txt
+2026-04-11 01:07:39 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 01:07:39 | INFO | import | 导入预览 AI 增强完成 import_file_id=2
+2026-04-11 01:08:43 | INFO | import | 导入预览 AI 增强开始 import_file_id=3 filename=tes22t.txt
+2026-04-11 01:10:17 | WARNING | import | AI 输出校验失败 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1 error=无法解析 JSON 输出: {
+    "characters": [
+        {
+            "name": "马可",
+            "role": "飞行员/赏金猎人",
+            "background": "驾驶红色飞行艇，与空贼对抗，被意大利空军追捕",
+            "personality_tags": ["勇敢", "固执"],
+            
+2026-04-11 01:13:02 | WARNING | import | AI 输出校验失败 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1 error=无法解析 JSON 输出: {
+    "characters": [
+        {
+            "name": "马可",
+            "role": "飞行员，前意大利空军王牌，绰号“红猪”",
+            "background": "曾为意大利空军王牌飞行员，现为赏金猎人，驾驶飞行艇，被意大利空军追捕",
+            "personality_tags": ["沉
+2026-04-11 01:37:34 | INFO | import | 导入预览构建完成 mode=quick detected_type=narrative base_ms=0.13 structure_ai_ms=0 profile_ai_ms=0 finalize_ms=0.09 total_ms=0.63
+2026-04-11 01:37:34 | INFO | import | 导入预览完成 import_file_id=4 mode=quick status=preview_ready total_ms=27.41
+2026-04-11 01:37:55 | INFO | import | 导入任务已排队 import_file_id=4 filename=tes22t.txt
+2026-04-11 01:37:55 | INFO | import | 导入任务开始 import_file_id=4 filename=tes22t.txt
+2026-04-11 01:38:10 | INFO | import | AI 调用成功 task=import_commit_review provider=deepseek model=deepseek-chat attempt=1
+2026-04-11 01:38:10 | INFO | import | 导入AI角色档案生成开始 tier=light score=3.47 chars=1 units=0 events=1 timeout=75
+2026-04-11 01:38:10 | WARNING | import | 正式导入前角色档案增强降级 import_file_id=4 warning=角色档案 AI 增强失败，已回退到基础档案生成。原因：'\n    "character_name"'
+2026-04-11 01:38:10 | INFO | import | 清理旧导入遗留数据 char_ids=[1] legacy_events=0 legacy_observations=0
+2026-04-11 01:38:10 | INFO | import | 导入事件创建完成 import_file_id=4 created_events=0
+2026-04-11 01:38:10 | INFO | import | 导入任务完成 import_file_id=4 chars=1 units=0 events=0 rels=0 ai_rebuild=0 fallback=0 total_ms=14834.18
+2026-04-11 01:39:12 | INFO | import | 导入预览构建完成 mode=quick detected_type=narrative base_ms=0.33 structure_ai_ms=0 profile_ai_ms=0 finalize_ms=0.2 total_ms=0.77
+2026-04-11 01:39:12 | INFO | import | 导入预览完成 import_file_id=5 mode=quick status=preview_ready total_ms=24.78
+2026-04-11 01:43:23 | INFO | import | 导入预览构建完成 mode=quick detected_type=narrative base_ms=0.12 structure_ai_ms=0 profile_ai_ms=0 finalize_ms=0.09 total_ms=0.34
+2026-04-11 01:43:23 | INFO | import | 导入预览完成 import_file_id=1 mode=quick status=preview_ready total_ms=23.56
+2026-04-12 13:12:04 | INFO | import | 导入预览 AI 增强开始 import_file_id=2 filename=tes22t.txt
+2026-04-12 13:15:04 | WARNING | import | 导入预览 AI 增强降级 import_file_id=2 warning=AI 解析暂时不可用，已切换为基础规则解析。原因：TimeoutError
+2026-04-12 13:32:27 | INFO | import | 导入预览 AI 增强开始 import_file_id=3 filename=tes22t.txt
+2026-04-12 13:34:27 | WARNING | import | 导入预览 AI 增强降级 import_file_id=3 warning=AI 解析超时，已自动切换为更稳定的基础规则解析结果。
+2026-04-12 13:40:29 | INFO | import | 导入任务已排队 import_file_id=3 filename=tes22t.txt
+2026-04-12 13:40:29 | INFO | import | 导入任务开始 import_file_id=3 filename=tes22t.txt
+2026-04-12 13:40:36 | INFO | import | AI 调用成功 task=import_commit_review provider=deepseek model=deepseek-chat attempt=1
+2026-04-12 13:40:36 | INFO | import | 导入事件创建完成 import_file_id=3 created_events=0
+2026-04-12 13:40:36 | INFO | import | 导入任务完成 import_file_id=3 chars=0 units=0 events=0 rels=0
+2026-04-12 14:42:22 | INFO | import | 导入预览 AI 增强开始 import_file_id=4 filename=tes22t.txt
+2026-04-12 14:42:40 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1
+2026-04-12 14:42:40 | INFO | import | 导入预览 AI 增强完成 import_file_id=4
+2026-04-12 14:43:29 | INFO | import | 导入任务已排队 import_file_id=4 filename=tes22t.txt
+2026-04-12 14:43:29 | INFO | import | 导入任务开始 import_file_id=4 filename=tes22t.txt
+2026-04-12 14:43:41 | INFO | import | AI 调用成功 task=import_commit_review provider=deepseek model=deepseek-chat attempt=1
+2026-04-12 14:43:41 | INFO | import | 清理旧导入遗留数据 char_ids=[1, 2] legacy_events=0 legacy_observations=0
+2026-04-12 14:43:41 | INFO | import | 导入事件创建完成 import_file_id=4 created_events=4
+2026-04-12 14:43:49 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1
+2026-04-12 14:43:49 | INFO | import | 导入任务完成 import_file_id=4 chars=2 units=1 events=4 rels=1
+2026-04-12 14:50:32 | INFO | import | AI 调用成功 task=chat_analysis provider=deepseek model=deepseek-chat attempt=1
+2026-04-12 15:24:03 | INFO | import | 导入预览 AI 增强开始 import_file_id=5 filename=tes22t.txt
+2026-04-12 15:24:41 | WARNING | import | AI 输出校验失败 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1 error=无法解析 JSON 输出: {
+    "characters": [
+        {
+            "name": "马可",
+            "role": "飞行员/主角",
+            "background": "驾驶飞行艇，与空贼对抗，被意大利空军追捕",
+            "personality_tags": ["勇敢", "固执", "沉默寡言"],
+        
+2026-04-12 15:25:22 | WARNING | import | AI 输出校验失败 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1 error=无法解析 JSON 输出: {
+    "characters": [
+        {
+            "name": "马可",
+            "role": "飞行员",
+            "background": "刚解救被绑架女学生，与空贼敌对",
+            "personality_tags": ["自信", "勇敢"],
+            "status": "c
+2026-04-12 15:25:31 | WARNING | import | 导入预览 AI 增强降级 import_file_id=5 warning=AI 解析超时，已自动切换为更稳定的基础规则解析结果。
+2026-04-12 16:19:19 | INFO | import | 导入预览 AI 增强开始 import_file_id=6 filename=tes22t.txt
+2026-04-12 16:21:08 | INFO | import | AI 调用成功 task=import_narrative_parse provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=12304
+2026-04-12 16:21:08 | INFO | import | 导入预览 AI 增强完成 import_file_id=6
+2026-04-12 16:23:48 | INFO | import | 导入任务已排队 import_file_id=6 filename=tes22t.txt
+2026-04-12 16:23:48 | INFO | import | 导入任务开始 import_file_id=6 filename=tes22t.txt
+2026-04-12 16:24:27 | INFO | import | AI 调用成功 task=import_commit_review provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=3176
+2026-04-12 16:24:27 | INFO | import | 清理旧导入遗留数据 char_ids=[1, 2, 3, 4, 5] legacy_events=0 legacy_observations=0
+2026-04-12 16:24:27 | INFO | import | 导入事件创建完成 import_file_id=6 created_events=12
+2026-04-12 16:24:36 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=447
+2026-04-12 16:24:37 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=507
+2026-04-12 16:24:39 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=583
+2026-04-12 16:24:46 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=492
+2026-04-12 16:24:49 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=609
+2026-04-12 16:24:49 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=506
+2026-04-12 16:24:56 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=516
+2026-04-12 16:25:01 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=578
+2026-04-12 16:25:03 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=689
+2026-04-12 16:25:07 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=505
+2026-04-12 16:25:11 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=514
+2026-04-12 16:25:14 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=535
+2026-04-12 16:25:20 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=653
+2026-04-12 16:25:21 | INFO | import | AI 调用成功 task=interaction_analysis_rebuild provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=480
+2026-04-12 16:25:21 | INFO | import | 导入任务完成 import_file_id=6 chars=5 units=14 events=12 rels=3
+2026-04-12 16:30:03 | INFO | import | AI 调用成功 task=chat_analysis provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=631
+2026-04-12 16:44:43 | INFO | import | AI 调用成功 task=ai_suggest_update provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=818
+2026-04-12 16:48:06 | INFO | import | AI 调用成功 task=chat_analysis provider=deepseek model=deepseek-chat attempt=1 finish_reason=stop raw_len=601
