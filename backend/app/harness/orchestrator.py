@@ -352,7 +352,9 @@ class AIOrchestrator:
                 "recent_dialogue": recent_dialogue,
             },
         )
-        # ai_suggest_update returns a list
+        if isinstance(result, dict):
+            updates = result.get("updates", [])
+            return updates if isinstance(updates, list) else []
         return result if isinstance(result, list) else []
 
     async def analyze_emotion_curve(self, character: str, messages: list[str]) -> dict:
@@ -381,6 +383,41 @@ class AIOrchestrator:
             {
                 "interaction_unit": json.dumps(interaction_unit, ensure_ascii=False),
                 "context_payload": json.dumps(context_payload, ensure_ascii=False),
+            },
+        )
+
+    async def structured_diagnosis(self, diagnosis_context: dict) -> dict:
+        return await self.call(
+            "structured_diagnosis",
+            {
+                "diagnosis_context": json.dumps(diagnosis_context, ensure_ascii=False),
+            },
+        )
+
+    async def critique_diagnosis(self, diagnosis: dict, evidence_pack: dict, profile_context: dict) -> dict:
+        return await self.call(
+            "diagnosis_critic",
+            {
+                "diagnosis": json.dumps(diagnosis, ensure_ascii=False),
+                "evidence_pack": json.dumps(evidence_pack, ensure_ascii=False),
+                "profile_context": json.dumps(profile_context, ensure_ascii=False),
+            },
+        )
+
+    async def long_context_review(self, review_corpus: dict) -> dict:
+        return await self.call(
+            "long_context_review",
+            {
+                "review_corpus": json.dumps(review_corpus, ensure_ascii=False),
+            },
+        )
+
+    async def critique_long_context_review(self, review_result: dict, review_corpus_summary: dict) -> dict:
+        return await self.call(
+            "long_context_review_critic",
+            {
+                "review_result": json.dumps(review_result, ensure_ascii=False),
+                "review_corpus_summary": json.dumps(review_corpus_summary, ensure_ascii=False),
             },
         )
 

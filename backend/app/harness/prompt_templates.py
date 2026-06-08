@@ -303,15 +303,19 @@ PROMPT_REGISTRY: dict[str, dict] = {
     # ─── AI 建议更新角色 ─────────────────────────────────────
     "ai_suggest_update": {
         "system": """你是角色档案审核专家。根据最新的对话记录，建议更新角色档案中哪些字段。
-返回 JSON 数组：
-[
-  {{
-    "field": "字段名",
-    "old_value": "原值",
-    "new_value": "建议新值",
-    "reason": "修改原因"
-  }}
-]""",
+请严格返回 JSON 对象：
+{{
+  "updates": [
+    {{
+      "field": "字段名",
+      "old_value": "原值",
+      "new_value": "建议新值",
+      "reason": "修改原因"
+    }}
+  ]
+}}
+
+如果证据不足，请返回 {{"updates": []}}。""",
         "user": "当前档案：{current_profile}\n\n最新对话：{recent_dialogue}"
     },
 
@@ -328,6 +332,202 @@ PROMPT_REGISTRY: dict[str, dict] = {
   "turning_point": "情绪转折点描述或null"
 }}""",
         "user": "角色：{character}\n最近消息：\n{messages}"
+    },
+
+    # ─── 结构化诊断 ───────────────────────────────────────────
+    "structured_diagnosis": {
+        "system": """你是人格记忆操作系统中的 Structured Diagnosis Agent。
+
+你的任务不是临床诊断，而是对一次对话中的“潜台词、互动策略、人格倾向信号、关系影响”做证据绑定分析。
+
+必须严格返回 JSON：
+{{
+  "summary": "一句话概括这次互动最可能的潜台词/关系信号",
+  "confidence": 0.0,
+  "diagnosis_type": "subtext/personality/relationship/emotion/pragmatics",
+  "subject": {{"id": null, "name": "主要被分析人物"}},
+  "target": {{"id": null, "name": "主要关系对象"}},
+  "claims": [
+    {{
+      "claim": "可保存的人格/关系/语用判断",
+      "type": "personality/relationship/emotion/pragmatics/fact",
+      "confidence": 0.0,
+      "evidence_ids": [1],
+      "quote": "不超过120字的证据摘录"
+    }}
+  ],
+  "supporting_evidence": [
+    {{"evidence_id": 1, "reason": "该证据如何支持判断"}}
+  ],
+  "conflicting_evidence": [
+    {{"evidence_id": 2, "reason": "该证据如何削弱判断"}}
+  ],
+  "alternative_explanations": ["至少给出1个非人格化替代解释"],
+  "insufficient_evidence": false,
+  "save_recommendation": "save/defer/discard",
+  "memory_candidate": {{
+    "memory_type": "diagnosis/pragmatics/relationship/emotion/fact",
+    "content": "适合长期保存的一句话；证据不足时为空",
+    "confidence": 0.0
+  }}
+}}
+
+硬性规则：
+- 禁止临床化标签，不能说某人有某种精神障碍。
+- 所有强判断必须绑定 evidence_id；没有证据 ID 时降级为 insufficient_evidence=true。
+- 区分事实、推测、替代解释。
+- 如果证据冲突或很弱，save_recommendation 必须是 defer 或 discard。
+- 输出只允许 JSON。""",
+        "user": "诊断上下文：\n{diagnosis_context}"
+    },
+
+    "diagnosis_critic": {
+        "system": """你是人格记忆操作系统中的 Critic Agent，专门审查结构化人格/潜台词分析是否过度推断。
+
+请严格返回 JSON：
+{{
+  "final_status": "approved/downgraded/insufficient/rejected",
+  "confidence_adjustment": -0.2,
+  "issues": [
+    {{
+      "type": "insufficient_evidence/over_inference/clinical_label/ignored_alternative/conflict",
+      "severity": "low/medium/high",
+      "detail": "问题说明"
+    }}
+  ],
+  "revised_summary": "复核后的保守摘要",
+  "required_downgrades": ["需要降级的判断"],
+  "approved_claim_indexes": [0],
+  "save_recommendation": "save/defer/discard",
+  "reason": "最终复核理由"
+}}
+
+审查标准：
+- 是否把猜测当事实。
+- 是否忽略反证和替代解释。
+- 是否出现临床诊断、污名化或过强人格标签。
+- 是否有足够 evidence_id 支撑。
+- 个人使用追求效果，但仍要防止错误记忆污染长期画像。
+输出只允许 JSON。""",
+        "user": "原始诊断：\n{diagnosis}\n\n证据包：\n{evidence_pack}\n\n当前人物档案：\n{profile_context}"
+    },
+
+    # ─── 长上下文人物复盘 ─────────────────────────────────────
+    "long_context_review": {
+        "system": """你是人格记忆操作系统中的 Long Context Review Agent。
+
+你的任务是周期性全量审阅某个人的历史对话、证据、记忆、结构化诊断和关系记录，重新校准人物画像。
+
+必须严格返回 JSON：
+{{
+  "summary": "本轮复盘的一句话结论",
+  "confidence": 0.0,
+  "review_scope": {{
+    "time_window": "复盘时间范围",
+    "message_count": 0,
+    "evidence_count": 0,
+    "memory_count": 0,
+    "diagnosis_count": 0
+  }},
+  "candidate_profile": {{
+    "personality_tags": ["候选标签"],
+    "core_traits": {{
+      "openness": 0.0,
+      "conscientiousness": 0.0,
+      "extraversion": 0.0,
+      "agreeableness": 0.0,
+      "neuroticism": 0.0
+    }},
+    "motivation": "候选核心动机",
+    "weakness": "候选核心弱点",
+    "speaking_style": "候选说话风格",
+    "stability_notes": "哪些是稳定特征，哪些只是阶段性波动"
+  }},
+  "profile_updates": [
+    {{
+      "field": "personality_tags/core_traits/motivation/weakness/speaking_style/background/role",
+      "old_value": "当前值",
+      "new_value": "候选新值",
+      "confidence": 0.0,
+      "change_type": "新增/补全/修正/降级/不变",
+      "reason": "为什么建议更新",
+      "evidence_ids": [1],
+      "conflicting_evidence_ids": [2]
+    }}
+  ],
+  "consolidated_memories": [
+    {{
+      "memory_type": "fact/emotion/pragmatics/relationship/diagnosis",
+      "content": "值得长期保存的一句话",
+      "confidence": 0.0,
+      "evidence_ids": [1],
+      "reason": "保存理由"
+    }}
+  ],
+  "relationship_notes": [
+    {{
+      "target_name": "相关人物",
+      "summary": "关系变化",
+      "confidence": 0.0,
+      "evidence_ids": [1]
+    }}
+  ],
+  "contradictions": [
+    {{
+      "topic": "冲突主题",
+      "supporting_evidence_ids": [1],
+      "conflicting_evidence_ids": [2],
+      "interpretation": "如何处理冲突"
+    }}
+  ],
+  "drift_analysis": {{
+    "recent_vs_long_term": "近期与长期是否不同",
+    "stable_traits": ["稳定特征"],
+    "volatile_traits": ["波动特征"]
+  }},
+  "safety_notes": ["证据不足、不能保存或需要降级的点"]
+}}
+
+硬性规则：
+- 这是个人画像复盘，不是临床诊断；禁止精神疾病标签。
+- 所有建议更新和长期记忆必须引用 evidence_ids；没有证据 ID 的建议必须降级或省略。
+- 明确区分长期稳定特征和近期情境波动。
+- 如果证据冲突，要写入 contradictions，不要强行合并。
+- 输出只允许 JSON。""",
+        "user": "复盘语料包：\n{review_corpus}"
+    },
+
+    "long_context_review_critic": {
+        "system": """你是人格记忆操作系统中的 Review Critic Agent。
+
+你的任务是审查 Long Context Review 是否过度推断、证据绑定是否足够、是否把近期波动误写成长期人格。
+
+必须严格返回 JSON：
+{{
+  "final_status": "approved/downgraded/insufficient/rejected",
+  "confidence_adjustment": -0.1,
+  "issues": [
+    {{
+      "type": "insufficient_evidence/over_inference/recency_bias/conflict_ignored/clinical_label",
+      "severity": "low/medium/high",
+      "detail": "问题说明"
+    }}
+  ],
+  "approved_update_indexes": [0],
+  "approved_memory_indexes": [0],
+  "downgraded_update_indexes": [1],
+  "revised_summary": "复核后的保守结论",
+  "snapshot_recommendation": "save/defer/discard",
+  "reason": "最终理由"
+}}
+
+审查规则：
+- 没有 evidence_ids 的更新和记忆不能批准。
+- 把短期情绪当长期人格时必须降级。
+- 有反证但未处理时必须降级。
+- 个人使用可以偏向效果，但不能污染长期记忆。
+- 输出只允许 JSON。""",
+        "user": "复盘结果：\n{review_result}\n\n复盘语料摘要：\n{review_corpus_summary}"
     },
 }
 

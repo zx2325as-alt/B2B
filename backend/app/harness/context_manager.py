@@ -76,7 +76,9 @@ class ContextManager:
 
         messages: list[dict] = []
         for m in selected:
-            messages.append({"role": m.role, "content": m.content})
+            speaker = (m.metadata or {}).get("character_name", "")
+            content = f"[{speaker}]: {m.content}" if speaker else m.content
+            messages.append({"role": m.role, "content": content})
         messages.append({"role": "user", "content": new_user_message})
 
         return messages, full_system

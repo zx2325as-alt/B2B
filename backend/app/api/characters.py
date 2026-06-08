@@ -4,24 +4,27 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from ..models.sql_models import (
     Character, CharacterEvent, Relationship, CharacterObservation,
-    Conversation, Message, ImportFile, InteractionUnit
+    Conversation, Message, ImportFile, InteractionUnit,
+    EvidenceSpan, MemoryItem, PersonalitySnapshot, AgentRun, RetrievalTrace, StructuredDiagnosis,
 )
 from ..schemas import (
     CharacterCreate, CharacterUpdate, CharacterOut,
     EventCreate, EventOut,
     RelationshipCreate, RelationshipUpdate, RelationshipOut,
     ObservationReview, ObservationOut, ImportCommitRequest, BehaviorPatternPayload,
-    MessageOut,
+    MessageOut, EvidenceSpanOut, MemoryItemOut, PersonalitySnapshotOut, StructuredDiagnosisOut,
+    CharacterReviewRequest, CharacterReviewOut,
 )
 from ..harness.orchestrator import orchestrator
 from ..harness.import_engine import extract_text_from_file, build_import_preview
+from ..harness.graph_store import graph_store
 from .deps import get_db, SessionLocal
 
 router = APIRouter(prefix="/characters", tags=["characters"])
@@ -77,6 +80,7 @@ async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_char
     db.add(char)
     db.flush()
     db.refresh(char)
+    graph_store.sync_character(char)
     try:
         profile = await orchestrator.generate_character_profile(
             char.name,
@@ -90,6 +94,7 @@ async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_char
         char.speaking_style = profile.get("speaking_style", "") or char.speaking_style
         db.flush()
         db.refresh(char)
+        graph_store.sync_character(char)
     except Exception:
         pass
     return char
@@ -117,6 +122,340 @@ def _merge_metadata(import_file: ImportFile, extra: dict[str, Any]) -> dict[str,
         else:
             metadata[key] = value
     return metadata
+
+
+def _create_evidence_span(
+    db: Session,
+    *,
+    character_id: int | None = None,
+    source_type: str = "unknown",
+    source_id: int | None = None,
+    conversation_id: int | None = None,
+    message_id: int | None = None,
+    import_file_id: int | None = None,
+    interaction_unit_id: int | None = None,
+    character_event_id: int | None = None,
+    relationship_id: int | None = None,
+    observation_id: int | None = None,
+    supports_type: str = "memory",
+    supports_id: int | None = None,
+    polarity: str = "supports",
+    quote: str = "",
+    interpretation: str = "",
+    confidence: float = 0.0,
+    metadata: dict[str, Any] | None = None,
+) -> EvidenceSpan:
+    evidence = EvidenceSpan(
+        character_id=character_id,
+        source_type=source_type,
+        source_id=source_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        import_file_id=import_file_id,
+        interaction_unit_id=interaction_unit_id,
+        character_event_id=character_event_id,
+        relationship_id=relationship_id,
+        observation_id=observation_id,
+        supports_type=supports_type,
+        supports_id=supports_id,
+        polarity=polarity,
+        quote=(quote or "")[:2000],
+        interpretation=(interpretation or "")[:2000],
+        confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+        metadata_json=metadata or {},
+    )
+    db.add(evidence)
+    db.flush()
+    graph_store.sync_evidence(evidence)
+    return evidence
+
+
+def _create_memory_item(
+    db: Session,
+    *,
+    character_id: int,
+    memory_type: str,
+    content: str,
+    confidence: float,
+    source: str,
+    evidence_ids: list[int] | None = None,
+) -> MemoryItem | None:
+    normalized = (content or "").strip()
+    if not normalized:
+        return None
+    existing = db.query(MemoryItem).filter(
+        MemoryItem.character_id == character_id,
+        MemoryItem.memory_type == memory_type,
+        MemoryItem.content == normalized,
+        MemoryItem.status == "active",
+    ).first()
+    if existing:
+        merged_ids = list(dict.fromkeys(list(existing.evidence_ids or []) + list(evidence_ids or [])))
+        existing.evidence_ids = merged_ids
+        existing.confidence = max(float(existing.confidence or 0.0), max(0.0, min(1.0, float(confidence or 0.0))))
+        existing.updated_at = datetime.utcnow()
+        db.flush()
+        graph_store.sync_memory(existing)
+        return existing
+    memory = MemoryItem(
+        character_id=character_id,
+        memory_type=memory_type,
+        content=normalized[:2000],
+        confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+        evidence_ids=list(evidence_ids or []),
+        source=source,
+        status="active",
+    )
+    db.add(memory)
+    db.flush()
+    graph_store.sync_memory(memory)
+    return memory
+
+
+def _build_snapshot_payload(char: Character) -> dict[str, Any]:
+    return {
+        "basic_info": {
+            "name": char.name,
+            "role": char.role or "",
+            "background": char.background or "",
+            "age": char.age,
+        },
+        "personality_model": {
+            "tags": char.personality_tags or [],
+            "core_traits": char.core_traits or {},
+        },
+        "core_motivation": char.motivation or "",
+        "core_weakness": char.weakness or "",
+        "speaking_style": char.speaking_style or "",
+    }
+
+
+def _create_personality_snapshot(
+    db: Session,
+    char: Character,
+    *,
+    source: str,
+    supporting_evidence: list[int] | None = None,
+    conflicting_evidence: list[int] | None = None,
+    critic_result: dict[str, Any] | None = None,
+) -> PersonalitySnapshot:
+    latest = db.query(PersonalitySnapshot).filter(
+        PersonalitySnapshot.character_id == char.id
+    ).order_by(PersonalitySnapshot.version.desc()).first()
+    snapshot = PersonalitySnapshot(
+        character_id=char.id,
+        version=(latest.version if latest else 0) + 1,
+        profile_json=_build_snapshot_payload(char),
+        supporting_evidence=list(supporting_evidence or []),
+        conflicting_evidence=list(conflicting_evidence or []),
+        critic_result=critic_result or {"status": "not_reviewed", "reason": "第二阶段证据层基础快照，尚未接入 Critic Agent。"},
+        source=source,
+    )
+    db.add(snapshot)
+    db.flush()
+    return snapshot
+
+
+def _clip_text(text: str | None, limit: int = 700) -> str:
+    return " ".join((text or "").split())[:limit]
+
+
+def _review_window_filter(query, model, window_days: int | None):
+    if not window_days:
+        return query
+    cutoff = datetime.utcnow() - timedelta(days=max(1, int(window_days)))
+    if hasattr(model, "created_at"):
+        return query.filter(model.created_at >= cutoff)
+    return query
+
+
+def _build_review_corpus(db: Session, char: Character, body: CharacterReviewRequest) -> dict[str, Any]:
+    relationships = db.query(Relationship).filter(
+        (Relationship.source_id == char.id) | (Relationship.target_id == char.id)
+    ).all()
+    events_query = db.query(CharacterEvent).filter(CharacterEvent.character_id == char.id)
+    events_query = _review_window_filter(events_query, CharacterEvent, body.window_days)
+    events = events_query.order_by(CharacterEvent.created_at.desc()).limit(80).all()
+
+    memories_query = db.query(MemoryItem).filter(
+        MemoryItem.character_id == char.id,
+        MemoryItem.status == "active",
+    )
+    memories_query = _review_window_filter(memories_query, MemoryItem, body.window_days)
+    memories = memories_query.order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(
+        min(max(body.max_memories, 1), 300)
+    ).all()
+
+    evidence_query = db.query(EvidenceSpan).filter(EvidenceSpan.character_id == char.id)
+    evidence_query = _review_window_filter(evidence_query, EvidenceSpan, body.window_days)
+    evidence = evidence_query.order_by(EvidenceSpan.created_at.desc()).limit(
+        min(max(body.max_evidence, 1), 500)
+    ).all()
+
+    diagnoses_query = db.query(StructuredDiagnosis).filter(
+        (StructuredDiagnosis.speaker_id == char.id) | (StructuredDiagnosis.listener_id == char.id)
+    )
+    diagnoses_query = _review_window_filter(diagnoses_query, StructuredDiagnosis, body.window_days)
+    diagnoses = diagnoses_query.order_by(StructuredDiagnosis.created_at.desc()).limit(
+        min(max(body.max_diagnoses, 1), 300)
+    ).all()
+
+    messages_query = db.query(Message).filter(
+        (Message.character_id == char.id)
+        | (Message.character_name == char.name)
+        | (Message.receiver_id == char.id)
+        | (Message.receiver_name == char.name)
+    )
+    messages_query = _review_window_filter(messages_query, Message, body.window_days)
+    messages = list(reversed(messages_query.order_by(Message.created_at.desc()).limit(
+        min(max(body.max_messages, 1), 800)
+    ).all()))
+
+    latest_snapshot = db.query(PersonalitySnapshot).filter(
+        PersonalitySnapshot.character_id == char.id
+    ).order_by(PersonalitySnapshot.version.desc()).first()
+    corpus = {
+        "character": _build_snapshot_payload(char),
+        "latest_snapshot": {
+            "id": latest_snapshot.id,
+            "version": latest_snapshot.version,
+            "source": latest_snapshot.source,
+            "profile_json": latest_snapshot.profile_json or {},
+            "critic_result": latest_snapshot.critic_result or {},
+        } if latest_snapshot else {},
+        "scope": {
+            "window_days": body.window_days,
+            "generated_at": datetime.utcnow().isoformat(),
+            "message_count": len(messages),
+            "evidence_count": len(evidence),
+            "memory_count": len(memories),
+            "diagnosis_count": len(diagnoses),
+            "event_count": len(events),
+            "relationship_count": len(relationships),
+        },
+        "relationships": [
+            {
+                "id": rel.id,
+                "source_id": rel.source_id,
+                "source_name": rel.source.name if rel.source else "",
+                "target_id": rel.target_id,
+                "target_name": rel.target.name if rel.target else "",
+                "rel_type": rel.rel_type,
+                "strength": rel.strength,
+                "sentiment": rel.sentiment,
+                "description": _clip_text(rel.description, 300),
+                "history_tail": (rel.history or [])[-5:],
+            }
+            for rel in relationships
+        ],
+        "events": [
+            {
+                "id": event.id,
+                "title": event.title,
+                "description": _clip_text(event.description, 500),
+                "event_date": event.event_date or "",
+                "emotion_label": event.emotion_label or "",
+                "importance": event.importance,
+            }
+            for event in events
+        ],
+        "memories": [
+            {
+                "id": memory.id,
+                "memory_type": memory.memory_type,
+                "content": _clip_text(memory.content, 500),
+                "confidence": memory.confidence,
+                "evidence_ids": memory.evidence_ids or [],
+                "source": memory.source,
+            }
+            for memory in memories
+        ],
+        "evidence": [
+            {
+                "id": item.id,
+                "source_type": item.source_type,
+                "supports_type": item.supports_type,
+                "polarity": item.polarity,
+                "quote": _clip_text(item.quote, 500),
+                "interpretation": _clip_text(item.interpretation, 500),
+                "confidence": item.confidence,
+                "created_at": item.created_at.isoformat() if item.created_at else "",
+            }
+            for item in evidence
+        ],
+        "diagnoses": [
+            {
+                "id": report.id,
+                "diagnosis_type": report.diagnosis_type,
+                "status": report.status,
+                "confidence": report.confidence,
+                "summary": _clip_text((report.critic_json or {}).get("revised_summary") or (report.result_json or {}).get("summary"), 500),
+                "evidence_ids": report.evidence_ids or [],
+                "conflicting_evidence_ids": report.conflicting_evidence_ids or [],
+                "created_at": report.created_at.isoformat() if report.created_at else "",
+            }
+            for report in diagnoses
+        ],
+        "messages": [
+            {
+                "id": message.id,
+                "conversation_id": message.conversation_id,
+                "role": message.role,
+                "speaker": message.character_name or "",
+                "receiver": message.receiver_name or "",
+                "content": _clip_text(message.content, 700),
+                "intent": message.intent or "",
+                "strategy": message.strategy or "",
+                "emotion": message.emotion or "",
+                "subtext": _clip_text(message.subtext, 500),
+                "psychological_tag": message.psychological_tag or "",
+                "created_at": message.created_at.isoformat() if message.created_at else "",
+            }
+            for message in messages
+        ],
+    }
+    return corpus
+
+
+def _review_corpus_summary(corpus: dict[str, Any]) -> dict[str, Any]:
+    scope = corpus.get("scope") or {}
+    return {
+        "character": (corpus.get("character") or {}).get("basic_info", {}),
+        "scope": scope,
+        "top_evidence_ids": [item.get("id") for item in (corpus.get("evidence") or [])[:30]],
+        "top_memory_ids": [item.get("id") for item in (corpus.get("memories") or [])[:30]],
+        "diagnosis_status_counts": {
+            status: len([item for item in corpus.get("diagnoses", []) if item.get("status") == status])
+            for status in ["approved", "downgraded", "insufficient", "rejected"]
+        },
+    }
+
+
+def _approved_indexes(values: Any, fallback_len: int) -> set[int]:
+    if isinstance(values, list):
+        indexes = set()
+        for value in values:
+            try:
+                indexes.add(int(value))
+            except Exception:
+                continue
+        return indexes
+    return set(range(fallback_len))
+
+
+def _evidence_ids_from_review(items: list[dict[str, Any]]) -> list[int]:
+    ids: list[int] = []
+    for item in items or []:
+        values = []
+        values.extend(item.get("evidence_ids") or [])
+        values.extend(item.get("supporting_evidence_ids") or [])
+        values.extend(item.get("conflicting_evidence_ids") or [])
+        for value in values:
+            try:
+                ids.append(int(value))
+            except Exception:
+                continue
+    return list(dict.fromkeys(ids))
 
 
 def _update_import_status(db: Session, import_file: ImportFile, status: str, message: str, **extra: Any) -> None:
@@ -331,6 +670,44 @@ def _create_change_observation(
         reviewed_at=datetime.utcnow() if status == "approved" else None,
     )
     db.add(observation)
+    db.flush()
+    evidence_span = _create_evidence_span(
+        db,
+        character_id=char_id,
+        source_type=source,
+        source_id=observation.id,
+        observation_id=observation.id,
+        supports_type=field,
+        supports_id=observation.id,
+        quote=example or evidence or normalized_new_value,
+        interpretation=f"{module} / {change_type}：{normalized_new_value}",
+        confidence=confidence,
+        metadata={
+            "module": module,
+            "field": field,
+            "category": category,
+            "trigger": trigger,
+        },
+    )
+    memory_type = {
+        "personality_tags": "diagnosis",
+        "core_traits": "diagnosis",
+        "motivation": "fact",
+        "weakness": "emotion",
+        "speaking_style": "pragmatics",
+        "behavior_pattern": "pragmatics",
+        "relationship_network": "relationship",
+        "event_timeline": "fact",
+    }.get(field, "fact")
+    _create_memory_item(
+        db,
+        character_id=char_id,
+        memory_type=memory_type,
+        content=normalized_new_value,
+        confidence=confidence,
+        source=source,
+        evidence_ids=[evidence_span.id],
+    )
     return observation
 
 
@@ -607,6 +984,20 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
             char.version += 1
             char.updated_at = datetime.utcnow()
             db.add(char)
+            db.flush()
+            graph_store.sync_character(char)
+            supporting_evidence = [
+                item.id for item in db.query(EvidenceSpan).filter(
+                    EvidenceSpan.character_id == char.id,
+                    EvidenceSpan.source_type.in_(["导入文本", "AI导入解析"]),
+                ).order_by(EvidenceSpan.created_at.desc()).limit(20).all()
+            ]
+            _create_personality_snapshot(
+                db,
+                char,
+                source="导入文本",
+                supporting_evidence=supporting_evidence,
+            )
     db.commit()
     return total_changes
 
@@ -835,6 +1226,7 @@ def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: 
             db.add(event)
             db.flush()
             db.refresh(event)
+            graph_store.sync_event(event, actor)
             created_records.append((actor, draft))
             created_events += 1
             for source_index in draft.get("source_indexes", []):
@@ -943,11 +1335,24 @@ def _cleanup_legacy_import_artifacts(db: Session, resolved_chars: dict[str, Char
 
 async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -> None:
     db = SessionLocal()
+    agent_run = None
     try:
         body = ImportCommitRequest.model_validate(payload)
         import_file = db.get(ImportFile, import_file_id)
         if not import_file:
             return
+        agent_run = AgentRun(
+            workflow_name="import_commit",
+            input_hash=f"import:{import_file_id}:{import_file.version}",
+            status="running",
+            model_used=import_file.model_used or "ai-harness",
+            trace_json={
+                "filename": import_file.filename,
+                "stage": "start",
+            },
+        )
+        db.add(agent_run)
+        db.commit()
         preview = dict(body.preview_payload or {})
         role_mappings = list(body.role_mappings or [])
 
@@ -1076,6 +1481,7 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                             )
                             db.add(rel)
                             db.flush()
+                            graph_store.sync_relationship(rel, speaker_char, resolved_receiver)
                             created_relationship = True
                             _create_change_observation(
                                 db,
@@ -1091,6 +1497,7 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                                 example=(unit.get("content", "") or "")[:120],
                             )
                         relationship_id = rel.id
+                        graph_store.sync_relationship(rel, speaker_char, resolved_receiver)
 
                     source_line_index = int(unit.get("source_line_index", index) or index)
                     event_id = source_event_map.get((speaker_char.name, source_line_index))
@@ -1127,6 +1534,51 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                     )
                     db.add(iu)
                     db.flush()
+                    quote = unit.get("content", "") or unit.get("psychological_label", "")
+                    evidence = _create_evidence_span(
+                        db,
+                        character_id=speaker_char.id,
+                        source_type="import",
+                        source_id=import_file.id,
+                        conversation_id=conversation.id if conversation else None,
+                        message_id=message_id,
+                        import_file_id=import_file.id,
+                        interaction_unit_id=iu.id,
+                        character_event_id=event_id,
+                        relationship_id=relationship_id,
+                        supports_type="interaction",
+                        supports_id=iu.id,
+                        quote=quote,
+                        interpretation=unit.get("psychological_label", "") or analysis.get("strategy_explanation", ""),
+                        confidence=max(
+                            _safe_float(unit.get("receiver_confidence"), 0.0),
+                            _safe_float((unit.get("intent") or {}).get("confidence"), 0.0),
+                            _safe_float((unit.get("strategy") or {}).get("confidence"), 0.0),
+                            _safe_float((unit.get("emotion") or {}).get("confidence"), 0.0),
+                        ),
+                        metadata={
+                            "source_line_index": source_line_index,
+                            "receiver": receiver_name,
+                            "analysis": analysis,
+                        },
+                    )
+                    for memory_type, field_name in [
+                        ("fact", "intent"),
+                        ("pragmatics", "strategy"),
+                        ("emotion", "emotion"),
+                    ]:
+                        payload_value = unit.get(field_name) or {}
+                        value = (payload_value.get("value") or "").strip()
+                        if value:
+                            _create_memory_item(
+                                db,
+                                character_id=speaker_char.id,
+                                memory_type=memory_type,
+                                content=value,
+                                confidence=_safe_float(payload_value.get("confidence"), evidence.confidence),
+                                source="导入文本",
+                                evidence_ids=[evidence.id],
+                            )
                 committed_units += 1
                 if created_relationship:
                     created_relationships += 1
@@ -1138,6 +1590,18 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
         db.commit()
 
         import_file.summary = (preview.get("plot_summary", {}) or {}).get("main_conflict", import_file.summary)
+        if agent_run:
+            agent_run.status = "completed"
+            agent_run.trace_json = {
+                **(agent_run.trace_json or {}),
+                "stage": "completed",
+                "committed_units": committed_units,
+                "created_events": created_events,
+                "created_relationships": created_relationships,
+                "profile_changes": profile_change_count,
+                "failures": failures,
+            }
+            agent_run.updated_at = datetime.utcnow()
         _update_import_status(
             db,
             import_file,
@@ -1175,6 +1639,15 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
     except Exception as exc:
         import_logger.exception("导入任务失败 import_file_id=%s error=%s", import_file_id, exc)
         db.rollback()
+        if agent_run:
+            try:
+                agent_run.status = "failed"
+                agent_run.trace_json = {**(agent_run.trace_json or {}), "stage": "failed", "error": str(exc)}
+                agent_run.updated_at = datetime.utcnow()
+                db.add(agent_run)
+                db.commit()
+            except Exception:
+                db.rollback()
         import_file = db.get(ImportFile, import_file_id)
         if import_file:
             _update_import_status(
@@ -1203,18 +1676,73 @@ async def create_character(body: CharacterCreate, db: Session = Depends(get_db))
     db.add(char)
     db.commit()
     db.refresh(char)
+    graph_store.sync_character(char)
     # 自动生成 AI 心理档案
     try:
         profile = await orchestrator.generate_character_profile(
             char.name, char.role, char.background
         )
-        char.personality_tags = profile.get("personality_tags", [])
-        char.core_traits = profile.get("core_traits", {})
-        char.weakness = profile.get("weakness", "")
-        char.motivation = profile.get("motivation", "")
-        char.speaking_style = profile.get("speaking_style", "")
+        generated_fields = {
+            "personality_tags": profile.get("personality_tags", []),
+            "core_traits": profile.get("core_traits", {}),
+            "weakness": profile.get("weakness", ""),
+            "motivation": profile.get("motivation", ""),
+            "speaking_style": profile.get("speaking_style", ""),
+        }
+        for field, new_value in generated_fields.items():
+            current_value = getattr(char, field, None)
+            is_empty = current_value in (None, "", [], {})
+            if is_empty:
+                setattr(char, field, new_value)
+            elif _stringify_value(current_value) != _stringify_value(new_value):
+                obs = CharacterObservation(
+                    character_id=char.id,
+                    field=field,
+                    old_value=_stringify_value(current_value),
+                    new_value=_stringify_value(new_value),
+                    reason=_build_observation_reason(
+                        source="角色创建",
+                        evidence="AI 根据初始角色信息生成的候选画像；已保留用户手填内容，等待人工确认。",
+                        confidence=0.7,
+                        change_type=_infer_change_type(current_value, new_value),
+                        module=_resolve_profile_module(field),
+                    ),
+                )
+                db.add(obs)
+                db.flush()
+                evidence = _create_evidence_span(
+                    db,
+                    character_id=char.id,
+                    source_type="profile",
+                    source_id=obs.id,
+                    observation_id=obs.id,
+                    supports_type=field,
+                    supports_id=obs.id,
+                    quote=_stringify_value(new_value),
+                    interpretation=f"角色创建候选画像：{field}",
+                    confidence=0.7,
+                    metadata={"field": field, "status": "pending"},
+                )
+                _create_memory_item(
+                    db,
+                    character_id=char.id,
+                    memory_type="diagnosis" if field in {"personality_tags", "core_traits"} else "fact",
+                    content=_stringify_value(new_value),
+                    confidence=0.7,
+                    source="角色创建候选画像",
+                    evidence_ids=[evidence.id],
+                )
         db.commit()
         db.refresh(char)
+        supporting_evidence = [
+            item.id for item in db.query(EvidenceSpan).filter(
+                EvidenceSpan.character_id == char.id,
+            ).order_by(EvidenceSpan.created_at.desc()).limit(20).all()
+        ]
+        _create_personality_snapshot(db, char, source="角色创建", supporting_evidence=supporting_evidence)
+        db.commit()
+        db.refresh(char)
+        graph_store.sync_character(char)
     except Exception:
         pass  # AI 分析失败不影响创建
     return char
@@ -1243,7 +1771,41 @@ def get_character_profile_view(char_id: int, db: Session = Depends(get_db)):
     observations = db.query(CharacterObservation).filter_by(character_id=char_id).order_by(
         CharacterObservation.created_at.desc()
     ).all()
-    return _build_profile_view(char, relationships, events, observations)
+    result = _build_profile_view(char, relationships, events, observations)
+    evidence_count = db.query(EvidenceSpan).filter(EvidenceSpan.character_id == char_id).count()
+    memories = db.query(MemoryItem).filter(
+        MemoryItem.character_id == char_id,
+        MemoryItem.status == "active",
+    ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(8).all()
+    latest_snapshot = db.query(PersonalitySnapshot).filter(
+        PersonalitySnapshot.character_id == char_id
+    ).order_by(PersonalitySnapshot.version.desc()).first()
+    latest_review_snapshot = db.query(PersonalitySnapshot).filter(
+        PersonalitySnapshot.character_id == char_id,
+        PersonalitySnapshot.source == "长上下文复盘",
+    ).order_by(PersonalitySnapshot.created_at.desc()).first()
+    result["memory_summary"] = {
+        "evidence_count": evidence_count,
+        "memory_count": db.query(MemoryItem).filter(MemoryItem.character_id == char_id, MemoryItem.status == "active").count(),
+        "latest_snapshot_version": latest_snapshot.version if latest_snapshot else None,
+        "latest_review_snapshot": {
+            "id": latest_review_snapshot.id,
+            "version": latest_review_snapshot.version,
+            "created_at": latest_review_snapshot.created_at.isoformat() if latest_review_snapshot.created_at else "",
+            "critic_result": latest_review_snapshot.critic_result or {},
+        } if latest_review_snapshot else None,
+        "recent_memories": [
+            {
+                "id": memory.id,
+                "memory_type": memory.memory_type,
+                "content": memory.content,
+                "confidence": memory.confidence,
+                "evidence_ids": memory.evidence_ids or [],
+            }
+            for memory in memories
+        ],
+    }
+    return result
 
 
 @router.get("/{char_id}/ai-update-log")
@@ -1257,6 +1819,194 @@ def get_character_ai_update_log(char_id: int, db: Session = Depends(get_db)):
     return _build_ai_update_log(observations)
 
 
+@router.get("/{char_id}/evidence", response_model=list[EvidenceSpanOut])
+def list_character_evidence(char_id: int, limit: int = 80, db: Session = Depends(get_db)):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    return db.query(EvidenceSpan).filter(
+        EvidenceSpan.character_id == char_id
+    ).order_by(EvidenceSpan.created_at.desc()).limit(min(max(limit, 1), 200)).all()
+
+
+@router.get("/{char_id}/memories", response_model=list[MemoryItemOut])
+def list_character_memories(char_id: int, memory_type: str = "", db: Session = Depends(get_db)):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    query = db.query(MemoryItem).filter(
+        MemoryItem.character_id == char_id,
+        MemoryItem.status == "active",
+    )
+    if memory_type:
+        query = query.filter(MemoryItem.memory_type == memory_type)
+    return query.order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).all()
+
+
+@router.get("/{char_id}/snapshots", response_model=list[PersonalitySnapshotOut])
+def list_personality_snapshots(char_id: int, db: Session = Depends(get_db)):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    return db.query(PersonalitySnapshot).filter(
+        PersonalitySnapshot.character_id == char_id
+    ).order_by(PersonalitySnapshot.version.desc()).all()
+
+
+@router.get("/{char_id}/diagnoses", response_model=list[StructuredDiagnosisOut])
+def list_character_diagnoses(char_id: int, limit: int = 80, db: Session = Depends(get_db)):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    return db.query(StructuredDiagnosis).filter(
+        (StructuredDiagnosis.speaker_id == char_id) | (StructuredDiagnosis.listener_id == char_id)
+    ).order_by(StructuredDiagnosis.created_at.desc()).limit(min(max(limit, 1), 200)).all()
+
+
+@router.post("/{char_id}/long-context-review", response_model=CharacterReviewOut)
+async def run_long_context_review(
+    char_id: int,
+    body: CharacterReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    body = body or CharacterReviewRequest()
+    corpus = _build_review_corpus(db, char, body)
+    agent_run = AgentRun(
+        workflow_name="long_context_review",
+        input_hash=f"character:{char_id}:window:{body.window_days or 'all'}:{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+        status="running",
+        model_used="ai-harness",
+        trace_json={
+            "character_id": char_id,
+            "scope": corpus.get("scope", {}),
+            "steps": ["long_context_review", "long_context_review_critic", "snapshot", "observations", "memory_consolidation"],
+        },
+    )
+    db.add(agent_run)
+    db.commit()
+    db.refresh(agent_run)
+
+    observation_ids: list[int] = []
+    memory_ids: list[int] = []
+    snapshot_id = None
+    try:
+        review = await orchestrator.long_context_review(corpus)
+        critic = await orchestrator.critique_long_context_review(review, _review_corpus_summary(corpus))
+        updates = review.get("profile_updates") or []
+        memories = review.get("consolidated_memories") or []
+        approved_update_indexes = _approved_indexes(critic.get("approved_update_indexes"), len(updates))
+        approved_memory_indexes = _approved_indexes(critic.get("approved_memory_indexes"), len(memories))
+        final_status = critic.get("final_status") or "downgraded"
+        snapshot_recommendation = critic.get("snapshot_recommendation") or "defer"
+
+        supporting_evidence = _evidence_ids_from_review([
+            item for index, item in enumerate(updates) if index in approved_update_indexes
+        ] + [
+            item for index, item in enumerate(memories) if index in approved_memory_indexes
+        ])
+        conflicting_evidence = _evidence_ids_from_review(review.get("contradictions") or [])
+        latest = db.query(PersonalitySnapshot).filter(
+            PersonalitySnapshot.character_id == char.id
+        ).order_by(PersonalitySnapshot.version.desc()).first()
+        snapshot = PersonalitySnapshot(
+            character_id=char.id,
+            version=(latest.version if latest else 0) + 1,
+            profile_json={
+                "current_profile": _build_snapshot_payload(char),
+                "candidate_profile": review.get("candidate_profile") or {},
+                "review_summary": review.get("summary") or "",
+                "drift_analysis": review.get("drift_analysis") or {},
+                "relationship_notes": review.get("relationship_notes") or [],
+                "review_scope": review.get("review_scope") or corpus.get("scope", {}),
+            },
+            supporting_evidence=supporting_evidence,
+            conflicting_evidence=conflicting_evidence,
+            critic_result={
+                **(critic or {}),
+                "final_status": final_status,
+                "snapshot_recommendation": snapshot_recommendation,
+            },
+            source="长上下文复盘",
+        )
+        db.add(snapshot)
+        db.flush()
+        snapshot_id = snapshot.id
+
+        if body.create_observations and final_status in {"approved", "downgraded"}:
+            for index, update in enumerate(updates):
+                if index not in approved_update_indexes:
+                    continue
+                field = (update.get("field") or "").strip()
+                if not field or not hasattr(char, field):
+                    continue
+                obs = _create_change_observation(
+                    db,
+                    char.id,
+                    field,
+                    update.get("old_value", getattr(char, field, "")),
+                    update.get("new_value", ""),
+                    "长上下文复盘",
+                    update.get("reason", "") or review.get("summary", ""),
+                    _safe_float(update.get("confidence"), review.get("confidence") or 0.0),
+                    _resolve_profile_module(field),
+                    update.get("change_type") or _infer_change_type(update.get("old_value", getattr(char, field, "")), update.get("new_value", "")),
+                    status="pending",
+                    example=f"证据ID：{update.get('evidence_ids') or []}；反证ID：{update.get('conflicting_evidence_ids') or []}",
+                )
+                if obs:
+                    observation_ids.append(obs.id)
+
+        if body.consolidate_memories and final_status in {"approved", "downgraded"}:
+            for index, memory in enumerate(memories):
+                if index not in approved_memory_indexes:
+                    continue
+                item = _create_memory_item(
+                    db,
+                    character_id=char.id,
+                    memory_type=memory.get("memory_type") or "diagnosis",
+                    content=memory.get("content") or "",
+                    confidence=_safe_float(memory.get("confidence"), review.get("confidence") or 0.0),
+                    source="长上下文复盘",
+                    evidence_ids=[int(eid) for eid in (memory.get("evidence_ids") or []) if str(eid).isdigit()],
+                )
+                if item:
+                    memory_ids.append(item.id)
+
+        agent_run.status = "completed"
+        agent_run.trace_json = {
+            **(agent_run.trace_json or {}),
+            "final_status": final_status,
+            "snapshot_recommendation": snapshot_recommendation,
+            "snapshot_id": snapshot_id,
+            "observation_ids": observation_ids,
+            "memory_ids": memory_ids,
+            "critic": critic,
+        }
+        agent_run.updated_at = datetime.utcnow()
+        db.commit()
+        return CharacterReviewOut(
+            ok=True,
+            character_id=char.id,
+            agent_run_id=agent_run.id,
+            snapshot_id=snapshot_id,
+            observation_ids=observation_ids,
+            memory_ids=memory_ids,
+            review=review,
+            critic=critic,
+        )
+    except Exception as exc:
+        db.rollback()
+        agent_run.status = "failed"
+        agent_run.trace_json = {**(agent_run.trace_json or {}), "error": str(exc)}
+        agent_run.updated_at = datetime.utcnow()
+        db.add(agent_run)
+        db.commit()
+        raise HTTPException(502, f"长上下文复盘失败：{exc}") from exc
+
+
 @router.put("/{char_id}", response_model=CharacterOut)
 def update_character(char_id: int, body: CharacterUpdate, db: Session = Depends(get_db)):
     char = db.get(Character, char_id)
@@ -1268,6 +2018,7 @@ def update_character(char_id: int, body: CharacterUpdate, db: Session = Depends(
     char.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(char)
+    graph_store.sync_character(char)
     return char
 
 
@@ -1449,6 +2200,8 @@ def export_all_data(db: Session = Depends(get_db)):
                 "scenario": conv.scenario,
                 "is_readonly": getattr(conv, "is_readonly", False),
                 "source_import_file_id": getattr(conv, "source_import_file_id", None),
+                "active_branch_id": getattr(conv, "active_branch_id", None),
+                "active_branch_point_id": getattr(conv, "active_branch_point_id", None),
                 "created_at": conv.created_at.isoformat() if conv.created_at else None,
                 "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
             }
@@ -1495,11 +2248,104 @@ def export_all_data(db: Session = Depends(get_db)):
             }
             for item in db.query(ImportFile).order_by(ImportFile.created_at.desc()).all()
         ],
+        "evidence_spans": [
+            EvidenceSpanOut.model_validate(evidence).model_dump(mode="json")
+            for evidence in db.query(EvidenceSpan).order_by(EvidenceSpan.created_at).all()
+        ],
+        "memory_items": [
+            MemoryItemOut.model_validate(memory).model_dump(mode="json")
+            for memory in db.query(MemoryItem).order_by(MemoryItem.created_at).all()
+        ],
+        "personality_snapshots": [
+            PersonalitySnapshotOut.model_validate(snapshot).model_dump(mode="json")
+            for snapshot in db.query(PersonalitySnapshot).order_by(PersonalitySnapshot.created_at).all()
+        ],
+        "structured_diagnoses": [
+            StructuredDiagnosisOut.model_validate(report).model_dump(mode="json")
+            for report in db.query(StructuredDiagnosis).order_by(StructuredDiagnosis.created_at).all()
+        ],
+        "agent_runs": [
+            {
+                "id": run.id,
+                "workflow_name": run.workflow_name,
+                "input_hash": run.input_hash,
+                "status": run.status,
+                "model_used": run.model_used,
+                "trace_json": run.trace_json or {},
+                "created_at": run.created_at.isoformat() if run.created_at else None,
+                "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+            }
+            for run in db.query(AgentRun).order_by(AgentRun.created_at).all()
+        ],
+        "retrieval_traces": [
+            {
+                "id": trace.id,
+                "conversation_id": trace.conversation_id,
+                "speaker_id": trace.speaker_id,
+                "listener_id": trace.listener_id,
+                "query_text": trace.query_text,
+                "strategy": trace.strategy or {},
+                "evidence_pack": trace.evidence_pack or {},
+                "created_at": trace.created_at.isoformat() if trace.created_at else None,
+            }
+            for trace in db.query(RetrievalTrace).order_by(RetrievalTrace.created_at).all()
+        ],
     }
     return JSONResponse(
         content=payload,
         headers={"Content-Disposition": f"attachment; filename=btb-export-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.json"},
     )
+
+
+# ─── Graph Store ──────────────────────────────────────────────────────────────
+
+@router.get("/graph/health")
+def graph_health():
+    return graph_store.health()
+
+
+@router.post("/graph/start")
+def start_graph_store():
+    return graph_store.start_bundled()
+
+
+@router.post("/graph/sync-all")
+def sync_graph_store(db: Session = Depends(get_db)):
+    health = graph_store.health()
+    if not health.get("available"):
+        raise HTTPException(503, {"message": "Neo4j 当前不可用，请先启动图谱服务。", "health": health})
+    graph_store.ensure_schema()
+    counts = {
+        "characters": 0,
+        "relationships": 0,
+        "events": 0,
+        "evidence": 0,
+        "memories": 0,
+    }
+    for char in db.query(Character).all():
+        if graph_store.sync_character(char):
+            counts["characters"] += 1
+    for rel in db.query(Relationship).all():
+        if graph_store.sync_relationship(rel, rel.source, rel.target):
+            counts["relationships"] += 1
+    for event in db.query(CharacterEvent).all():
+        if graph_store.sync_event(event, event.character):
+            counts["events"] += 1
+    for evidence in db.query(EvidenceSpan).all():
+        if graph_store.sync_evidence(evidence):
+            counts["evidence"] += 1
+    for memory in db.query(MemoryItem).all():
+        if graph_store.sync_memory(memory):
+            counts["memories"] += 1
+    return {"ok": True, "health": graph_store.health(), "counts": counts}
+
+
+@router.get("/graph/context")
+def get_graph_context(speaker_id: int | None = None, listener_id: int | None = None):
+    health = graph_store.health()
+    if not health.get("available"):
+        raise HTTPException(503, {"message": "Neo4j 当前不可用，请先启动图谱服务。", "health": health})
+    return graph_store.get_graph_context(speaker_id, listener_id)
 
 
 # ─── AI Suggestions ──────────────────────────────────────────────────────────
@@ -1535,6 +2381,29 @@ async def suggest_update(char_id: int, db: Session = Depends(get_db)):
             ),
         )
         db.add(obs)
+        db.flush()
+        evidence = _create_evidence_span(
+            db,
+            character_id=char_id,
+            source_type="chat_suggestion",
+            source_id=obs.id,
+            observation_id=obs.id,
+            supports_type=field or "profile_update",
+            supports_id=obs.id,
+            quote=s.get("reason", "") or dialogue[:300],
+            interpretation=f"AI 建议更新：{field}",
+            confidence=0.72,
+            metadata={"field": field, "recent_dialogue": dialogue[:1000]},
+        )
+        _create_memory_item(
+            db,
+            character_id=char_id,
+            memory_type="diagnosis" if field in {"personality_tags", "core_traits"} else "fact",
+            content=str(s.get("new_value", "")),
+            confidence=0.72,
+            source="AI建议更新",
+            evidence_ids=[evidence.id],
+        )
         obs_list.append(obs)
     db.commit()
     for o in obs_list:
@@ -1559,6 +2428,40 @@ def review_observation(char_id: int, obs_id: int, body: ObservationReview, db: S
         if char and hasattr(char, obs.field):
             setattr(char, obs.field, _coerce_observation_value(obs.field, obs.new_value))
             char.version += 1
+            existing_evidence = db.query(EvidenceSpan).filter(
+                EvidenceSpan.observation_id == obs.id,
+            ).first()
+            if not existing_evidence:
+                existing_evidence = _create_evidence_span(
+                    db,
+                    character_id=char_id,
+                    source_type="observation_review",
+                    source_id=obs.id,
+                    observation_id=obs.id,
+                    supports_type=obs.field or "profile_update",
+                    supports_id=obs.id,
+                    quote=obs.reason or obs.new_value,
+                    interpretation=f"审核通过的档案更新：{obs.field}",
+                    confidence=0.8,
+                    metadata={"status": body.status},
+                )
+            _create_memory_item(
+                db,
+                character_id=char_id,
+                memory_type="diagnosis" if obs.field in {"personality_tags", "core_traits"} else "fact",
+                content=obs.new_value or "",
+                confidence=max(0.8, float(existing_evidence.confidence or 0.0)),
+                source="人工审核",
+                evidence_ids=[existing_evidence.id],
+            )
+            _create_personality_snapshot(
+                db,
+                char,
+                source="人工审核",
+                supporting_evidence=[existing_evidence.id],
+                critic_result={"status": "human_approved", "reason": "用户批准 AI 建议。"},
+            )
+            graph_store.sync_character(char)
     db.commit()
     return {"ok": True, "status": body.status}
 
@@ -1578,6 +2481,29 @@ def create_behavior_pattern(char_id: int, body: BehaviorPatternPayload, db: Sess
         reviewed_at=datetime.utcnow(),
     )
     db.add(obs)
+    db.flush()
+    evidence = _create_evidence_span(
+        db,
+        character_id=char_id,
+        source_type="manual",
+        source_id=obs.id,
+        observation_id=obs.id,
+        supports_type="behavior_pattern",
+        supports_id=obs.id,
+        quote=body.example or body.trigger or body.new_value,
+        interpretation=f"{body.category}：{body.new_value}",
+        confidence=body.confidence,
+        metadata={"category": body.category, "trigger": body.trigger},
+    )
+    _create_memory_item(
+        db,
+        character_id=char_id,
+        memory_type="pragmatics",
+        content=body.new_value,
+        confidence=body.confidence,
+        source=body.source,
+        evidence_ids=[evidence.id],
+    )
     db.commit()
     db.refresh(obs)
     return obs
@@ -1592,6 +2518,28 @@ def update_behavior_pattern(char_id: int, obs_id: int, body: BehaviorPatternPayl
     obs.reason = _format_behavior_pattern_reason(body.source, body.confidence, body.category, body.trigger, body.example)
     obs.status = "approved"
     obs.reviewed_at = datetime.utcnow()
+    evidence = _create_evidence_span(
+        db,
+        character_id=char_id,
+        source_type="manual",
+        source_id=obs.id,
+        observation_id=obs.id,
+        supports_type="behavior_pattern",
+        supports_id=obs.id,
+        quote=body.example or body.trigger or body.new_value,
+        interpretation=f"手动更新行为模式：{body.new_value}",
+        confidence=body.confidence,
+        metadata={"category": body.category, "trigger": body.trigger},
+    )
+    _create_memory_item(
+        db,
+        character_id=char_id,
+        memory_type="pragmatics",
+        content=body.new_value,
+        confidence=body.confidence,
+        source=body.source,
+        evidence_ids=[evidence.id],
+    )
     db.commit()
     db.refresh(obs)
     return obs
@@ -1602,6 +2550,12 @@ def delete_behavior_pattern(char_id: int, obs_id: int, db: Session = Depends(get
     obs = db.get(CharacterObservation, obs_id)
     if not obs or obs.character_id != char_id or obs.field != "behavior_pattern":
         raise HTTPException(404, "行为模式不存在")
+    db.query(MemoryItem).filter(
+        MemoryItem.character_id == char_id,
+        MemoryItem.memory_type == "pragmatics",
+        MemoryItem.content == (obs.new_value or ""),
+        MemoryItem.status == "active",
+    ).update({"status": "deprecated", "updated_at": datetime.utcnow()})
     db.delete(obs)
     db.commit()
     return {"ok": True}
@@ -1619,11 +2573,15 @@ def list_events(char_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{char_id}/events", response_model=EventOut)
 def create_event(char_id: int, body: EventCreate, db: Session = Depends(get_db)):
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
     event = CharacterEvent(**body.model_dump())
     event.character_id = char_id
     db.add(event)
     db.commit()
     db.refresh(event)
+    graph_store.sync_event(event, char)
     return event
 
 
@@ -1656,6 +2614,7 @@ def create_relationship(body: RelationshipCreate, db: Session = Depends(get_db))
     db.add(rel)
     db.commit()
     db.refresh(rel)
+    graph_store.sync_relationship(rel, rel.source, rel.target)
     return rel
 
 
@@ -1678,6 +2637,7 @@ def update_relationship(rel_id: int, body: RelationshipUpdate, db: Session = Dep
     rel.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(rel)
+    graph_store.sync_relationship(rel, rel.source, rel.target)
     return rel
 
 

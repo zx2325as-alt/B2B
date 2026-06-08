@@ -188,3 +188,81 @@
 2026-04-13 23:01:25 | INFO | openai._base_client | Retrying request to /chat/completions in 0.832478 seconds
 2026-04-13 23:01:29 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
 2026-04-13 23:01:58 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-08 14:48:18 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 14:48:19 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 14:48:19 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 14:48:20 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 14:48:20 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 14:48:21 | INFO | httpx | HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 Authorization Required"
+2026-06-08 16:43:10 | WARNING | neo4j.session | Transaction failed and will be retried in 0.8045849251194712s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:13 | WARNING | neo4j.session | Transaction failed and will be retried in 1.7892158204783208s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:17 | WARNING | neo4j.session | Transaction failed and will be retried in 4.220032804478447s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:23 | WARNING | neo4j.session | Transaction failed and will be retried in 7.494651595006595s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:33 | WARNING | neo4j.session | Transaction failed and will be retried in 18.316703936744506s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:53 | WARNING | app.harness.graph_store | Neo4j 写入失败: Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。)
+2026-06-08 16:43:55 | WARNING | neo4j.session | Transaction failed and will be retried in 1.0748531286377936s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:43:58 | WARNING | neo4j.session | Transaction failed and will be retried in 2.1454947337588886s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:03 | WARNING | neo4j.session | Transaction failed and will be retried in 3.4176979922208965s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:08 | WARNING | neo4j.session | Transaction failed and will be retried in 8.017701944804044s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:18 | WARNING | neo4j.session | Transaction failed and will be retried in 14.246833766267473s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:34 | WARNING | app.harness.graph_store | Neo4j 写入失败: Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。)
+2026-06-08 16:44:36 | WARNING | neo4j.session | Transaction failed and will be retried in 1.1690652533938906s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:40 | WARNING | neo4j.session | Transaction failed and will be retried in 2.206328442803015s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:44 | WARNING | neo4j.session | Transaction failed and will be retried in 3.37786761450167s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:44:49 | WARNING | neo4j.session | Transaction failed and will be retried in 8.60914003817714s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:00 | WARNING | neo4j.session | Transaction failed and will be retried in 16.463894180537217s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:18 | WARNING | app.harness.graph_store | Neo4j 写入失败: Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。)
+2026-06-08 16:45:20 | WARNING | neo4j.session | Transaction failed and will be retried in 1.0406985777035078s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:22 | INFO | httpx | HTTP Request: GET http://testserver/api/v1/characters/graph/health "HTTP/1.1 200 OK"
+2026-06-08 16:45:23 | WARNING | neo4j.session | Transaction failed and will be retried in 1.797589733047761s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:24 | INFO | httpx | HTTP Request: POST http://testserver/api/v1/characters/graph/start "HTTP/1.1 200 OK"
+2026-06-08 16:45:27 | WARNING | neo4j.session | Transaction failed and will be retried in 3.54078764435426s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:33 | WARNING | neo4j.session | Transaction failed and will be retried in 7.629396597873075s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:45:42 | WARNING | neo4j.session | Transaction failed and will be retried in 16.325818588155556s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:01 | WARNING | app.harness.graph_store | Neo4j 写入失败: Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。)
+2026-06-08 16:46:03 | WARNING | neo4j.session | Transaction failed and will be retried in 0.9232790542323328s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:06 | WARNING | neo4j.session | Transaction failed and will be retried in 2.3537228418260723s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:10 | WARNING | neo4j.session | Transaction failed and will be retried in 3.315954212814451s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:16 | WARNING | neo4j.session | Transaction failed and will be retried in 8.79671775540827s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:26 | WARNING | neo4j.session | Transaction failed and will be retried in 16.929131027445273s (Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。))
+2026-06-08 16:46:45 | WARNING | app.harness.graph_store | Neo4j 写入失败: Couldn't connect to 127.0.0.1:7687 (resolved to ('127.0.0.1:7687',)):
+Failed to establish connection to ResolvedIPv4Address(('127.0.0.1', 7687)) (reason [WinError 10061] 由于目标计算机积极拒绝，无法连接。)
+2026-06-08 16:46:47 | INFO | httpx | HTTP Request: GET http://testserver/api/v1/characters/graph/health "HTTP/1.1 200 OK"
+2026-06-08 16:46:50 | INFO | httpx | HTTP Request: POST http://testserver/api/v1/characters/graph/start "HTTP/1.1 200 OK"
+2026-06-08 17:10:24 | INFO | httpx | HTTP Request: GET http://testserver/api/v1/characters/graph/health "HTTP/1.1 200 OK"
+2026-06-08 17:24:22 | INFO | httpx | HTTP Request: GET http://testserver/openapi.json "HTTP/1.1 200 OK"
+2026-06-08 17:24:52 | INFO | httpx | HTTP Request: POST http://testserver/api/v1/characters/999999/long-context-review "HTTP/1.1 404 Not Found"
+2026-06-08 17:32:24 | INFO | neo4j.notifications | Received notification from DBMS server: <GqlStatusObject gql_status='03N42', status_description='`CONSTRAINT person_id FOR (e:Person) REQUIRE (e.id) IS UNIQUE` already exists.', position=None, raw_classification='SCHEMA', classification=<NotificationClassification.SCHEMA: 'SCHEMA'>, raw_severity='INFORMATION', severity=<NotificationSeverity.INFORMATION: 'INFORMATION'>, diagnostic_record={'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/', '_classification': 'SCHEMA', '_severity': 'INFORMATION'}> for query: 'CREATE CONSTRAINT person_id IF NOT EXISTS FOR (n:Person) REQUIRE n.id IS UNIQUE'
+2026-06-08 17:32:24 | INFO | neo4j.notifications | Received notification from DBMS server: <GqlStatusObject gql_status='03N42', status_description='`CONSTRAINT event_id FOR (e:Event) REQUIRE (e.id) IS UNIQUE` already exists.', position=None, raw_classification='SCHEMA', classification=<NotificationClassification.SCHEMA: 'SCHEMA'>, raw_severity='INFORMATION', severity=<NotificationSeverity.INFORMATION: 'INFORMATION'>, diagnostic_record={'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/', '_classification': 'SCHEMA', '_severity': 'INFORMATION'}> for query: 'CREATE CONSTRAINT event_id IF NOT EXISTS FOR (n:Event) REQUIRE n.id IS UNIQUE'
+2026-06-08 17:32:24 | INFO | neo4j.notifications | Received notification from DBMS server: <GqlStatusObject gql_status='03N42', status_description='`CONSTRAINT evidence_id FOR (e:Evidence) REQUIRE (e.id) IS UNIQUE` already exists.', position=None, raw_classification='SCHEMA', classification=<NotificationClassification.SCHEMA: 'SCHEMA'>, raw_severity='INFORMATION', severity=<NotificationSeverity.INFORMATION: 'INFORMATION'>, diagnostic_record={'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/', '_classification': 'SCHEMA', '_severity': 'INFORMATION'}> for query: 'CREATE CONSTRAINT evidence_id IF NOT EXISTS FOR (n:Evidence) REQUIRE n.id IS UNIQUE'
+2026-06-08 17:32:24 | INFO | neo4j.notifications | Received notification from DBMS server: <GqlStatusObject gql_status='03N42', status_description='`CONSTRAINT memory_id FOR (e:Memory) REQUIRE (e.id) IS UNIQUE` already exists.', position=None, raw_classification='SCHEMA', classification=<NotificationClassification.SCHEMA: 'SCHEMA'>, raw_severity='INFORMATION', severity=<NotificationSeverity.INFORMATION: 'INFORMATION'>, diagnostic_record={'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/', '_classification': 'SCHEMA', '_severity': 'INFORMATION'}> for query: 'CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (n:Memory) REQUIRE n.id IS UNIQUE'
+2026-06-08 17:32:24 | INFO | neo4j.notifications | Received notification from DBMS server: <GqlStatusObject gql_status='03N42', status_description='`CONSTRAINT relationship_id FOR (e:RelationshipFact) REQUIRE (e.id) IS UNIQUE` already exists.', position=None, raw_classification='SCHEMA', classification=<NotificationClassification.SCHEMA: 'SCHEMA'>, raw_severity='INFORMATION', severity=<NotificationSeverity.INFORMATION: 'INFORMATION'>, diagnostic_record={'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/', '_classification': 'SCHEMA', '_severity': 'INFORMATION'}> for query: 'CREATE CONSTRAINT relationship_id IF NOT EXISTS FOR (n:RelationshipFact) REQUIRE n.id IS UNIQUE'

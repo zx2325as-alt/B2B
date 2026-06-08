@@ -130,6 +130,105 @@ class ObservationOut(BaseModel):
         from_attributes = True
 
 
+class EvidenceSpanOut(BaseModel):
+    id: int
+    character_id: Optional[int]
+    source_type: str
+    source_id: Optional[int]
+    conversation_id: Optional[int]
+    message_id: Optional[int]
+    import_file_id: Optional[int]
+    interaction_unit_id: Optional[int]
+    character_event_id: Optional[int]
+    relationship_id: Optional[int]
+    observation_id: Optional[int]
+    supports_type: str
+    supports_id: Optional[int]
+    polarity: str
+    quote: str
+    interpretation: str
+    confidence: float
+    metadata_json: dict[str, Any]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MemoryItemOut(BaseModel):
+    id: int
+    character_id: int
+    memory_type: str
+    content: str
+    confidence: float
+    evidence_ids: list
+    source: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    last_used_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class PersonalitySnapshotOut(BaseModel):
+    id: int
+    character_id: int
+    version: int
+    profile_json: dict[str, Any]
+    supporting_evidence: list
+    conflicting_evidence: list
+    critic_result: dict[str, Any]
+    source: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StructuredDiagnosisOut(BaseModel):
+    id: int
+    conversation_id: Optional[int]
+    message_id: Optional[int]
+    analysis_message_id: Optional[int]
+    speaker_id: Optional[int]
+    listener_id: Optional[int]
+    diagnosis_type: str
+    status: str
+    confidence: float
+    result_json: dict[str, Any]
+    critic_json: dict[str, Any]
+    evidence_ids: list
+    conflicting_evidence_ids: list
+    agent_run_id: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CharacterReviewRequest(BaseModel):
+    window_days: Optional[int] = None
+    max_messages: int = 300
+    max_evidence: int = 160
+    max_memories: int = 120
+    max_diagnoses: int = 100
+    create_observations: bool = True
+    consolidate_memories: bool = True
+
+
+class CharacterReviewOut(BaseModel):
+    ok: bool
+    character_id: int
+    agent_run_id: Optional[int]
+    snapshot_id: Optional[int]
+    observation_ids: list[int]
+    memory_ids: list[int]
+    review: dict[str, Any]
+    critic: dict[str, Any]
+
+
 # ─── Chat ────────────────────────────────────────────────────────────────────
 
 class ActiveCharacter(BaseModel):
@@ -154,6 +253,7 @@ class MessageOut(BaseModel):
     message_index: int
     conversation_id: int
     parent_id: Optional[int]
+    branch_id: Optional[str] = None
     role: str
     speaker_id: Optional[int]
     speaker_name: Optional[str]

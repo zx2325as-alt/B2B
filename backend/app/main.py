@@ -8,6 +8,7 @@ from pathlib import Path
 from .models.sql_models import Base
 from .api.deps import engine
 from .api import characters, chat
+from .harness.graph_store import graph_store
 
 def _configure_logging():
     logs_dir = Path(__file__).parent / "logs"
@@ -59,9 +60,12 @@ def _ensure_sqlite_columns():
         "conversations": {
             "is_readonly": "ALTER TABLE conversations ADD COLUMN is_readonly BOOLEAN DEFAULT 0",
             "source_import_file_id": "ALTER TABLE conversations ADD COLUMN source_import_file_id INTEGER",
+            "active_branch_id": "ALTER TABLE conversations ADD COLUMN active_branch_id VARCHAR(80)",
+            "active_branch_point_id": "ALTER TABLE conversations ADD COLUMN active_branch_point_id INTEGER",
         },
         "messages": {
             "message_index": "ALTER TABLE messages ADD COLUMN message_index INTEGER DEFAULT 0",
+            "branch_id": "ALTER TABLE messages ADD COLUMN branch_id VARCHAR(80)",
             "receiver_id": "ALTER TABLE messages ADD COLUMN receiver_id INTEGER",
             "receiver_name": "ALTER TABLE messages ADD COLUMN receiver_name VARCHAR(100)",
             "intent": "ALTER TABLE messages ADD COLUMN intent VARCHAR(200)",
@@ -94,6 +98,8 @@ def _ensure_sqlite_columns():
 _configure_logging()
 Base.metadata.create_all(bind=engine)
 _ensure_sqlite_columns()
+if graph_store.health().get("available"):
+    graph_store.ensure_schema()
 
 app = FastAPI(
     title="BtB - Deep Dialogue Intelligence",

@@ -17,6 +17,16 @@ export const characterApi = {
   listObservations: (id)       => api.get(`/characters/${id}/observations`),
   getProfileView: (id)         => api.get(`/characters/${id}/profile-view`),
   getAiUpdateLog: (id)         => api.get(`/characters/${id}/ai-update-log`),
+  listEvidence: (id, limit = 80) => api.get(`/characters/${id}/evidence`, { params: { limit } }),
+  listMemories: (id, memoryType = '') => api.get(`/characters/${id}/memories`, { params: memoryType ? { memory_type: memoryType } : {} }),
+  listSnapshots: (id)          => api.get(`/characters/${id}/snapshots`),
+  listDiagnoses: (id, limit = 80) => api.get(`/characters/${id}/diagnoses`, { params: { limit } }),
+  runLongContextReview: (id, data = {}) => api.post(`/characters/${id}/long-context-review`, data),
+  graphHealth: ()              => api.get('/characters/graph/health'),
+  startGraph: ()               => api.post('/characters/graph/start'),
+  syncGraph: ()                => api.post('/characters/graph/sync-all'),
+  getGraphContext: (speakerId, listenerId = null) =>
+    api.get('/characters/graph/context', { params: { speaker_id: speakerId, listener_id: listenerId } }),
   reviewObservation: (cid, oid, status) =>
     api.post(`/characters/${cid}/observations/${oid}/review`, { status }),
   createBehaviorPattern: (cid, data) => api.post(`/characters/${cid}/behavior-patterns`, data),
@@ -47,6 +57,11 @@ export const chatApi = {
   getEmotionTension: (cid, source, target) => api.get(`/chat/conversations/${cid}/emotion-tension`, { params: { source, target } }),
   reanalyzeMessage: (id)       => api.post(`/chat/messages/${id}/reanalyze`),
   archiveConversation: (cid, data) => api.post(`/chat/conversations/${cid}/archive`, data),
+  previewEvidencePack: (cid, data) => api.post(`/chat/conversations/${cid}/evidence-pack`, data),
+  listRetrievalTraces: (cid, limit = 20) => api.get(`/chat/conversations/${cid}/retrieval-traces`, { params: { limit } }),
+  listDiagnoses: (cid, limit = 50) => api.get(`/chat/conversations/${cid}/diagnoses`, { params: { limit } }),
+  listMessageDiagnoses: (mid) => api.get(`/chat/messages/${mid}/diagnoses`),
+  diagnoseMessage: (mid) => api.post(`/chat/messages/${mid}/diagnose`),
 }
 
 /**

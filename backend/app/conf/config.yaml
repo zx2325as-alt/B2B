@@ -11,6 +11,10 @@ ai:
     relationship_analysis: "deepseek"
     ai_suggest_update: "deepseek"
     emotion_curve: "deepseek"
+    structured_diagnosis: "deepseek"
+    diagnosis_critic: "deepseek"
+    long_context_review: "deepseek"
+    long_context_review_critic: "deepseek"
   task_models:
     import_dialogue_parse: "deepseek-chat"
     import_narrative_parse: "deepseek-chat"
@@ -22,11 +26,19 @@ ai:
     import_narrative_parse: 8192
     import_commit_review: 4096
     interaction_analysis_rebuild: 3072
+    structured_diagnosis: 3072
+    diagnosis_critic: 2048
+    long_context_review: 6144
+    long_context_review_critic: 3072
   task_temperatures:
     import_dialogue_parse: 0.3
     import_narrative_parse: 0.3
     import_commit_review: 0.3
     interaction_analysis_rebuild: 0.4
+    structured_diagnosis: 0.3
+    diagnosis_critic: 0.2
+    long_context_review: 0.25
+    long_context_review_critic: 0.15
   
   providers:
     openai:
@@ -39,24 +51,18 @@ ai:
         
     deepseek:
       base_url: "https://api.deepseek.com/v1"
-      api_key: "sk-803936ec8add440db0dca13ec660f070"
+      api_key: "sk-b485624217094c209a90af7db84ea9ab"
       models:
         simple: "deepseek-chat"
         medium: "deepseek-chat"
         complex: "deepseek-chat"
+
+graph:
+  enabled: true
+  provider: "neo4j"
+  uri: "bolt://127.0.0.1:7687"
+  username: ""
+  password: ""
+  database: "neo4j"
+  bundled_home: "backend/app/models/neo4j-community-5.18.1"
         
-    ollama:
-      base_url: "http://localhost:11434/v1"
-      api_key: "ollama"
-      models:
-        simple: "llama3"
-        medium: "llama3"
-        complex: "llama3"
-        
-    vllm:
-      base_url: "http://localhost:8000/v1"
-      api_key: "empty"
-      models:
-        simple: "Qwen2.5-7B-Instruct"
-        medium: "Qwen2.5-14B-Instruct"
-        complex: "Qwen2.5-32B-Instruct"

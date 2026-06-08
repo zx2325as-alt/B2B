@@ -139,9 +139,8 @@ export const useChatStore = defineStore('chat', () => {
   async function createBranch(messageId) {
     if (!activeConvId.value) return
     await chatApi.createBranch(activeConvId.value, messageId)
-    // Truncate messages to up to branch point
-    const idx = messages.value.findIndex(m => m.id === messageId)
-    if (idx >= 0) messages.value = messages.value.slice(0, idx + 1)
+    await loadConversations()
+    await loadMessages(activeConvId.value)
   }
 
   return {

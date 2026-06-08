@@ -7,3 +7,6 @@ backend/btb.db
 backend/app/logs/
 btb-export-2026-04-10-13-58-20.json
 tes22t.txt
+backend/app/logs/
+backend/app/models/neo4j-community-5.18.1/
+frontend/dist/

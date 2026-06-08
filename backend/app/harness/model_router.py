@@ -63,6 +63,10 @@ class ModelRouter:
         "relationship_analysis": TaskComplexity.MEDIUM,
         "ai_suggest_update": TaskComplexity.COMPLEX,
         "emotion_curve": TaskComplexity.SIMPLE,
+        "structured_diagnosis": TaskComplexity.COMPLEX,
+        "diagnosis_critic": TaskComplexity.COMPLEX,
+        "long_context_review": TaskComplexity.COMPLEX,
+        "long_context_review_critic": TaskComplexity.COMPLEX,
     }
 
     JSON_TASKS = {
@@ -73,7 +77,12 @@ class ModelRouter:
         "interaction_analysis_rebuild",
         "character_profile_gen",
         "relationship_analysis",
+        "ai_suggest_update",
         "emotion_curve",
+        "structured_diagnosis",
+        "diagnosis_critic",
+        "long_context_review",
+        "long_context_review_critic",
     }
 
     def resolve_provider(self, task_name: str) -> str:
@@ -150,7 +159,11 @@ class OutputGuardrails:
         "character_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation"],
         "relationship_analysis": ["relationship_summary", "predicted_trend"],
         "emotion_curve": ["emotions", "trend"],
-        "ai_suggest_update": [],  # array
+        "ai_suggest_update": ["updates"],
+        "structured_diagnosis": ["summary", "confidence", "supporting_evidence", "conflicting_evidence", "alternative_explanations", "insufficient_evidence"],
+        "diagnosis_critic": ["final_status", "confidence_adjustment", "issues", "revised_summary"],
+        "long_context_review": ["summary", "confidence", "candidate_profile", "profile_updates", "consolidated_memories", "contradictions"],
+        "long_context_review_critic": ["final_status", "confidence_adjustment", "issues", "approved_update_indexes", "approved_memory_indexes"],
     }
 
     FORBIDDEN_PATTERNS = [
