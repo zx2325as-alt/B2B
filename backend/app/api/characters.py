@@ -18,6 +18,7 @@ from ..schemas import (
     EventCreate, EventOut,
     RelationshipCreate, RelationshipUpdate, RelationshipOut,
     ObservationReview, ObservationOut, ImportCommitRequest, BehaviorPatternPayload,
+    MessageOut,
 )
 from ..harness.orchestrator import orchestrator
 from ..harness.import_engine import extract_text_from_file, build_import_preview
@@ -750,7 +751,8 @@ def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]
     preview_events = preview.get("events") or []
     drafts = []
     if preview_events:
-        for index, event in enumerate(preview_events[:20], start=1):
+        # 移除前 20 个事件限制，处理全部事件
+        for index, event in enumerate(preview_events, start=1):
             actors = _dedupe_names([event.get("actor", "")] + list(event.get("participants") or []))
             if not actors:
                 continue
@@ -893,7 +895,13 @@ async def _rebuild_import_analyses(preview: dict[str, Any], resolved_chars: dict
         }
         try:
             async with semaphore:
-                analyses[index] = await orchestrator.rebuild_import_analysis(unit, context_payload)
+                # 单条分析加 60 秒超时，防止卡住整个导入流程
+                analyses[index] = await asyncio.wait_for(
+                    orchestrator.rebuild_import_analysis(unit, context_payload),
+                    timeout=60.0,
+                )
+        except asyncio.TimeoutError:
+            failures.append({"index": index, "error": "分析超时"})
         except Exception as exc:
             failures.append({"index": index, "error": str(exc)})
 
@@ -948,7 +956,7 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
         preview, role_mappings, review_summary = await _auto_review_import(preview, role_mappings, import_file.id)
 
         resolved_chars = {}
-        parsed_characters = {item.get("name"): item for item in preview.get("characters", [])}
+        parsed_characters = {item.get("name"): item for item in preview.get("characters", []) if item.get("name")}
         for original_name, parsed_char in parsed_characters.items():
             mapping = _resolve_mapping(role_mappings, original_name)
             if mapping["action"] == "skip":

@@ -128,8 +128,8 @@ PROMPT_REGISTRY: dict[str, dict] = {
 - 共现不是强关系，只有直接互动、明确指向或明显情绪指向时才建立关系
 - 对话格式时优先使用说话人标签
 - 字段缺失时允许为空，不要臆造长篇背景
-- 输出要简洁，角色不超过 12 个、interaction_units 不超过 16 条、事件不超过 10 条、关系不超过 10 条
-- summary、background、description 字段尽量控制在 40 字以内，不要复述大段原文""",
+- 按实际内容尽可能完整输出，不人为限制角色数、交互数、事件数、关系数
+- summary、background、description 字段控制在 80 字以内，不要复述大段原文""",
         "user": "文件类型：{file_type}\n内容：\n{content_text}"
     },
 
@@ -193,8 +193,8 @@ PROMPT_REGISTRY: dict[str, dict] = {
 - 没有直接对白时，也可以从叙事动作中提炼 interaction_units，但不要过度猜测
 - 所有推断都要保守且可解释
 - 字段缺失时允许为空，不要臆造长篇背景
-- 输出要简洁，角色不超过 12 个、interaction_units 不超过 16 条、事件不超过 10 条、关系不超过 10 条
-- summary、background、description 字段尽量控制在 40 字以内，不要复述大段原文""",
+- 按实际内容尽可能完整输出，不人为限制角色数、交互数、事件数、关系数
+- summary、background、description 字段控制在 80 字以内，不要复述大段原文""",
         "user": "文件类型：{file_type}\n内容：\n{content_text}"
     },
 

@@ -18,15 +18,15 @@ ai:
     interaction_analysis_rebuild: "deepseek-chat"
   task_max_tokens:
     chat_analysis: 2048
-    import_dialogue_parse: 4096
-    import_narrative_parse: 4096
-    import_commit_review: 3072
+    import_dialogue_parse: 8192
+    import_narrative_parse: 8192
+    import_commit_review: 4096
     interaction_analysis_rebuild: 3072
   task_temperatures:
-    import_dialogue_parse: 0.2
-    import_narrative_parse: 0.2
-    import_commit_review: 0.2
-    interaction_analysis_rebuild: 0.3
+    import_dialogue_parse: 0.3
+    import_narrative_parse: 0.3
+    import_commit_review: 0.3
+    interaction_analysis_rebuild: 0.4
   
   providers:
     openai:

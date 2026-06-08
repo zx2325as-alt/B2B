@@ -688,6 +688,15 @@ const importOptions = ref({
   auto_archive: true,
 })
 let importPollTimer = null
+let importPollCount = 0
+const MAX_POLL_COUNT = 120  // 最多轮询 120 次（配合退避策略约等于 10 分钟上限）
+
+function getNextPollDelay(count) {
+  // 指数退避：前 5 次 2s，5-20 次 5s，20 次以后 10s
+  if (count < 5) return 2000
+  if (count < 20) return 5000
+  return 10000
+}
 
 const showCharModal = ref(false)
 const showRelModal = ref(false)
@@ -954,41 +963,60 @@ async function handleImportFileChange(e) {
   importError.value = ''
   importNotice.value = ''
   importPreviewPending.value = false
+  importPollCount = 0
+  if (importPollTimer) window.clearTimeout(importPollTimer)
 }
 async function pollPreviewStatus(taskId) {
   if (!taskId) return
+  if (importPollCount >= MAX_POLL_COUNT) {
+    importPreviewPending.value = false
+    importError.value = 'AI 预览增强超时，已显示基础预览结果，可直接确认导入。'
+    return
+  }
   try {
     const res = await characterApi.getImportStatus(taskId)
     const data = res.data || {}
     if (data.status === 'preview_processing') {
       importNotice.value = data.progress?.message || 'AI 预览增强正在后台处理中…'
-      importPollTimer = window.setTimeout(() => pollPreviewStatus(taskId), 1500)
+      importPollCount++
+      importPollTimer = window.setTimeout(() => pollPreviewStatus(taskId), getNextPollDelay(importPollCount))
       return
     }
     if (data.status === 'preview_ready') {
       importPreviewPending.value = false
+      importPollCount = 0
       importPreview.value = data.preview_payload || importPreview.value
       importNotice.value = data.preview_warning || data.progress?.message || 'AI 预览增强完成'
       return
     }
     importPreviewPending.value = false
+    importPollCount = 0
   } catch (err) {
     importPreviewPending.value = false
+    importPollCount = 0
     importError.value = err?.response?.data?.detail || err?.message || '预览增强状态获取失败。'
   }
 }
 async function pollImportStatus(taskId) {
   if (!taskId) return
+  if (importPollCount >= MAX_POLL_COUNT) {
+    importTaskId.value = null
+    importPollCount = 0
+    importError.value = '导入任务超时，请查看后台日志确认状态。'
+    return
+  }
   try {
     const res = await characterApi.getImportStatus(taskId)
     const data = res.data || {}
     if (data.status === 'queued' || data.status === 'reviewing' || data.status === 'processing') {
       importNotice.value = data.progress?.message || '导入任务正在后台处理中…'
-      importPollTimer = window.setTimeout(() => pollImportStatus(taskId), 1500)
+      importPollCount++
+      importPollTimer = window.setTimeout(() => pollImportStatus(taskId), getNextPollDelay(importPollCount))
       return
     }
     if (data.status === 'committed') {
       importTaskId.value = null
+      importPollCount = 0
       importResult.value = data.result || null
       importNotice.value = data.progress?.message || '导入完成'
       importCompletionNotice.value = `导入完成：关系 ${data.relationship_count || data.result?.relationships || 0}`
@@ -1006,9 +1034,11 @@ async function pollImportStatus(taskId) {
       return
     }
     importTaskId.value = null
+    importPollCount = 0
     importError.value = data.progress?.message || '导入失败，请查看后台日志。'
   } catch (err) {
     importTaskId.value = null
+    importPollCount = 0
     importError.value = err?.response?.data?.detail || err?.message || '导入状态获取失败，请查看后台日志。'
   }
 }
@@ -1029,7 +1059,8 @@ async function previewImport() {
     importTaskId.value = res.data?.import_file_id || null
     if (importPreviewPending.value) {
       if (importPollTimer) window.clearTimeout(importPollTimer)
-      importPollTimer = window.setTimeout(() => pollPreviewStatus(importTaskId.value), 600)
+      importPollCount = 0
+      importPollTimer = window.setTimeout(() => pollPreviewStatus(importTaskId.value), 2000)
     }
   } catch (err) {
     importPreview.value = null
@@ -1067,7 +1098,8 @@ async function commitImport() {
     importCompletionNotice.value = ''
     closeImportModal()
     if (importPollTimer) window.clearTimeout(importPollTimer)
-    importPollTimer = window.setTimeout(() => pollImportStatus(importTaskId.value), 600)
+    importPollCount = 0
+    importPollTimer = window.setTimeout(() => pollImportStatus(importTaskId.value), 2000)
   } catch (err) {
     importError.value = err?.response?.data?.detail || err?.message || '导入失败，请稍后重试。'
   } finally {
