@@ -28,6 +28,19 @@ DIALOGUE_PATTERNS = [
 
 NARRATIVE_SPEAKER_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·\-]{1,11})(?:说|问|回答|回应|表示|想到|看着|盯着|告诉|喊道)")
 
+REPORTING_VERBS = (
+    "回答道", "说道", "问道", "喊道", "告诉", "表示", "回应", "回答", "说", "问",
+)
+INVALID_ENTITY_NAMES = {
+    "他", "她", "它", "他们", "她们", "我们", "你们", "有人", "众人", "大家",
+    "他说", "她说", "他们说", "她们说", "他问", "她问", "他们回答道", "她们回答道",
+    "叙述者", "作者", "旁白", "未知说话者", "未知群体",
+}
+NON_ENTITY_HINTS = (
+    "这样", "如此", "什么", "哪里", "怎么", "为什么", "工作", "广告", "事情",
+    "时候", "如果", "因为", "所以", "必须", "已经", "没有", "只有",
+)
+
 
 def chunk_text(content_text: str, chunk_size: int = 2400, overlap: int = 240) -> list[str]:
     text = content_text or ""
@@ -65,6 +78,216 @@ def detect_import_type(filename: str, content_text: str) -> str:
     if has_dialogue_marker:
         return "dialogue"
     return "narrative"
+
+
+def _strip_reporting_verb(name: str) -> str:
+    value = (name or "").strip(" \t\r\n，。、“”\"'：:；;,.!?！？")
+    for verb in REPORTING_VERBS:
+        if value.endswith(verb) and len(value) > len(verb):
+            value = value[: -len(verb)].strip(" ，。、“”\"'：:；;")
+            break
+    return value
+
+
+def _extract_speaker_receiver(raw_name: str) -> tuple[str, str]:
+    value = (raw_name or "").strip(" \t\r\n，。、“”\"'：:；;,.!?！？")
+    pattern = r"^(.{1,18}?)(?:对|向)(.{1,18}?)(?:说|问|回答|回应|表示|告诉|喊道)$"
+    matched = re.match(pattern, value)
+    if matched:
+        return _clean_entity_name(matched.group(1)), _clean_entity_name(matched.group(2))
+    return _clean_entity_name(value), ""
+
+
+def _clean_entity_name(raw_name: str) -> str:
+    value = _strip_reporting_verb(raw_name)
+    value = re.sub(r"^(?:那个|这位|一位|一个)", "", value).strip()
+    if not value or value in INVALID_ENTITY_NAMES:
+        return ""
+    if len(value) > 16:
+        return ""
+    if "对" in value or "向" in value:
+        return ""
+    if any(ch in value for ch in "，。！？；：,.!?;:”“\"'"):
+        return ""
+    if any(hint in value for hint in NON_ENTITY_HINTS) and "·" not in value:
+        return ""
+    if re.fullmatch(r"[\d\s\-_/]+", value):
+        return ""
+    return value
+
+
+def _has_direct_quote(text: str) -> bool:
+    return bool(re.search(r"[“\"].{1,240}[”\"]", text or ""))
+
+
+def _normalize_unit_content(text: str) -> str:
+    value = (text or "").strip()
+    value = re.sub(r"^[“\"'‘’]+|[”\"'‘’]+$", "", value)
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[，。！？；：,.!?;:”“\"'‘’]", "", value)
+    return value[:220]
+
+
+def _merge_character(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in ("role", "background", "status"):
+        if not target.get(key) and source.get(key):
+            target[key] = source[key]
+    target["confidence"] = max(float(target.get("confidence") or 0.0), float(source.get("confidence") or 0.0))
+    tags = list(target.get("personality_tags") or [])
+    for tag in source.get("personality_tags") or []:
+        if tag and tag not in tags:
+            tags.append(tag)
+    target["personality_tags"] = tags[:8]
+
+
+def sanitize_import_entities(parsed: dict[str, Any], detected_type: str) -> dict[str, Any]:
+    parsed = normalize_import_result(parsed)
+    characters: dict[str, dict[str, Any]] = {}
+
+    for character in parsed.get("characters", []):
+        raw_name = character.get("name", "")
+        name, _ = _extract_speaker_receiver(raw_name)
+        if not name:
+            continue
+        cleaned = dict(character)
+        cleaned["name"] = name
+        cleaned["confidence"] = max(float(cleaned.get("confidence") or 0.0), 0.55)
+        if name in characters:
+            _merge_character(characters[name], cleaned)
+        else:
+            characters[name] = cleaned
+
+    sanitized_units: list[dict[str, Any]] = []
+    last_partner_by_speaker: dict[str, str] = {}
+    previous_valid_speaker = ""
+    for unit in parsed.get("interaction_units", []):
+        raw_speaker = unit.get("speaker", "")
+        speaker, embedded_receiver = _extract_speaker_receiver(raw_speaker)
+        raw_receiver = unit.get("receiver", "")
+        receiver_speaker, receiver_target = _extract_speaker_receiver(raw_receiver)
+        receiver = receiver_target or receiver_speaker or embedded_receiver
+        if not receiver and speaker and last_partner_by_speaker.get(speaker):
+            receiver = last_partner_by_speaker[speaker]
+        if not receiver and previous_valid_speaker and previous_valid_speaker != speaker:
+            receiver = previous_valid_speaker
+        if receiver == speaker:
+            receiver = last_partner_by_speaker.get(speaker, "")
+        content = (unit.get("content") or "").strip()
+        if not speaker or not content:
+            continue
+
+        has_receiver = bool(receiver and receiver != speaker)
+        is_direct_dialogue = detected_type == "dialogue" or _has_direct_quote(content)
+        analysis_mode = "dialogue" if has_receiver and is_direct_dialogue else "evidence_only"
+        if detected_type == "narrative" and not is_direct_dialogue and not has_receiver:
+            analysis_mode = "evidence_only"
+
+        cleaned_unit = dict(unit)
+        cleaned_unit["speaker"] = speaker
+        cleaned_unit["receiver"] = receiver
+        cleaned_unit["receiver_confidence"] = max(
+            float(cleaned_unit.get("receiver_confidence") or 0.0),
+            0.72 if has_receiver and embedded_receiver else (0.55 if has_receiver else 0.0),
+        )
+        cleaned_unit["receiver_state"] = "confirmed" if embedded_receiver else ("inferred" if has_receiver else "ambiguous")
+        cleaned_unit["analysis_mode"] = analysis_mode
+        content_key = _normalize_unit_content(content)
+        should_append = True
+        for existing_index, existing in enumerate(sanitized_units):
+            if existing.get("speaker") != speaker or existing.get("receiver") != receiver:
+                continue
+            existing_key = _normalize_unit_content(existing.get("content", ""))
+            if not content_key or not existing_key:
+                continue
+            if content_key == existing_key or content_key in existing_key or existing_key in content_key:
+                if len(content_key) < len(existing_key):
+                    sanitized_units[existing_index] = cleaned_unit
+                should_append = False
+                break
+        if not should_append:
+            previous_valid_speaker = speaker
+            continue
+        sanitized_units.append(cleaned_unit)
+
+        characters.setdefault(
+            speaker,
+            {
+                "name": speaker,
+                "role": "",
+                "background": "",
+                "personality_tags": [],
+                "status": "confirmed" if analysis_mode == "dialogue" else "inferred",
+                "confidence": 0.8 if analysis_mode == "dialogue" else 0.65,
+            },
+        )
+        if has_receiver:
+            characters.setdefault(
+                receiver,
+                {
+                    "name": receiver,
+                    "role": "",
+                    "background": "",
+                    "personality_tags": [],
+                    "status": "inferred",
+                    "confidence": 0.6,
+                },
+            )
+            last_partner_by_speaker[speaker] = receiver
+            last_partner_by_speaker[receiver] = speaker
+        previous_valid_speaker = speaker
+
+    sanitized_events = []
+    for event in parsed.get("events", []):
+        actor = _clean_entity_name(event.get("actor", ""))
+        participants = [_clean_entity_name(name) for name in event.get("participants", []) or []]
+        participants = [name for name in participants if name]
+        if not actor and participants:
+            actor = participants[0]
+        if not actor:
+            continue
+        cleaned_event = dict(event)
+        cleaned_event["actor"] = actor
+        cleaned_event["participants"] = _dedupe_text_values([actor] + participants)
+        sanitized_events.append(cleaned_event)
+        characters.setdefault(
+            actor,
+            {
+                "name": actor,
+                "role": "",
+                "background": "",
+                "personality_tags": [],
+                "status": "inferred",
+                "confidence": 0.65,
+            },
+        )
+
+    sanitized_relationships = []
+    for relationship in parsed.get("relationships", []):
+        source = _clean_entity_name(relationship.get("source", ""))
+        target = _clean_entity_name(relationship.get("target", ""))
+        if not source or not target or source == target:
+            continue
+        cleaned_relationship = dict(relationship)
+        cleaned_relationship["source"] = source
+        cleaned_relationship["target"] = target
+        sanitized_relationships.append(cleaned_relationship)
+
+    parsed["characters"] = list(characters.values())
+    parsed["interaction_units"] = sanitized_units
+    parsed["events"] = sanitized_events
+    parsed["relationships"] = sanitized_relationships
+    parsed["import_mode"] = "dialogue_analysis" if detected_type == "dialogue" else "article_evidence"
+    return parsed
+
+
+def _dedupe_text_values(values: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 async def extract_text_from_file(filename: str, content: bytes) -> str:
@@ -797,7 +1020,7 @@ def build_character_profiles(parsed: dict[str, Any]) -> dict[str, Any]:
 
 
 def finalize_import_preview(parsed: dict[str, Any], existing_characters: list[dict], content_text: str, detected_type: str, warning_message: str = "") -> dict[str, Any]:
-    parsed = normalize_import_result(parsed)
+    parsed = sanitize_import_entities(parsed, detected_type)
     for index, unit in enumerate(parsed.get("interaction_units", []), start=1):
         unit["source_line_index"] = unit.get("source_line_index") or index
         unit["psychological_label"] = build_psychological_label(unit)

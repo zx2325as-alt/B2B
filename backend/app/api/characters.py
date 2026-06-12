@@ -50,6 +50,39 @@ def _safe_float(value, default=0.0):
         return default
 
 
+GENERIC_IMPORT_MEMORY_VALUES = {
+    "陈述事实", "补充说明", "回答", "询问", "提问", "直接陈述", "直接回答",
+    "解释", "中性", "对话", "发言", "叙述", "未知", "无",
+}
+
+
+def _unit_analysis_mode(unit: dict[str, Any]) -> str:
+    return (unit.get("analysis_mode") or "dialogue").strip() or "dialogue"
+
+
+def _should_run_import_analysis(unit: dict[str, Any]) -> bool:
+    if _unit_analysis_mode(unit) != "dialogue":
+        return False
+    speaker = (unit.get("speaker") or "").strip()
+    receiver = (unit.get("receiver") or "").strip()
+    return bool(speaker and receiver and speaker != receiver)
+
+
+def _is_useful_import_memory(value: str) -> bool:
+    value = (value or "").strip()
+    if not value or value in GENERIC_IMPORT_MEMORY_VALUES:
+        return False
+    return len(value) >= 3
+
+
+def _build_import_fact_memory(unit: dict[str, Any]) -> str:
+    speaker = (unit.get("speaker") or "").strip()
+    content = (unit.get("content") or "").strip().strip("“”\"")
+    if not speaker or not content:
+        return ""
+    return f"{speaker}相关证据：{content[:180]}"
+
+
 def _resolve_mapping(role_mappings: list, original_name: str) -> dict:
     for mapping in role_mappings:
         if mapping.original_name == original_name:
@@ -1256,6 +1289,8 @@ async def _rebuild_import_analyses(preview: dict[str, Any], resolved_chars: dict
     failures: list[dict[str, Any]] = []
 
     async def _analyze(index: int, unit: dict[str, Any]) -> None:
+        if not _should_run_import_analysis(unit):
+            return
         speaker_name = (unit.get("speaker") or "").strip()
         if not speaker_name or speaker_name not in resolved_chars:
             return
@@ -1407,12 +1442,14 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 speaker_char = resolved_chars[speaker_name]
                 receiver_name = unit.get("receiver", "").strip()
                 resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
-                analysis = analysis_map.get(index)
-                if not isinstance(analysis, dict):
+                analysis = analysis_map.get(index) if _should_run_import_analysis(unit) else {}
+                if _should_run_import_analysis(unit) and not isinstance(analysis, dict):
                     continue
+                if not isinstance(analysis, dict):
+                    analysis = {}
                 message_id = None
                 analysis_message_id = None
-                message_step = 2 if conversation else 0
+                message_step = (2 if _should_run_import_analysis(unit) else 1) if conversation else 0
                 created_relationship = False
                 with db.begin_nested():
                     message_index = next_message_index
@@ -1436,32 +1473,33 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                         db.flush()
                         message_id = msg.id
 
-                        analysis_msg = Message(
-                            conversation_id=conversation.id,
-                            role="assistant",
-                            message_index=message_index + 1,
-                            character_name="AI分析",
-                            receiver_id=resolved_receiver.id if resolved_receiver else None,
-                            receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
-                            content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
-                            intent=(unit.get("intent") or {}).get("value", ""),
-                            strategy=(unit.get("strategy") or {}).get("value", ""),
-                            emotion=(unit.get("emotion") or {}).get("value", ""),
-                            inner_monologue=analysis.get("inner_monologue"),
-                            emotion_label=analysis.get("emotion_attribution"),
-                            emotion_score=0.6,
-                            subtext=analysis.get("strategy_explanation"),
-                            psychological_tag=analysis.get("analysis_tags"),
-                            source_type="import_analysis",
-                            readonly=True,
-                            parent_id=msg.id,
-                        )
-                        db.add(analysis_msg)
-                        db.flush()
-                        analysis_message_id = analysis_msg.id
+                        if _should_run_import_analysis(unit):
+                            analysis_msg = Message(
+                                conversation_id=conversation.id,
+                                role="assistant",
+                                message_index=message_index + 1,
+                                character_name="AI分析",
+                                receiver_id=resolved_receiver.id if resolved_receiver else None,
+                                receiver_name=resolved_receiver.name if resolved_receiver else receiver_name,
+                                content=analysis.get("behavior_tendency", "") or analysis.get("inner_monologue", ""),
+                                intent=(unit.get("intent") or {}).get("value", ""),
+                                strategy=(unit.get("strategy") or {}).get("value", ""),
+                                emotion=(unit.get("emotion") or {}).get("value", ""),
+                                inner_monologue=analysis.get("inner_monologue"),
+                                emotion_label=analysis.get("emotion_attribution"),
+                                emotion_score=0.6,
+                                subtext=analysis.get("strategy_explanation"),
+                                psychological_tag=analysis.get("analysis_tags"),
+                                source_type="import_analysis",
+                                readonly=True,
+                                parent_id=msg.id,
+                            )
+                            db.add(analysis_msg)
+                            db.flush()
+                            analysis_message_id = analysis_msg.id
 
                     relationship_id = None
-                    if resolved_receiver:
+                    if resolved_receiver and _should_run_import_analysis(unit):
                         intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
                         sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
                         interaction_type = (unit.get("interaction_type") or {}).get("value", "")
@@ -1560,16 +1598,27 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                             "source_line_index": source_line_index,
                             "receiver": receiver_name,
                             "analysis": analysis,
+                            "analysis_mode": _unit_analysis_mode(unit),
                         },
                     )
+                    fact_memory = _build_import_fact_memory(unit)
+                    if fact_memory:
+                        _create_memory_item(
+                            db,
+                            character_id=speaker_char.id,
+                            memory_type="fact",
+                            content=fact_memory,
+                            confidence=max(0.55, evidence.confidence),
+                            source="导入文本",
+                            evidence_ids=[evidence.id],
+                        )
                     for memory_type, field_name in [
-                        ("fact", "intent"),
                         ("pragmatics", "strategy"),
                         ("emotion", "emotion"),
                     ]:
                         payload_value = unit.get(field_name) or {}
                         value = (payload_value.get("value") or "").strip()
-                        if value:
+                        if _is_useful_import_memory(value):
                             _create_memory_item(
                                 db,
                                 character_id=speaker_char.id,

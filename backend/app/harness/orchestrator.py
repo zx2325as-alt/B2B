@@ -6,7 +6,6 @@ AI Harness: Orchestrator
 import json
 import asyncio
 import logging
-import os
 import yaml
 from pathlib import Path
 from typing import AsyncGenerator, Any
@@ -30,10 +29,8 @@ def load_config():
             return yaml.safe_load(f) or {}
     return {}
 
-config_data = load_config()
-ai_config = config_data.get("ai", {})
-providers_config = ai_config.get("providers", {})
 client_cache: dict[str, openai.AsyncOpenAI] = {}
+provider_client_signatures: dict[str, str] = {}
 http_client_cache: dict[str, httpx.AsyncClient] = {}
 logger = logging.getLogger("import")
 
@@ -43,6 +40,9 @@ def resolve_provider_name(task_name: str) -> str:
 
 
 def resolve_provider_config(provider_name: str) -> dict[str, Any]:
+    config_data = load_config()
+    ai_config = config_data.get("ai", {})
+    providers_config = ai_config.get("providers", {})
     provider = providers_config.get(provider_name, {})
     if provider:
         return provider
@@ -50,23 +50,9 @@ def resolve_provider_config(provider_name: str) -> dict[str, Any]:
 
 
 def resolve_provider_api_key(provider_name: str, provider_config: dict[str, Any]) -> str | None:
-    env_keys = {
-        "deepseek": ["DEEPSEEK_API_KEY"],
-        "openai": ["OPENAI_API_KEY"],
-        "ollama": ["OLLAMA_API_KEY"],
-        "vllm": ["VLLM_API_KEY"],
-    }
-    for env_key in env_keys.get(provider_name, []):
-        value = os.environ.get(env_key)
-        if value:
-            return value
     config_key = provider_config.get("api_key")
     if config_key:
         return config_key
-    if provider_name == "openai":
-        return os.environ.get("OPENAI_API_KEY")
-    if provider_name == "deepseek":
-        return os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     return None
 
 
@@ -82,21 +68,24 @@ def get_async_http_client(provider_name: str) -> httpx.AsyncClient:
 
 
 def get_openai_client(provider_name: str) -> openai.AsyncOpenAI:
-    client = client_cache.get(provider_name)
-    if client is not None:
-        return client
     provider_config = resolve_provider_config(provider_name)
-    client_kwargs: dict[str, Any] = {
-        "http_client": get_async_http_client(provider_name),
-    }
     api_key = resolve_provider_api_key(provider_name, provider_config)
     base_url = provider_config.get("base_url")
-    if api_key:
-        client_kwargs["api_key"] = api_key
+    signature = f"{provider_name}|{base_url or ''}|{api_key or ''}"
+    cached_signature = provider_client_signatures.get(provider_name)
+    if cached_signature == signature:
+        client = client_cache.get(signature)
+        if client is not None:
+            return client
+    client_kwargs: dict[str, Any] = {
+        "http_client": get_async_http_client(provider_name),
+        "api_key": api_key or "not-used",
+    }
     if base_url:
         client_kwargs["base_url"] = base_url
     client = openai.AsyncOpenAI(**client_kwargs)
-    client_cache[provider_name] = client
+    client_cache[signature] = client
+    provider_client_signatures[provider_name] = signature
     return client
 
 
