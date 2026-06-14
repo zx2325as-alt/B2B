@@ -64,19 +64,28 @@ def chunk_text(content_text: str, chunk_size: int = 2400, overlap: int = 240) ->
 
 
 def detect_import_type(filename: str, content_text: str) -> str:
+    """
+    四种类型：
+    - structured：JSON/CSV
+    - dialogue：带"角色：台词"标记的剧本式文本
+    - profile_document：资料型文本（自述/简历/日记/人物介绍）——无对话、第一人称密集或纯陈述
+    - narrative：第三人称叙事（小说/文章，含"X说/X问"句式）
+    """
     suffix = Path(filename).suffix.lower()
+    if suffix in {".json", ".csv"}:
+        return "structured"
     has_dialogue_marker = any(
         any(dialogue_pattern.match(line.strip()) for dialogue_pattern in DIALOGUE_PATTERNS)
         for line in content_text.splitlines() if line.strip()
     )
-    if suffix in {".json", ".csv"}:
-        return "structured"
-    if suffix in {".md", ".txt", ".pdf", ".docx"}:
-        if has_dialogue_marker:
-            return "dialogue"
-        return "narrative"
     if has_dialogue_marker:
         return "dialogue"
+    sample = content_text[:6000]
+    speaker_hits = len(NARRATIVE_SPEAKER_PATTERN.findall(sample))
+    first_person = sample.count("我")
+    # 第一人称密集（自述/日记）或完全没有叙事说话句式（简介/资料）→ 资料型
+    if first_person >= 8 or speaker_hits == 0:
+        return "profile_document"
     return "narrative"
 
 
@@ -138,6 +147,49 @@ def _merge_character(target: dict[str, Any], source: dict[str, Any]) -> None:
         if tag and tag not in tags:
             tags.append(tag)
     target["personality_tags"] = tags[:8]
+
+
+PERSONA_FACT_CATEGORIES = {
+    "经历", "习惯", "价值观", "技能", "恐惧", "欲望", "人际模式", "语言风格", "健康", "身份背景", "心理特征",
+}
+_GENERIC_SUBJECTS = {"我", "主角", "本人", "笔者", "作者"}
+
+
+def sanitize_persona_facts(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """清洗人物事实：主体名归一（'我'→识别出的主体）、类目兜底、按内容去重"""
+    subject_name = ((parsed.get("subject") or {}).get("name") or "").strip()
+    if subject_name in _GENERIC_SUBJECTS:
+        subject_name = "主角" if subject_name == "我" else subject_name
+    sanitized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for fact in parsed.get("persona_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        raw_subject = (fact.get("subject") or "").strip()
+        if raw_subject in _GENERIC_SUBJECTS or not raw_subject:
+            raw_subject = subject_name or "主角"
+        name = _clean_entity_name(raw_subject) or (raw_subject if raw_subject in {"主角"} else "")
+        content = (fact.get("content") or "").strip()
+        if not name or not content or len(content) < 3:
+            continue
+        category = (fact.get("category") or "").strip()
+        if category not in PERSONA_FACT_CATEGORIES:
+            category = "心理特征"
+        key = (name, _normalize_unit_content(content)[:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        sanitized.append(
+            {
+                "subject": name,
+                "category": category,
+                "content": content[:120],
+                "quote": (fact.get("quote") or "").strip()[:200],
+                "confidence": max(0.0, min(1.0, float(fact.get("confidence") or 0.6))),
+                "time_hint": (fact.get("time_hint") or "").strip()[:40],
+            }
+        )
+    return sanitized
 
 
 def sanitize_import_entities(parsed: dict[str, Any], detected_type: str) -> dict[str, Any]:
@@ -272,11 +324,30 @@ def sanitize_import_entities(parsed: dict[str, Any], detected_type: str) -> dict
         cleaned_relationship["target"] = target
         sanitized_relationships.append(cleaned_relationship)
 
+    # 人物事实：清洗 + 事实主体注册为角色（资料型导入的角色主要来源于此）
+    sanitized_facts = sanitize_persona_facts(parsed)
+    for fact in sanitized_facts:
+        characters.setdefault(
+            fact["subject"],
+            {
+                "name": fact["subject"],
+                "role": "",
+                "background": "",
+                "personality_tags": [],
+                "status": "inferred",
+                "confidence": 0.7,
+            },
+        )
+
     parsed["characters"] = list(characters.values())
     parsed["interaction_units"] = sanitized_units
     parsed["events"] = sanitized_events
     parsed["relationships"] = sanitized_relationships
-    parsed["import_mode"] = "dialogue_analysis" if detected_type == "dialogue" else "article_evidence"
+    parsed["persona_facts"] = sanitized_facts
+    parsed["import_mode"] = (
+        "dialogue_analysis" if detected_type == "dialogue"
+        else ("profile_evidence" if detected_type == "profile_document" else "article_evidence")
+    )
     return parsed
 
 
@@ -566,45 +637,121 @@ def parse_narrative_chunks(content_text: str) -> dict[str, Any]:
     }
 
 
-async def safe_ai_import_parse(file_type: str, content_text: str) -> tuple[dict[str, Any], str]:
-    base_result = parse_dialogue_chunks(content_text) if file_type == "dialogue" else parse_narrative_chunks(content_text)
-    candidate_payloads = build_import_ai_candidate_payloads(file_type, content_text, base_result)
-    last_error = ""
-    timed_out = False
-    for index, payload in enumerate(candidate_payloads):
-        timeout_seconds = 555.0
-        if len(payload) <= 2400:
-            timeout_seconds = 540.0
-        elif len(payload) <= 3200:
-            timeout_seconds = 548.0
-        try:
-            result = await asyncio.wait_for(
-                orchestrator.parse_import_content(file_type, payload),
-                timeout=timeout_seconds,
+# 逐 chunk 解析的安全上限：单块 3000 字 × 24 块 ≈ 7 万字，超出部分仅走规则解析
+AI_PARSE_CHUNK_SIZE = 3000
+AI_PARSE_CHUNK_OVERLAP = 200
+AI_PARSE_MAX_CHUNKS = 24
+AI_PARSE_CONCURRENCY = 3
+AI_PARSE_CHUNK_TIMEOUT = 180.0
+
+
+def _merge_chunk_parse_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """把多个 chunk 的 AI 解析结果合并为一份完整结果"""
+    merged: dict[str, Any] = {
+        "characters": [],
+        "interaction_units": [],
+        "events": [],
+        "relationships": [],
+        "persona_facts": [],
+        "plot_summary": {},
+        "subject": {},
+    }
+    turning_points: list[str] = []
+    seen_unit_signatures: set[tuple[str, str]] = set()
+    seen_event_summaries: set[str] = set()
+    seen_relationship_keys: set[tuple[str, str]] = set()
+    seen_fact_keys: set[tuple[str, str]] = set()
+    for result in results:
+        result = normalize_import_result(result)
+        merged["characters"] = _merge_characters(merged["characters"], result.get("characters", []))
+        for unit in result.get("interaction_units", []):
+            signature = (
+                (unit.get("speaker") or "").strip(),
+                _normalize_unit_content(unit.get("content") or ""),
             )
-            if isinstance(result, dict) and any(result.get(key) for key in ("characters", "interaction_units", "events", "relationships", "plot_summary")):
-                return result, ""
-            last_error = "AI 解析结果格式异常"
-        except asyncio.TimeoutError:
-            last_error = "TimeoutError"
-            timed_out = True
-            if index >= len(candidate_payloads) - 1:
-                break
-            continue
-        except Exception as exc:
-            last_error = str(exc).strip() or exc.__class__.__name__
-            normalized_error = last_error.lower()
-            if (
-                "402" in normalized_error
-                or "payment required" in normalized_error
-                or "insufficient balance" in normalized_error
-            ):
-                return {}, "DeepSeek 余额不足，已自动跳过 AI 增强，当前展示基础规则解析结果。"
-    if timed_out and last_error == "TimeoutError":
-        return {}, "AI 解析超时，已自动切换为更稳定的基础规则解析结果。"
-    if last_error:
-        return {}, f"AI 解析暂时不可用，已切换为基础规则解析。原因：{last_error[:120]}"
-    return {}, "AI 解析暂时不可用，已切换为基础规则解析。"
+            if not signature[1] or signature in seen_unit_signatures:
+                continue
+            seen_unit_signatures.add(signature)
+            unit = dict(unit)
+            unit["source_line_index"] = len(merged["interaction_units"]) + 1
+            merged["interaction_units"].append(unit)
+        for event in result.get("events", []):
+            summary_key = (event.get("summary") or "").strip()[:80]
+            if summary_key and summary_key in seen_event_summaries:
+                continue
+            seen_event_summaries.add(summary_key)
+            merged["events"].append(event)
+        for relationship in result.get("relationships", []):
+            key = ((relationship.get("source") or "").strip(), (relationship.get("target") or "").strip())
+            if not key[0] or not key[1] or key in seen_relationship_keys:
+                continue
+            seen_relationship_keys.add(key)
+            merged["relationships"].append(relationship)
+        for fact in result.get("persona_facts") or []:
+            if not isinstance(fact, dict):
+                continue
+            key = ((fact.get("subject") or "").strip(), (fact.get("content") or "").strip()[:40])
+            if not key[1] or key in seen_fact_keys:
+                continue
+            seen_fact_keys.add(key)
+            merged["persona_facts"].append(fact)
+        subject = result.get("subject") or {}
+        if isinstance(subject, dict) and subject.get("name"):
+            if float(subject.get("confidence") or 0) >= float(merged["subject"].get("confidence") or 0):
+                merged["subject"] = subject
+        plot = result.get("plot_summary") or {}
+        if plot.get("main_conflict") and not merged["plot_summary"].get("main_conflict"):
+            merged["plot_summary"]["main_conflict"] = plot["main_conflict"]
+        if plot.get("relationship_path") and not merged["plot_summary"].get("relationship_path"):
+            merged["plot_summary"]["relationship_path"] = plot["relationship_path"]
+        for point in plot.get("turning_points") or []:
+            if point and point not in turning_points:
+                turning_points.append(point)
+    if turning_points:
+        merged["plot_summary"]["turning_points"] = turning_points[:8]
+    return merged
+
+
+async def safe_ai_import_parse(file_type: str, content_text: str) -> tuple[dict[str, Any], str]:
+    """
+    全量逐 chunk AI 解析：每块独立调用、并发受限、单块失败不影响整体。
+    返回 (合并结果, 警告信息)；全部失败时返回空结果并附带降级原因。
+    """
+    chunks = chunk_text(content_text, chunk_size=AI_PARSE_CHUNK_SIZE, overlap=AI_PARSE_CHUNK_OVERLAP)
+    truncated = len(chunks) > AI_PARSE_MAX_CHUNKS
+    chunks = chunks[:AI_PARSE_MAX_CHUNKS]
+    semaphore = asyncio.Semaphore(AI_PARSE_CONCURRENCY)
+
+    async def _parse_chunk(chunk: str) -> dict[str, Any] | Exception:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    orchestrator.parse_import_content(file_type, chunk),
+                    timeout=AI_PARSE_CHUNK_TIMEOUT,
+                )
+            except Exception as exc:
+                return exc
+
+    outcomes = await asyncio.gather(*(_parse_chunk(chunk) for chunk in chunks))
+    successes = [item for item in outcomes if isinstance(item, dict)]
+    errors = [item for item in outcomes if isinstance(item, Exception)]
+
+    for error in errors:
+        text = str(error).lower()
+        if "402" in text or "payment required" in text or "insufficient balance" in text:
+            return {}, "DeepSeek 余额不足，已自动跳过 AI 增强，当前展示基础规则解析结果。"
+
+    if not successes:
+        reason = str(errors[0])[:120] if errors else "AI 解析结果为空"
+        return {}, f"AI 解析暂时不可用，已切换为基础规则解析。原因：{reason}"
+
+    merged = _merge_chunk_parse_results(successes)
+    warning = ""
+    if errors:
+        warning = f"AI 解析部分降级：{len(errors)}/{len(chunks)} 个文本块失败，已用规则解析结果补齐。"
+    if truncated:
+        warning = (warning + " " if warning else "") + f"文件过长，AI 仅增强前 {AI_PARSE_MAX_CHUNKS} 块（约 {AI_PARSE_MAX_CHUNKS * AI_PARSE_CHUNK_SIZE} 字），其余走规则解析。"
+    return merged, warning
 
 
 def normalize_import_result(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -613,90 +760,10 @@ def normalize_import_result(parsed: dict[str, Any]) -> dict[str, Any]:
     normalized["interaction_units"] = normalized.get("interaction_units") if isinstance(normalized.get("interaction_units"), list) else []
     normalized["events"] = normalized.get("events") if isinstance(normalized.get("events"), list) else []
     normalized["relationships"] = normalized.get("relationships") if isinstance(normalized.get("relationships"), list) else []
+    normalized["persona_facts"] = normalized.get("persona_facts") if isinstance(normalized.get("persona_facts"), list) else []
     normalized["plot_summary"] = normalized.get("plot_summary") if isinstance(normalized.get("plot_summary"), dict) else {}
+    normalized["subject"] = normalized.get("subject") if isinstance(normalized.get("subject"), dict) else {}
     return normalized
-
-
-def build_import_ai_candidate_payloads(file_type: str, content_text: str, base_result: dict[str, Any]) -> list[str]:
-    candidate_payloads = []
-    text_snippet = "\n".join(line.strip() for line in content_text.splitlines() if line.strip())[:1200]
-    compact_structure = {
-        "file_type": file_type,
-        "characters": [
-            {
-                "name": item.get("name", ""),
-                "role": item.get("role", ""),
-                "status": item.get("status", ""),
-            }
-            for item in base_result.get("characters", [])[:12]
-        ],
-        "interaction_units": [
-            {
-                "source_line_index": item.get("source_line_index", index),
-                "speaker": item.get("speaker", ""),
-                "receiver": item.get("receiver", ""),
-                "content": (item.get("content", "") or "")[:72],
-            }
-            for index, item in enumerate(base_result.get("interaction_units", [])[:16], start=1)
-        ],
-        "events": [
-            {
-                "actor": item.get("actor", ""),
-                "action": item.get("action", ""),
-                "participants": item.get("participants", []),
-                "summary": (item.get("summary", "") or "")[:72],
-            }
-            for item in base_result.get("events", [])[:10]
-        ],
-        "text_snippet": text_snippet,
-    }
-    primary_payload = json.dumps(compact_structure, ensure_ascii=False)
-    if primary_payload:
-        candidate_payloads.append(primary_payload[:2600])
-    dialogue_excerpt = []
-    for index, item in enumerate(base_result.get("interaction_units", [])[:12], start=1):
-        dialogue_excerpt.append(
-            f"{index}. {item.get('speaker', '')} -> {item.get('receiver', '待推断')} : {(item.get('content', '') or '')[:60]}"
-        )
-    event_excerpt = []
-    for index, item in enumerate(base_result.get("events", [])[:8], start=1):
-        event_excerpt.append(
-            f"{index}. {item.get('actor', '')} / {item.get('action', '')} / {(item.get('summary', '') or '')[:60]}"
-        )
-    secondary_payload = "\n".join(
-        block for block in [
-            f"文件类型: {file_type}",
-            f"文本摘要:\n{text_snippet[:1000]}",
-            "规则解析角色:\n" + "\n".join(
-                f"- {item.get('name', '')}｜{item.get('role', '')}｜{item.get('status', '')}"
-                for item in base_result.get("characters", [])[:12]
-            ),
-            "规则解析交互:\n" + "\n".join(dialogue_excerpt),
-            "规则解析事件:\n" + "\n".join(event_excerpt),
-        ]
-        if block.strip()
-    )
-    if secondary_payload and secondary_payload not in candidate_payloads:
-        candidate_payloads.append(secondary_payload[:1800])
-    ultra_compact_payload = json.dumps(
-        {
-            "file_type": file_type,
-            "character_names": [
-                (item.get("name") or "").strip()
-                for item in base_result.get("characters", [])[:8]
-                if (item.get("name") or "").strip()
-            ],
-            "interaction_excerpt": dialogue_excerpt[:8],
-            "event_excerpt": event_excerpt[:6],
-            "text_snippet": text_snippet[:700],
-        },
-        ensure_ascii=False,
-    )
-    if ultra_compact_payload and ultra_compact_payload not in candidate_payloads:
-        candidate_payloads.append(ultra_compact_payload[:1200])
-    if text_snippet and text_snippet not in candidate_payloads and len(text_snippet) <= 900:
-        candidate_payloads.append(text_snippet[:900])
-    return candidate_payloads
 
 
 def build_psychological_label(unit: dict[str, Any]) -> str:
@@ -1054,6 +1121,17 @@ async def build_import_preview(filename: str, content_text: str, existing_charac
         if enable_ai:
             llm_result, warning_message = await safe_ai_import_parse(detected_type, content_text)
             parsed = merge_ai_parse_result(parsed, llm_result)
+    elif detected_type == "profile_document":
+        # 资料型文本没有可用的规则解析层，骨架为空，主要产出来自 AI 事实抽取
+        parsed = {
+            "characters": [], "interaction_units": [], "events": [],
+            "relationships": [], "persona_facts": [], "plot_summary": {}, "subject": {},
+        }
+        if enable_ai:
+            llm_result, warning_message = await safe_ai_import_parse(detected_type, content_text)
+            parsed = merge_ai_parse_result(parsed, llm_result)
+            if not (parsed.get("persona_facts") or parsed.get("characters")):
+                warning_message = warning_message or "资料型文本未能抽取出人物信息，请检查文件内容。"
     else:
         parsed = parse_narrative_chunks(content_text)
         if enable_ai:
@@ -1071,7 +1149,7 @@ def merge_ai_parse_result(base_result: dict[str, Any], ai_result: dict[str, Any]
         merged["characters"] = ai_result["characters"] if len(ai_result["characters"]) >= len(base_result.get("characters", [])) else _merge_characters(base_result.get("characters", []), ai_result["characters"])
     if ai_result.get("interaction_units"):
         merged["interaction_units"] = _merge_interaction_units(base_result.get("interaction_units", []), ai_result["interaction_units"])
-    for key in ("events", "relationships", "plot_summary"):
+    for key in ("events", "relationships", "plot_summary", "persona_facts", "subject"):
         if ai_result.get(key):
             merged[key] = ai_result[key]
     return merged
@@ -1086,10 +1164,22 @@ def _merge_characters(base_characters: list[dict[str, Any]], ai_characters: list
             continue
         if name in character_index:
             idx = character_index[name]
-            merged[idx].update({k: v for k, v in ai_item.items() if v not in ("", None, [], {})})
+            existing = merged[idx]
+            for key, value in ai_item.items():
+                if value in ("", None, [], {}):
+                    continue
+                # 列表字段（如 personality_tags）做并集合并，避免后一个 chunk 覆盖前一个的发现
+                if isinstance(value, list) and isinstance(existing.get(key), list):
+                    combined = list(existing[key])
+                    for item in value:
+                        if item not in combined:
+                            combined.append(item)
+                    existing[key] = combined
+                else:
+                    existing[key] = value
         else:
             character_index[name] = len(merged)
-            merged.append(ai_item)
+            merged.append(dict(ai_item))
     return merged
 
 
@@ -1135,10 +1225,16 @@ def build_role_mappings(parsed_characters: list[dict], existing_characters: list
         candidates = []
         for existing in existing_characters:
             score = 0
+            aliases = existing.get("aliases") or []
             if existing["name"] == name:
+                score += 10
+            elif name in aliases:
+                # 别名精确命中：和本名命中同等可信（"张总"已记录为"张三"的别名）
                 score += 10
             elif existing["name"] in name or name in existing["name"]:
                 score += 5
+            elif any(alias and (alias in name or name in alias) for alias in aliases):
+                score += 4
             role = existing.get("role") or ""
             if role and role == character.get("role"):
                 score += 2

@@ -1,6 +1,20 @@
 import axios from 'axios'
+import { toast } from '../utils/notify.js'
 
 const api = axios.create({ baseURL: '/api/v1' })
+
+// 全局错误提示：所有 axios 请求失败都给用户可见反馈，不再静默吞掉
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const detail = error?.response?.data?.detail
+    const message = typeof detail === 'string'
+      ? detail
+      : (detail ? JSON.stringify(detail) : (error?.message || '请求失败'))
+    toast.error(message)
+    return Promise.reject(error)
+  }
+)
 
 // ── Characters ──────────────────────────────────────────────────────────────
 export const characterApi = {
@@ -20,6 +34,10 @@ export const characterApi = {
   listEvidence: (id, limit = 80) => api.get(`/characters/${id}/evidence`, { params: { limit } }),
   listMemories: (id, memoryType = '') => api.get(`/characters/${id}/memories`, { params: memoryType ? { memory_type: memoryType } : {} }),
   listSnapshots: (id)          => api.get(`/characters/${id}/snapshots`),
+  listHypotheses: (id, status = '') => api.get(`/characters/${id}/hypotheses`, { params: status ? { status } : {} }),
+  restoreSnapshot: (id, snapshotId) => api.post(`/characters/${id}/snapshots/${snapshotId}/restore`),
+  mergeCharacter: (targetId, sourceId) => api.post(`/characters/${targetId}/merge`, { source_id: sourceId }),
+  compactAll: ()               => api.post('/characters/maintenance/compact'),
   listDiagnoses: (id, limit = 80) => api.get(`/characters/${id}/diagnoses`, { params: { limit } }),
   runLongContextReview: (id, data = {}) => api.post(`/characters/${id}/long-context-review`, data),
   graphHealth: ()              => api.get('/characters/graph/health'),
@@ -50,12 +68,18 @@ export const relationshipApi = {
 export const chatApi = {
   listConversations: ()        => api.get('/chat/conversations'),
   createConversation: (data)   => api.post('/chat/conversations', data),
+  updateConversation: (id, data) => api.patch(`/chat/conversations/${id}`, data),
   deleteConversation: (id)     => api.delete(`/chat/conversations/${id}`),
   getMessages: (id)            => api.get(`/chat/conversations/${id}/messages`),
+  getPerspectives: (id)        => api.get(`/chat/conversations/${id}/perspectives`),
   createBranch: (cid, mid)     => api.post(`/chat/conversations/${cid}/branch/${mid}`),
+  listBranches: (cid)          => api.get(`/chat/conversations/${cid}/branches`),
+  switchBranch: (cid, branchId) => api.post(`/chat/conversations/${cid}/switch-branch`, { branch_id: branchId }),
   getEmotionCurve: (cid, name) => api.get(`/chat/conversations/${cid}/emotion-curve/${name}`),
   getEmotionTension: (cid, source, target) => api.get(`/chat/conversations/${cid}/emotion-tension`, { params: { source, target } }),
+  getStates: (cid)             => api.get(`/chat/conversations/${cid}/states`),
   reanalyzeMessage: (id)       => api.post(`/chat/messages/${id}/reanalyze`),
+  editMessage: (id, content)   => api.put(`/chat/messages/${id}`, { content }),
   archiveConversation: (cid, data) => api.post(`/chat/conversations/${cid}/archive`, data),
   previewEvidencePack: (cid, data) => api.post(`/chat/conversations/${cid}/evidence-pack`, data),
   listRetrievalTraces: (cid, limit = 20) => api.get(`/chat/conversations/${cid}/retrieval-traces`, { params: { limit } }),
@@ -69,9 +93,10 @@ export const chatApi = {
  * @param {object} payload
  * @param {function} onDelta   - 每个文字片段回调
  * @param {function} onDone    - 完成回调，传入完整结果
+ * @param {function} onSaved   - 消息落库回调，传入 { user_message_id, ai_message_id }
  * @param {function} onError   - 错误回调
  */
-export async function sendMessageStream(payload, { onDelta, onDone, onError, signal }) {
+export async function sendMessageStream(payload, { onDelta, onDone, onSaved, onError, signal }) {
   try {
     const response = await fetch('/api/v1/chat/send', {
       method: 'POST',
@@ -79,6 +104,17 @@ export async function sendMessageStream(payload, { onDelta, onDone, onError, sig
       body: JSON.stringify(payload),
       signal,
     })
+
+    // 非 2xx（403 只读会话 / 422 参数错误等）不是 SSE 流，必须显式报错
+    if (!response.ok) {
+      let message = `请求失败 (${response.status})`
+      try {
+        const body = await response.json()
+        if (body?.detail) message = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+      } catch { /* 忽略响应体解析失败 */ }
+      onError?.(message)
+      return
+    }
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
@@ -99,8 +135,9 @@ export async function sendMessageStream(payload, { onDelta, onDone, onError, sig
           const msg = JSON.parse(raw)
           if (msg.type === 'delta') onDelta?.(msg.text)
           else if (msg.type === 'done') onDone?.(msg.result)
+          else if (msg.type === 'saved') onSaved?.(msg)
           else if (msg.type === 'error') onError?.(msg.message)
-        } catch {}
+        } catch { /* 忽略不完整的 SSE 行 */ }
       }
     }
   } catch (err) {

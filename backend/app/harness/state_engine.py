@@ -1,8 +1,18 @@
+"""
+持续心理状态引擎（DB 持久化版）
+- 状态存储在 conversation_states 表，进程重启 / --reload 不丢失
+- bootstrap 只在该会话×角色首次出现时从档案初始化，之后只做增量补全，
+  不再覆盖上一轮 update_after_analysis 的演化结果
+- update_after_analysis 直接消费 chat_analysis 的结构化 JSON，不再正则解析标签串
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from sqlalchemy.orm import Session
+
+from ..models.sql_models import ConversationState
 
 DEFAULT_EMOTIONS = {
     "calm": 0.5,
@@ -25,75 +35,156 @@ class PsychologicalState:
     last_intent: str = ""
     last_strategy: str = ""
     consistency_note: str = ""
+    bootstrapped: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "PsychologicalState":
+        data = data or {}
+        state = cls()
+        for key in (
+            "current_goal", "defense_style", "last_intent",
+            "last_strategy", "consistency_note",
+        ):
+            if isinstance(data.get(key), str) and data[key]:
+                setattr(state, key, data[key])
+        if isinstance(data.get("emotion_vector"), dict):
+            state.emotion_vector = {**DEFAULT_EMOTIONS, **{
+                k: float(v) for k, v in data["emotion_vector"].items()
+                if isinstance(v, (int, float))
+            }}
+        if isinstance(data.get("beliefs"), dict):
+            state.beliefs = {str(k): str(v) for k, v in data["beliefs"].items()}
+        if isinstance(data.get("relationship_weights"), dict):
+            state.relationship_weights = {
+                str(k): float(v) for k, v in data["relationship_weights"].items()
+                if isinstance(v, (int, float))
+            }
+        if isinstance(data.get("stable_traits"), list):
+            state.stable_traits = [str(item) for item in data["stable_traits"] if item][:8]
+        if isinstance(data.get("behavior_patterns"), list):
+            state.behavior_patterns = [str(item) for item in data["behavior_patterns"] if item][:8]
+        state.bootstrapped = bool(data.get("bootstrapped"))
+        return state
 
 
 class PsychologicalStateEngine:
-    def __init__(self):
-        self._store: dict[int, dict[str, PsychologicalState]] = {}
+    """读写均走 DB；同一请求内通过传入同一个 Session 保证一致性"""
 
-    def get_state(self, conversation_id: int, character_name: str) -> PsychologicalState:
-        conv_state = self._store.setdefault(conversation_id, {})
-        return conv_state.setdefault(character_name, PsychologicalState())
+    def _get_row(self, db: Session, conversation_id: int, character_name: str) -> ConversationState | None:
+        return db.query(ConversationState).filter(
+            ConversationState.conversation_id == conversation_id,
+            ConversationState.character_name == character_name,
+        ).first()
+
+    def get_state(self, db: Session, conversation_id: int, character_name: str) -> PsychologicalState:
+        row = self._get_row(db, conversation_id, character_name)
+        return PsychologicalState.from_dict(row.state_json if row else None)
+
+    def save_state(self, db: Session, conversation_id: int, character_name: str, state: PsychologicalState) -> None:
+        row = self._get_row(db, conversation_id, character_name)
+        payload = asdict(state)
+        if row:
+            row.state_json = payload
+        else:
+            row = ConversationState(
+                conversation_id=conversation_id,
+                character_name=character_name,
+                state_json=payload,
+            )
+            db.add(row)
+        db.flush()
 
     def bootstrap_state(
         self,
+        db: Session,
         conversation_id: int,
         character_name: str,
         character_profile: dict[str, Any] | None = None,
         relationship_snapshot: dict[str, Any] | None = None,
         observations: list[str] | None = None,
     ) -> PsychologicalState:
-        state = self.get_state(conversation_id, character_name)
+        state = self.get_state(db, conversation_id, character_name)
         profile = character_profile or {}
-        state.stable_traits = [tag for tag in profile.get("personality_tags", []) if tag][:6]
-        state.behavior_patterns = [item for item in (observations or []) if item][:6]
-        state.current_goal = profile.get("motivation") or state.current_goal
-        state.defense_style = profile.get("weakness") or state.defense_style
-        if relationship_snapshot:
-            for key in ("trust", "dependency", "dominance", "fear", "attraction"):
-                if relationship_snapshot.get(key) is not None:
-                    state.relationship_weights[key] = float(relationship_snapshot[key])
-            belief_key = relationship_snapshot.get("target_name")
-            belief_value = relationship_snapshot.get("belief")
-            if belief_key and belief_value:
-                state.beliefs[belief_key] = belief_value
+
+        if not state.bootstrapped:
+            # 首次：从档案完整初始化
+            state.stable_traits = [tag for tag in profile.get("personality_tags", []) if tag][:6]
+            state.behavior_patterns = [item for item in (observations or []) if item][:6]
+            state.current_goal = profile.get("motivation") or state.current_goal
+            state.defense_style = profile.get("weakness") or state.defense_style
+            if relationship_snapshot:
+                for key in ("trust", "dependency", "dominance", "fear", "attraction"):
+                    if relationship_snapshot.get(key) is not None:
+                        state.relationship_weights[key] = float(relationship_snapshot[key])
+                belief_key = relationship_snapshot.get("target_name")
+                belief_value = relationship_snapshot.get("belief")
+                if belief_key and belief_value:
+                    state.beliefs[belief_key] = belief_value
+            state.bootstrapped = True
+        else:
+            # 后续：只补空缺，不覆盖演化结果
+            if not state.stable_traits:
+                state.stable_traits = [tag for tag in profile.get("personality_tags", []) if tag][:6]
+            if not state.behavior_patterns and observations:
+                state.behavior_patterns = [item for item in observations if item][:6]
+
+        self.save_state(db, conversation_id, character_name, state)
         return state
 
     def update_after_analysis(
         self,
+        db: Session,
         conversation_id: int,
         speaker_name: str,
         listener_name: str,
         analysis_result: dict[str, Any],
     ) -> None:
-        listener_state = self.get_state(conversation_id, listener_name)
-        speaker_state = self.get_state(conversation_id, speaker_name)
+        """消费结构化分析结果，演化双方状态（EMA 平滑，避免单轮剧烈跳变）"""
+        listener_state = self.get_state(db, conversation_id, listener_name)
+        speaker_state = self.get_state(db, conversation_id, speaker_name)
 
-        emotion_label = analysis_result.get("emotion_label", "")
-        intended = self._extract_score(emotion_label, "试图激发")
-        surface = self._extract_score(emotion_label, "表层")
-        deep = self._extract_score(emotion_label, "深层")
-        suppressed = self._extract_score(emotion_label, "压抑")
+        emotions = analysis_result.get("emotions") or {}
+
+        def _score(key: str) -> float | None:
+            item = emotions.get(key) or {}
+            value = item.get("score")
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+
+        def _blend(old: float, target: float, weight: float = 0.5) -> float:
+            return max(0.0, min(1.0, old * (1 - weight) + target * weight))
+
+        surface = _score("surface")
+        deep = _score("deep")
+        suppressed = _score("suppressed")
+        intended = _score("intended")
 
         if surface is not None:
-            listener_state.emotion_vector["calm"] = max(0.0, 1.0 - surface / 10)
+            listener_state.emotion_vector["calm"] = _blend(
+                listener_state.emotion_vector.get("calm", 0.5), 1.0 - surface / 10)
         if deep is not None:
-            listener_state.emotion_vector["guarded"] = min(1.0, deep / 10)
+            listener_state.emotion_vector["guarded"] = _blend(
+                listener_state.emotion_vector.get("guarded", 0.4), deep / 10)
         if suppressed is not None:
-            listener_state.emotion_vector["anger"] = min(1.0, suppressed / 10)
-
-        strategy_text = analysis_result.get("subtext", "")
-        intent_line, strategy_line = self._split_strategy(strategy_text)
-        speaker_state.last_intent = intent_line
-        speaker_state.last_strategy = strategy_line
-        listener_state.consistency_note = self._extract_consistency(strategy_text)
-
-        tags = [tag.strip() for tag in (analysis_result.get("psychological_tag", "") or "").split("|") if tag.strip()]
-        for tag in tags:
-            if "关系" in tag or "信任" in tag:
-                listener_state.beliefs[speaker_name] = tag
+            listener_state.emotion_vector["anger"] = _blend(
+                listener_state.emotion_vector.get("anger", 0.2), suppressed / 10)
         if intended is not None:
-            listener_state.relationship_weights["pressure"] = intended / 10
+            listener_state.relationship_weights["pressure"] = _blend(
+                listener_state.relationship_weights.get("pressure", 0.0), intended / 10)
+
+        strategy = analysis_result.get("strategy") or {}
+        speaker_state.last_intent = str(strategy.get("short_term") or speaker_state.last_intent)
+        speaker_state.last_strategy = str(strategy.get("long_term") or speaker_state.last_strategy)
+        listener_state.consistency_note = str(strategy.get("consistency_note") or listener_state.consistency_note)
+
+        tags = analysis_result.get("tags") or {}
+        relation_tag = str(tags.get("relation") or "").strip()
+        if relation_tag:
+            listener_state.beliefs[speaker_name] = relation_tag
+
+        self.save_state(db, conversation_id, listener_name, listener_state)
+        self.save_state(db, conversation_id, speaker_name, speaker_state)
 
     def render_state_block(self, character_name: str, state: PsychologicalState) -> str:
         beliefs = "；".join(f"{name}:{value}" for name, value in state.beliefs.items()) or "暂无"
@@ -116,26 +207,6 @@ class PsychologicalStateEngine:
                 f"- 一致性说明：{state.consistency_note or '暂无'}",
             ]
         )
-
-    def _extract_score(self, label: str, prefix: str) -> int | None:
-        if not label or prefix not in label:
-            return None
-        try:
-            segment = label.split(prefix, 1)[1]
-            number = segment.split("(", 1)[1].split(")", 1)[0]
-            return int(number)
-        except Exception:
-            return None
-
-    def _split_strategy(self, strategy_text: str) -> tuple[str, str]:
-        lines = [line.strip() for line in strategy_text.splitlines() if line.strip()]
-        short = next((line.replace("短期策略：", "").strip() for line in lines if line.startswith("短期策略：")), "")
-        long = next((line.replace("长期策略：", "").strip() for line in lines if line.startswith("长期策略：")), "")
-        return short, long
-
-    def _extract_consistency(self, strategy_text: str) -> str:
-        lines = [line.strip() for line in strategy_text.splitlines() if line.strip()]
-        return next((line.replace("一致性说明：", "").strip() for line in lines if line.startswith("一致性说明：")), "")
 
 
 state_engine = PsychologicalStateEngine()

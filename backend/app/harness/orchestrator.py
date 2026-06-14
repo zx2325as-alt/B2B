@@ -6,8 +6,6 @@ AI Harness: Orchestrator
 import json
 import asyncio
 import logging
-import yaml
-from pathlib import Path
 from typing import AsyncGenerator, Any
 
 import openai
@@ -16,22 +14,12 @@ import httpx
 from .prompt_templates import prompt_registry
 from .model_router import model_router, guardrails, GuardrailError
 from .context_manager import get_context
-from .state_engine import state_engine
-
-
-# 读取 YAML 配置文件
-CONF_DIR = Path(__file__).parent.parent / "conf"
-CONFIG_FILE = CONF_DIR / "config.yaml"
-
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+from .config_loader import get_ai_config, get_task_timeout
+from .analysis_schema import normalize_chat_analysis
 
 client_cache: dict[str, openai.AsyncOpenAI] = {}
 provider_client_signatures: dict[str, str] = {}
-http_client_cache: dict[str, httpx.AsyncClient] = {}
+_http_client: httpx.AsyncClient | None = None
 logger = logging.getLogger("import")
 
 
@@ -40,36 +28,25 @@ def resolve_provider_name(task_name: str) -> str:
 
 
 def resolve_provider_config(provider_name: str) -> dict[str, Any]:
-    config_data = load_config()
-    ai_config = config_data.get("ai", {})
-    providers_config = ai_config.get("providers", {})
+    providers_config = get_ai_config().get("providers", {}) or {}
     provider = providers_config.get(provider_name, {})
     if provider:
         return provider
-    return providers_config.get("deepseek", {})
+    return providers_config.get("deepseek", {}) or {}
 
 
-def resolve_provider_api_key(provider_name: str, provider_config: dict[str, Any]) -> str | None:
-    config_key = provider_config.get("api_key")
-    if config_key:
-        return config_key
-    return None
-
-
-def get_async_http_client(provider_name: str) -> httpx.AsyncClient:
-    client = http_client_cache.get(provider_name)
-    if client is None:
-        client = httpx.AsyncClient(
+def get_async_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout=180.0, connect=30.0),
-            verify=False,
         )
-        http_client_cache[provider_name] = client
-    return client
+    return _http_client
 
 
 def get_openai_client(provider_name: str) -> openai.AsyncOpenAI:
     provider_config = resolve_provider_config(provider_name)
-    api_key = resolve_provider_api_key(provider_name, provider_config)
+    api_key = provider_config.get("api_key") or None
     base_url = provider_config.get("base_url")
     signature = f"{provider_name}|{base_url or ''}|{api_key or ''}"
     cached_signature = provider_client_signatures.get(provider_name)
@@ -78,7 +55,7 @@ def get_openai_client(provider_name: str) -> openai.AsyncOpenAI:
         if client is not None:
             return client
     client_kwargs: dict[str, Any] = {
-        "http_client": get_async_http_client(provider_name),
+        "http_client": get_async_http_client(),
         "api_key": api_key or "not-used",
     }
     if base_url:
@@ -97,7 +74,15 @@ class AIOrchestrator:
     - 模型路由
     - 输出校验
     - 上下文管理
+    - 任务级超时（config.yaml ai.task_timeouts）
     """
+
+    async def _create_completion(self, task_name: str, client, request_kwargs: dict[str, Any]):
+        timeout = get_task_timeout(task_name)
+        return await asyncio.wait_for(
+            client.chat.completions.create(**request_kwargs),
+            timeout=timeout,
+        )
 
     async def call(
         self,
@@ -127,7 +112,10 @@ class AIOrchestrator:
             messages = [{"role": "user", "content": user_content}]
             system = prompt["system"]
 
+        last_error: Exception | None = None
         for attempt in range(retries + 1):
+            raw = ""
+            finish_reason = None
             try:
                 openai_messages = [{"role": "system", "content": system}] + messages
                 request_kwargs: dict[str, Any] = {
@@ -140,7 +128,7 @@ class AIOrchestrator:
                     request_kwargs["response_format"] = {"type": "json_object"}
                 if request_overrides:
                     request_kwargs.update(request_overrides)
-                response = await client.chat.completions.create(**request_kwargs)
+                response = await self._create_completion(task_name, client, request_kwargs)
                 raw = response.choices[0].message.content or ""
                 finish_reason = response.choices[0].finish_reason if response.choices else None
                 result = guardrails.process(task_name, raw)
@@ -155,15 +143,7 @@ class AIOrchestrator:
                 )
                 return result
             except GuardrailError as e:
-                finish_reason = None
-                raw_len = 0
-                raw_tail = ""
-                try:
-                    finish_reason = response.choices[0].finish_reason if response.choices else None
-                    raw_len = len(raw)
-                    raw_tail = raw[-160:]
-                except Exception:
-                    pass
+                last_error = e
                 logger.warning(
                     "AI 输出校验失败 task=%s provider=%s model=%s attempt=%s finish_reason=%s raw_len=%s raw_tail=%s error=%s",
                     task_name,
@@ -171,14 +151,20 @@ class AIOrchestrator:
                     model_cfg.model,
                     attempt + 1,
                     finish_reason,
-                    raw_len,
-                    raw_tail,
+                    len(raw),
+                    raw[-160:],
                     e,
                 )
                 if attempt == retries:
                     raise
+                # 把字段级错误回传给下一次重试，显著提高自我修复成功率
+                messages = messages + [
+                    {"role": "assistant", "content": raw[:4000]},
+                    {"role": "user", "content": f"上一次输出未通过校验：{e}。请严格按照 system 中的 JSON 结构重新输出完整 JSON。"},
+                ]
                 await asyncio.sleep(0.5)
             except Exception as e:
+                last_error = e
                 logger.warning(
                     "AI 调用异常 task=%s provider=%s model=%s attempt=%s error=%s",
                     task_name,
@@ -190,6 +176,7 @@ class AIOrchestrator:
                 if attempt == retries:
                     raise
                 await asyncio.sleep(1.0)
+        raise last_error or RuntimeError(f"AI 调用失败：{task_name}")
 
     async def call_text(
         self,
@@ -216,11 +203,15 @@ class AIOrchestrator:
         for attempt in range(retries + 1):
             try:
                 openai_messages = [{"role": "system", "content": system}] + messages
-                response = await client.chat.completions.create(
-                    model=model_cfg.model,
-                    max_tokens=model_cfg.max_tokens,
-                    temperature=model_cfg.temperature,
-                    messages=openai_messages,
+                response = await self._create_completion(
+                    task_name,
+                    client,
+                    {
+                        "model": model_cfg.model,
+                        "max_tokens": model_cfg.max_tokens,
+                        "temperature": model_cfg.temperature,
+                        "messages": openai_messages,
+                    },
                 )
                 return (response.choices[0].message.content or "").strip()
             except Exception:
@@ -239,11 +230,12 @@ class AIOrchestrator:
         speaker_state_block: str = "",
         listener_state_block: str = "",
         consistency_block: str = "",
-        listener_name: str = "",
+        viewers_block: str = "",
     ) -> AsyncGenerator[str, None]:
         """
-        流式聊天分析
+        流式聊天分析（表层回复流式 + 主接收方结构化分析 + 多视角分析）
         Yields: SSE data chunks (JSON strings)
+        状态机更新由调用方（chat.py）基于 done 结果执行，本层不写状态。
         """
         surface_prompt = prompt_registry.render(
             "chat_surface_reply",
@@ -255,20 +247,24 @@ class AIOrchestrator:
         surface_cfg = model_router.route("chat_surface_reply", len(content))
         client = get_openai_client(surface_cfg.provider)
         ctx = get_context(conversation_id)
+        memory_blocks = "\n\n".join(
+            block for block in [character_memory, speaker_state_block, listener_state_block, consistency_block] if block
+        )
         messages, system = ctx.build_messages(
-            surface_prompt["system"], surface_prompt["user"], "\n\n".join(
-                block for block in [character_memory, speaker_state_block, listener_state_block, consistency_block] if block
-            )
+            surface_prompt["system"], surface_prompt["user"], memory_blocks
         )
 
         try:
             openai_messages = [{"role": "system", "content": system}] + messages
-            response = await client.chat.completions.create(
-                model=surface_cfg.model,
-                max_tokens=surface_cfg.max_tokens,
-                temperature=surface_cfg.temperature,
-                messages=openai_messages,
-                stream=True
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=surface_cfg.model,
+                    max_tokens=surface_cfg.max_tokens,
+                    temperature=surface_cfg.temperature,
+                    messages=openai_messages,
+                    stream=True,
+                ),
+                timeout=get_task_timeout("chat_surface_reply"),
             )
             surface_reply = ""
             async for chunk in response:
@@ -290,28 +286,61 @@ class AIOrchestrator:
                     "generated_reply": surface_reply.strip(),
                 },
                 conversation_id=conversation_id,
-                character_memory="\n\n".join(
-                    block for block in [character_memory, speaker_state_block, listener_state_block, consistency_block] if block
-                ),
+                character_memory=memory_blocks,
             )
 
-            result = analysis_result if isinstance(analysis_result, dict) else {}
+            result = normalize_chat_analysis(analysis_result if isinstance(analysis_result, dict) else {})
             if not result.get("reply"):
                 result["reply"] = surface_reply.strip()
-            ctx.add("user", content, {"character_name": speaker})
-            ctx.add("assistant", result.get("reply", ""), {"character_name": "AI"})
-            if listener_name:
-                state_engine.update_after_analysis(
-                    conversation_id,
-                    speaker,
-                    listener_name,
-                    result,
-                )
+
+            # 多视角分析：在场每个旁观角色站在自己立场分析这句话
+            if viewers_block:
+                try:
+                    perspectives = await self.analyze_multi_perspective(
+                        scenario=scenario, speaker=speaker, content=content,
+                        viewers_block=viewers_block, context=ctx.to_text(8),
+                    )
+                    result["perspectives"] = perspectives
+                except Exception as exc:
+                    logger.warning("多视角分析失败 speaker=%s error=%s", speaker, exc)
+                    result["perspectives"] = []
+            else:
+                result["perspectives"] = []
+
             yield json.dumps({"type": "done", "result": result})
         except GuardrailError as e:
             yield json.dumps({"type": "error", "message": str(e)})
         except Exception as e:
             yield json.dumps({"type": "error", "message": str(e)})
+
+    async def analyze_multi_perspective(
+        self, scenario: str, speaker: str, content: str, viewers_block: str, context: str,
+    ) -> list[dict]:
+        """多视角分析：在场每个旁观角色对这句话的独立分析。返回 normalize 后的 perspective 列表。"""
+        result = await self.call(
+            "multi_perspective_analysis",
+            {
+                "scenario": scenario, "speaker": speaker, "content": content,
+                "viewers_block": viewers_block, "context": context or "（对话开始）",
+            },
+            retries=1,
+        )
+        raw = result.get("perspectives") if isinstance(result, dict) else None
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            viewer = (item.get("viewer") or "").strip()
+            if not viewer:
+                continue
+            normalized = normalize_chat_analysis(item)
+            normalized["viewer"] = viewer
+            stance = (item.get("stance") or "observer").strip()
+            normalized["stance"] = "speaker" if stance == "speaker" else "observer"
+            out.append(normalized)
+        return out
 
     async def generate_character_profile(self, name: str, role: str, background: str) -> dict:
         return await self.call(
@@ -355,7 +384,23 @@ class AIOrchestrator:
             },
         )
 
+    async def summarize_context(self, previous_summary: str, dialogue: str) -> str:
+        return await self.call_text(
+            "context_summary",
+            {
+                "previous_summary": previous_summary or "（无）",
+                "dialogue": dialogue,
+            },
+            retries=1,
+        )
+
     async def parse_import_content(self, file_type: str, content_text: str) -> dict:
+        if file_type == "profile_document":
+            return await self.call(
+                "import_profile_document_parse",
+                {"content_text": content_text[:12000]},
+                retries=1,
+            )
         task_name = "import_narrative_parse" if file_type == "narrative" else "import_dialogue_parse"
         return await self.call(
             task_name,
@@ -366,13 +411,97 @@ class AIOrchestrator:
             retries=1,
         )
 
-    async def rebuild_import_analysis(self, interaction_unit: dict, context_payload: dict) -> dict:
+    async def analyze_relationship_deep(
+        self,
+        pair_profiles: str,
+        interaction_samples: str,
+        existing_relationship: str,
+    ) -> dict:
+        """关系深度分析：权力结构 / 互动模式 / 认知差 / 张力 / 演化叙事"""
+        return await self.call(
+            "relationship_deep_analysis",
+            {
+                "pair_profiles": pair_profiles,
+                "interaction_samples": interaction_samples or "（无直接对话记录，基于事实与事件推断）",
+                "existing_relationship": existing_relationship or "（暂无关系记录）",
+            },
+            retries=1,
+        )
+
+    async def update_trait_hypotheses(
+        self,
+        character_profile: str,
+        active_hypotheses: str,
+        new_evidence: str,
+    ) -> dict:
+        """特质假设演化：新证据对照活跃假设 → 支持/反驳/新假设"""
+        return await self.call(
+            "trait_hypothesis_update",
+            {
+                "character_profile": character_profile,
+                "active_hypotheses": active_hypotheses or "（暂无活跃假设）",
+                "new_evidence": new_evidence,
+            },
+            retries=1,
+        )
+
+    async def rebuild_import_analysis(
+        self,
+        interaction_unit: dict,
+        context_payload: dict,
+        context_window: list | None = None,
+    ) -> dict:
         return await self.call(
             "interaction_analysis_rebuild",
             {
                 "interaction_unit": json.dumps(interaction_unit, ensure_ascii=False),
+                "context_window": json.dumps(context_window or [], ensure_ascii=False),
                 "context_payload": json.dumps(context_payload, ensure_ascii=False),
             },
+        )
+
+    async def analyze_interaction_batch(
+        self,
+        character_profiles: str,
+        relationships: str,
+        context_summary: str,
+        dialogue_block: str,
+        count: int,
+    ) -> dict:
+        """批量深度分析：一次调用分析连续多句对话（带全部角色档案与关系上下文）"""
+        return await self.call(
+            "interaction_batch_analysis",
+            {
+                "character_profiles": character_profiles or "（暂无档案）",
+                "relationships": relationships or "（暂无关系记录）",
+                "context_summary": context_summary or "（本段为开头，无此前剧情）",
+                "dialogue_block": dialogue_block,
+                "count": count,
+            },
+            retries=1,
+        )
+
+    async def generate_import_profile(
+        self,
+        name: str,
+        current_profile: str,
+        dialogue_samples: str,
+        event_samples: str,
+        relationship_samples: str,
+        rule_hints: str,
+    ) -> dict:
+        """融合模式：当前档案 + 本次导入的新证据 → 深化后的完整档案（支持多次导入渐进完善）"""
+        return await self.call(
+            "import_profile_gen",
+            {
+                "name": name,
+                "current_profile": current_profile or "（暂无档案，本次为首次构建）",
+                "dialogue_samples": dialogue_samples or "（无台词样本）",
+                "event_samples": event_samples or "（无事件记录）",
+                "relationship_samples": relationship_samples or "（无关系线索）",
+                "rule_hints": rule_hints or "（无）",
+            },
+            retries=1,
         )
 
     async def structured_diagnosis(self, diagnosis_context: dict) -> dict:

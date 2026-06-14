@@ -1,27 +1,34 @@
+import asyncio
 import json
 import re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 
 from ..models.sql_models import (
-    Conversation, Message, Character, Relationship, CharacterEvent, CharacterObservation,
-    EvidenceSpan, MemoryItem, RetrievalTrace, StructuredDiagnosis, AgentRun,
+    Conversation, ConversationState, Message, MessagePerspective, Character, Relationship, CharacterEvent, CharacterObservation,
+    EvidenceSpan, InteractionUnit, MemoryItem, RetrievalTrace, StructuredDiagnosis, AgentRun,
 )
-from ..schemas import ChatMessage, ConversationCreate, MessageOut, StructuredDiagnosisOut
+from ..schemas import ChatMessage, ConversationCreate, ConversationUpdate, MessageOut, MessagePerspectiveOut, StructuredDiagnosisOut
 from ..harness.orchestrator import orchestrator
-from ..harness.context_manager import get_context
+from ..harness.context_manager import get_context, clear_context
 from ..harness.state_engine import state_engine
 from ..harness.consistency_engine import build_consistency_constraints
+from ..harness.analysis_schema import extract_emotion_struct, extract_strategy_struct
+from ..harness.config_loader import get_config
 from ..harness.retrieval_engine import (
     build_evidence_pack,
     record_retrieval_trace,
     render_evidence_pack,
 )
 from ..harness.graph_store import graph_store
-from .deps import get_db
+from ..services.relationships import find_pair_relationship
+from ..services.identity import find_character_by_name
+from ..services.profiles import render_extended_profile
+from ..services.hypotheses import run_hypothesis_round
+from .deps import get_db, SessionLocal
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -50,34 +57,41 @@ SCENARIO_PRESETS = {
 }
 
 
-def _parse_emotion_label(label: str | None) -> dict:
-    if not label:
-        return {}
-    try_match = re.search(r"试图激发[:：]\s*([^\(\]\[｜|]+)\((\d+)\)", label)
-    surface_match = re.search(r"表层[:：]\s*([^\(\]\[｜|]+)\((\d+)\)", label)
-    deep_match = re.search(r"深层[:：]\s*([^\(\]\[｜|]+)\((\d+)\)", label)
-    suppressed_match = re.search(r"压抑[:：]\s*([^\(\]\[｜|]+)\((\d+)\)", label)
-    return {
-        "intended_label": try_match.group(1).strip() if try_match else "",
-        "intended_score": int(try_match.group(2)) if try_match else 0,
-        "surface_label": surface_match.group(1).strip() if surface_match else "",
-        "surface_score": int(surface_match.group(2)) if surface_match else 0,
-        "deep_label": deep_match.group(1).strip() if deep_match else "",
-        "deep_score": int(deep_match.group(2)) if deep_match else 0,
-        "suppressed_label": suppressed_match.group(1).strip() if suppressed_match else "",
-        "suppressed_score": int(suppressed_match.group(2)) if suppressed_match else 0,
-        "actual_label": deep_match.group(1).strip() if deep_match else "",
-        "actual_score": int(deep_match.group(2)) if deep_match else 0,
-    }
+def _emotion_struct_for(message: Message) -> dict:
+    """统一读取消息的情绪结构：优先 analysis_json，历史数据回退正则"""
+    return extract_emotion_struct(getattr(message, "analysis_json", None), message.emotion_label)
 
 
-def _parse_strategy_text(strategy_text: str | None) -> dict:
-    lines = [line.strip() for line in (strategy_text or "").splitlines() if line.strip()]
-    return {
-        "short_term": next((line.replace("短期策略：", "").strip() for line in lines if line.startswith("短期策略：")), ""),
-        "long_term": next((line.replace("长期策略：", "").strip() for line in lines if line.startswith("长期策略：")), ""),
-        "consistency": next((line.replace("一致性说明：", "").strip() for line in lines if line.startswith("一致性说明：")), ""),
+def _strategy_struct_for(message: Message) -> dict:
+    """统一读取消息的策略结构：优先 analysis_json，历史数据回退文本解析"""
+    return extract_strategy_struct(getattr(message, "analysis_json", None), message.subtext)
+
+
+def _apply_analysis_to_messages(user_msg: Message, ai_msg: Message, result: dict) -> None:
+    """把 normalize 后的结构化分析结果写入消息行（含 legacy 展示列）"""
+    emotions = result.get("emotions") or {}
+    strategy = result.get("strategy") or {}
+    deep_label = ((emotions.get("deep") or {}).get("label") or "").strip()
+    surface_label = ((emotions.get("surface") or {}).get("label") or "").strip()
+    user_msg.intent = strategy.get("short_term") or strategy.get("long_term")
+    user_msg.strategy = strategy.get("long_term") or strategy.get("short_term")
+    user_msg.emotion = deep_label or surface_label
+
+    ai_msg.content = result.get("reply", "") or ai_msg.content
+    ai_msg.inner_monologue = result.get("inner_monologue_text") or json.dumps(result.get("inner_monologue") or {}, ensure_ascii=False)
+    ai_msg.emotion_label = result.get("emotion_label")
+    ai_msg.emotion_score = result.get("emotion_score")
+    ai_msg.subtext = result.get("subtext")
+    ai_msg.psychological_tag = result.get("psychological_tag")
+    ai_msg.analysis_json = {
+        "emotions": result.get("emotions"),
+        "strategy": result.get("strategy"),
+        "tags": result.get("tags"),
+        "inner_monologue": result.get("inner_monologue"),
     }
+    ai_msg.intent = user_msg.intent
+    ai_msg.strategy = user_msg.strategy
+    ai_msg.emotion = user_msg.emotion
 
 
 def _emotion_polarity(label: str) -> int:
@@ -156,10 +170,12 @@ def _create_memory_item(
         db.flush()
         graph_store.sync_memory(existing)
         return existing
+    from ..harness.embeddings import embed_text
     memory = MemoryItem(
         character_id=character_id,
         memory_type=memory_type,
         content=normalized[:2000],
+        embedding=embed_text(normalized[:2000]),
         confidence=max(0.0, min(1.0, float(confidence or 0.0))),
         evidence_ids=list(evidence_ids or []),
         source=source,
@@ -337,7 +353,8 @@ async def _run_structured_diagnosis(
 
 
 def _find_or_create_character(db: Session, name: str) -> Character:
-    char = db.query(Character).filter(Character.name == name).first()
+    # 本名 → 别名 两级命中，避免同一人物因称呼不同被归档成新角色
+    char = find_character_by_name(db, name)
     if char:
         return char
     char = Character(
@@ -406,10 +423,7 @@ def _list_behavior_patterns(db: Session, char_id: int | None) -> list[str]:
 def _get_relationship_snapshot(db: Session, speaker_char: Character | None, listener_char: Character | None) -> dict:
     if not speaker_char or not listener_char:
         return {}
-    relationship = db.query(Relationship).filter(
-        Relationship.source_id == speaker_char.id,
-        Relationship.target_id == listener_char.id,
-    ).first()
+    relationship = find_pair_relationship(db, speaker_char.id, listener_char.id)
     if relationship:
         trust = max(0.0, min(1.0, relationship.strength))
         sentiment = relationship.sentiment or 0.0
@@ -442,6 +456,86 @@ def _get_relationship_snapshot(db: Session, speaker_char: Character | None, list
     }
 
 
+def _render_character_block(char: Character | None, name: str, header: str, speaker_char: Character | None, speaker_name: str, db: Session) -> str:
+    parts = [f"【{name}】{header}"]
+    if char:
+        parts.append(f"  定位：{char.role or '未知'}｜动机：{char.motivation or '未知'}｜弱点：{char.weakness or '未知'}｜说话风格：{char.speaking_style or '未知'}")
+        parts.append(f"  性格：{'、'.join(char.personality_tags or []) or '未知'}")
+        ext = render_extended_profile(char.profile_json, limit_per_dim=2)
+        if ext:
+            parts.append("  立体档案：" + ext.replace("\n", "；"))
+        if speaker_char and char.id != speaker_char.id:
+            rel = find_pair_relationship(db, char.id, speaker_char.id)
+            if rel:
+                parts.append(f"  与{speaker_name}的关系：{rel.rel_type}（强度{round(rel.strength,2)}，情感{round(rel.sentiment,2)}）{(rel.description or '')[:80]}")
+    else:
+        parts.append("  （档案信息有限，请基于对话推断其立场）")
+    return "\n".join(parts)
+
+
+def _build_viewers_context(db: Session, speaker: str, listeners: list, primary_name: str) -> tuple[str, list[dict]]:
+    """
+    构建多视角上下文：发言者本人（用于自述分析）+ 在场每个旁观角色（用于解读分析）。
+    返回 (viewers_block 文本, [{name, id} ...] 仅旁观者，用于 primary 判断)。
+    """
+    speaker_char = db.query(Character).filter(Character.name == speaker).first()
+    blocks: list[str] = [
+        _render_character_block(speaker_char, speaker, "（发言者本人——请分析他说这句话的真实目的）", speaker_char, speaker, db)
+    ]
+    viewers: list[dict] = []
+    for listener in listeners or []:
+        name = getattr(listener, "name", "")
+        if not name or name == speaker:
+            continue
+        char = db.get(Character, listener.id) if getattr(listener, "id", None) else db.query(Character).filter(Character.name == name).first()
+        viewers.append({"name": name, "id": char.id if char else None})
+        header = "（主要接收方——会回应）" if name == primary_name else "（旁观者）"
+        blocks.append(_render_character_block(char, name, header, speaker_char, speaker, db))
+    return "\n\n".join(blocks), viewers
+
+
+def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: str, perspectives: list, primary_name: str, primary_reply: str = "") -> int:
+    """保存一条发言的多视角分析（先清旧视角，再写新视角）。
+    每个旁观视角带"建议回答"；主要接收方的建议回答用流式生成的自然回复。"""
+    db.query(MessagePerspective).filter(MessagePerspective.message_id == user_msg.id).delete(synchronize_session=False)
+    saved = 0
+    for persp in perspectives or []:
+        viewer = (persp.get("viewer") or "").strip()
+        if not viewer:
+            continue
+        stance = "speaker" if (persp.get("stance") == "speaker" or viewer == speaker) else "observer"
+        is_primary = (stance == "observer" and viewer == primary_name)
+        viewer_char = db.query(Character).filter(Character.name == viewer).first()
+        emotions = persp.get("emotions") or {}
+        # 旁观者的建议回答：主要接收方用流式自然回复，其余用该视角自带的 reply
+        suggested = ""
+        if stance == "observer":
+            suggested = (primary_reply if is_primary and primary_reply else (persp.get("reply") or "")).strip()
+        db.add(MessagePerspective(
+            conversation_id=conv_id,
+            message_id=user_msg.id,
+            speaker_name=speaker,
+            viewer_character_id=viewer_char.id if viewer_char else None,
+            viewer_name=viewer,
+            stance=stance,
+            is_primary=is_primary,
+            suggested_reply=suggested[:500],
+            inner_monologue=persp.get("inner_monologue_text") or "",
+            emotion_label=persp.get("emotion_label") or "",
+            emotion_score=persp.get("emotion_score"),
+            subtext=persp.get("subtext") or "",
+            psychological_tag=persp.get("psychological_tag") or "",
+            analysis_json={
+                "emotions": emotions,
+                "strategy": persp.get("strategy"),
+                "tags": persp.get("tags"),
+                "inner_monologue": persp.get("inner_monologue"),
+            },
+        ))
+        saved += 1
+    return saved
+
+
 def _select_primary_listener(
     db: Session,
     speaker: str,
@@ -471,10 +565,7 @@ def _select_primary_listener(
         if listener.name and listener.name in recent_content:
             score += 1.5
         if getattr(listener, "id", None):
-            relationship = db.query(Relationship).filter(
-                Relationship.source_id == speaker_char.id,
-                Relationship.target_id == listener.id,
-            ).first()
+            relationship = find_pair_relationship(db, speaker_char.id, listener.id)
             if relationship:
                 score += relationship.strength
         ranked.append((score, listener))
@@ -521,6 +612,10 @@ def _build_listener_memory(
                     ]
                 )
             )
+            # 立体人物模型注入：价值观/恐惧/人际模式/语言指纹/矛盾性——让 AI 扮演的不是几行人设而是完整的人
+            extended_block = render_extended_profile(primary_char.profile_json)
+            if extended_block:
+                memory_parts.append(f"接收方立体档案：\n{extended_block}")
             events = db.query(CharacterEvent).filter(
                 CharacterEvent.character_id == primary_char.id
             ).order_by(CharacterEvent.created_at.desc()).limit(3).all()
@@ -542,6 +637,7 @@ def _build_listener_memory(
                 )
             )
             listener_state = state_engine.bootstrap_state(
+                db,
                 conv_id,
                 primary_char.name,
                 listener_profile,
@@ -551,6 +647,7 @@ def _build_listener_memory(
             listener_state_block = state_engine.render_state_block(primary_char.name, listener_state)
             if speaker_char:
                 speaker_state = state_engine.bootstrap_state(
+                    db,
                     conv_id,
                     speaker_char.name,
                     speaker_profile,
@@ -607,53 +704,153 @@ def _hydrate_context_from_db(
 ) -> None:
     ctx = get_context(conv.id)
     ctx.clear()
+    ctx.set_summary(getattr(conv, "context_summary", "") or "")
+    summary_until = int(getattr(conv, "summary_until_index", 0) or 0)
     query = _visible_messages_query(db, conv)
     if include_message_id:
         query = query.filter(Message.id <= include_message_id)
     elif before_message_id:
         query = query.filter(Message.id < before_message_id)
+    if summary_until:
+        # 已被滚动摘要覆盖的旧消息不再重复注入原文
+        query = query.filter(Message.message_index > summary_until)
     rows = query.order_by(Message.message_index, Message.created_at, Message.id).all()
-    for row in rows[-40:]:
+    for row in rows[-60:]:
         display_name = row.character_name or row.role
-        if row.role == "assistant" and row.receiver_name:
+        if row.role == "assistant" and (not row.character_name or row.character_name == "AI分析") and row.receiver_name:
             display_name = f"{row.receiver_name}的回复"
         ctx.add(row.role, row.content, {"character_name": display_name})
 
 
+async def _run_session_hypothesis_rounds(conv_id: int) -> None:
+    """会话证据驱动的特质假设演化（fire-and-forget 后台任务）：
+    取最近的用户发言，按角色分组跑假设轮——对话越多，系统对人物的理解越深。"""
+    db = SessionLocal()
+    try:
+        conv = db.get(Conversation, conv_id)
+        if not conv:
+            return
+        messages = _visible_messages_query(db, conv).filter(
+            Message.role == "user",
+        ).order_by(Message.message_index.desc(), Message.id.desc()).limit(24).all()
+        by_char: dict[int, list[str]] = {}
+        for message in reversed(messages):
+            if message.character_id:
+                by_char.setdefault(message.character_id, []).append(
+                    f"对{message.receiver_name or '？'}说：「{(message.content or '')[:120]}」"
+                )
+        for char_id, texts in by_char.items():
+            if len(texts) < 3:
+                continue
+            char = db.get(Character, char_id)
+            if char:
+                await run_hypothesis_round(db, char, texts)
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def _refresh_context_summary(conv_id: int) -> None:
+    """滚动摘要：把超出窗口的旧消息压缩为剧情纪要（fire-and-forget 后台任务）"""
+    db = SessionLocal()
+    try:
+        conv = db.get(Conversation, conv_id)
+        if not conv:
+            return
+        cfg = get_config().get("context", {}) or {}
+        trigger = int(cfg.get("summary_trigger_messages", 40))
+        keep_recent = int(cfg.get("summary_keep_recent", 20))
+        summary_until = int(getattr(conv, "summary_until_index", 0) or 0)
+        rows = _visible_messages_query(db, conv).filter(
+            Message.message_index > summary_until,
+        ).order_by(Message.message_index, Message.created_at, Message.id).all()
+        if len(rows) <= trigger:
+            return
+        to_summarize = rows[:-keep_recent] if keep_recent else rows
+        if not to_summarize:
+            return
+        lines = []
+        for row in to_summarize:
+            name = row.character_name or row.role
+            lines.append(f"[{name}] {row.content}")
+        dialogue = "\n".join(lines)[:9000]
+        summary = await orchestrator.summarize_context(conv.context_summary or "", dialogue)
+        if not (summary or "").strip():
+            return
+        conv.context_summary = summary.strip()[:4000]
+        conv.summary_until_index = int(to_summarize[-1].message_index or summary_until)
+        db.commit()
+        clear_context(conv_id)
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 # ─── Conversations ────────────────────────────────────────────────────────────
 
+def _compose_scene(conv: Conversation) -> str:
+    """把场景预设标题 + 用户手写背景说明合成为注入分析的场景文本。
+    单纯一个预设标签没有意义，背景说明才是真正约束分析的上下文。"""
+    label = SCENARIO_PRESETS.get(conv.scenario, {}).get("title", "") or conv.scenario or "通用对话"
+    brief = (getattr(conv, "scene_brief", "") or "").strip()
+    if brief:
+        return f"{label}。背景设定：{brief}"
+    return label
+
+
+def _conversation_payload(c: Conversation) -> dict:
+    return {
+        "id": c.id,
+        "title": c.title,
+        "scenario": c.scenario,
+        "scene_brief": getattr(c, "scene_brief", "") or "",
+        "updated_at": c.updated_at,
+        "is_readonly": bool(getattr(c, "is_readonly", False)),
+        "source_import_file_id": getattr(c, "source_import_file_id", None),
+        "active_branch_id": getattr(c, "active_branch_id", None),
+        "active_branch_point_id": getattr(c, "active_branch_point_id", None),
+        "participants": list(getattr(c, "participants", None) or []),
+    }
+
+
 @router.get("/conversations")
-def list_conversations(db: Session = Depends(get_db)):
-    convs = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(20).all()
-    return [
-        {
-            "id": c.id,
-            "title": c.title,
-            "scenario": c.scenario,
-            "updated_at": c.updated_at,
-            "is_readonly": bool(getattr(c, "is_readonly", False)),
-            "source_import_file_id": getattr(c, "source_import_file_id", None),
-            "active_branch_id": getattr(c, "active_branch_id", None),
-            "active_branch_point_id": getattr(c, "active_branch_point_id", None),
-        }
-        for c in convs
-    ]
+def list_conversations(limit: int = 50, db: Session = Depends(get_db)):
+    convs = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(min(max(limit, 1), 200)).all()
+    return [_conversation_payload(c) for c in convs]
 
 
 @router.post("/conversations")
 def create_conversation(body: ConversationCreate, db: Session = Depends(get_db)):
-    conv = Conversation(title=body.title, scenario=body.scenario)
+    conv = Conversation(title=body.title, scenario=body.scenario, scene_brief=(body.scene_brief or "").strip()[:2000])
     db.add(conv)
     db.commit()
     db.refresh(conv)
-    return {
-        "id": conv.id,
-        "title": conv.title,
-        "scenario": conv.scenario,
-        "is_readonly": False,
-        "active_branch_id": None,
-        "active_branch_point_id": None,
-    }
+    return _conversation_payload(conv)
+
+
+@router.patch("/conversations/{conv_id}")
+def update_conversation(conv_id: int, body: ConversationUpdate, db: Session = Depends(get_db)):
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    if body.title is not None:
+        conv.title = body.title.strip()[:200] or conv.title
+    if body.scenario is not None and body.scenario.strip():
+        conv.scenario = body.scenario.strip()[:100]
+    if body.scene_brief is not None:
+        conv.scene_brief = body.scene_brief.strip()[:2000]
+    if body.participants is not None:
+        conv.participants = [
+            {"id": item.id, "name": item.name.strip()}
+            for item in body.participants
+            if item.name and item.name.strip()
+        ]
+    conv.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(conv)
+    return _conversation_payload(conv)
 
 
 @router.delete("/conversations/{conv_id}")
@@ -661,10 +858,16 @@ def delete_conversation(conv_id: int, db: Session = Depends(get_db)):
     conv = db.get(Conversation, conv_id)
     if not conv:
         raise HTTPException(404, "对话不存在")
-    # 级联删除相关的 messages (假设已在模型中配置级联，否则需要手动删除)
-    db.query(Message).filter_by(conversation_id=conv_id).delete()
+    # 显式清理所有关联数据，避免孤儿行
+    db.query(EvidenceSpan).filter(EvidenceSpan.conversation_id == conv_id).delete(synchronize_session=False)
+    db.query(RetrievalTrace).filter(RetrievalTrace.conversation_id == conv_id).delete(synchronize_session=False)
+    db.query(StructuredDiagnosis).filter(StructuredDiagnosis.conversation_id == conv_id).delete(synchronize_session=False)
+    db.query(MessagePerspective).filter(MessagePerspective.conversation_id == conv_id).delete(synchronize_session=False)
+    db.query(ConversationState).filter(ConversationState.conversation_id == conv_id).delete(synchronize_session=False)
+    db.query(Message).filter_by(conversation_id=conv_id).delete(synchronize_session=False)
     db.delete(conv)
     db.commit()
+    clear_context(conv_id)
     return {"ok": True}
 
 
@@ -679,6 +882,77 @@ def get_messages(conv_id: int, db: Session = Depends(get_db)):
             row.message_index = index
     db.commit()
     return rows
+
+
+@router.get("/conversations/{conv_id}/perspectives")
+def get_conversation_perspectives(conv_id: int, db: Session = Depends(get_db)):
+    """返回该会话全部多视角分析，按发言消息 id 分组：{message_id: [perspective...]}"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    # 排序：发言者自述优先，其次主要接收方，再其余旁观者
+    rows = db.query(MessagePerspective).filter(
+        MessagePerspective.conversation_id == conv_id,
+    ).order_by(
+        (MessagePerspective.stance == "speaker").desc(),
+        MessagePerspective.is_primary.desc(),
+        MessagePerspective.id,
+    ).all()
+    grouped: dict[int, list] = {}
+    for row in rows:
+        grouped.setdefault(row.message_id, []).append(
+            MessagePerspectiveOut.model_validate(row).model_dump(mode="json")
+        )
+    return grouped
+
+
+# 情绪向量英文键 → 中文展示标签
+_EMOTION_VEC_LABELS = {
+    "calm": "平静", "guarded": "戒备", "attachment": "亲近", "fear": "恐惧", "anger": "压抑/愤怒",
+}
+
+
+@router.get("/conversations/{conv_id}/states")
+def get_conversation_states(conv_id: int, db: Session = Depends(get_db)):
+    """返回该会话中各在场角色的当前心理状态卡（来自持续状态机，对话越多越准）。
+    情绪面板上半部分用它呈现「各方此刻状态」。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    rows = db.query(ConversationState).filter(
+        ConversationState.conversation_id == conv_id,
+    ).order_by(ConversationState.updated_at.desc()).all()
+
+    cards = []
+    for row in rows:
+        st = state_engine.get_state(db, conv_id, row.character_name)
+        vec = st.emotion_vector or {}
+        # 头条情绪：除“平静”外强度最高的那一项；都很低则归为平静
+        salient = {k: v for k, v in vec.items() if k != "calm"}
+        if salient:
+            top_key = max(salient, key=lambda k: salient[k])
+            top_val = float(salient[top_key])
+        else:
+            top_key, top_val = "calm", float(vec.get("calm", 0.5))
+        if top_val < 0.34:
+            top_key, top_val = "calm", float(vec.get("calm", 0.5))
+        cards.append({
+            "name": row.character_name,
+            "headline_emotion": _EMOTION_VEC_LABELS.get(top_key, top_key),
+            "headline_score": round(top_val, 2),
+            "emotion_vector": [
+                {"label": _EMOTION_VEC_LABELS.get(k, k), "score": round(float(v), 2)}
+                for k, v in sorted(vec.items(), key=lambda kv: kv[1], reverse=True)
+            ],
+            "current_goal": st.current_goal or "",
+            "defense_style": st.defense_style or "",
+            "last_intent": st.last_intent or "",
+            "last_strategy": st.last_strategy or "",
+            "beliefs": [{"target": k, "belief": v} for k, v in (st.beliefs or {}).items()],
+            "stable_traits": st.stable_traits or [],
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        })
+    return {"conversation_id": conv_id, "states": cards}
 
 
 @router.post("/conversations/{conv_id}/evidence-pack")
@@ -817,6 +1091,11 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
         body.active_characters or [],
         body.conversation_id,
     )
+    # 用户手动指定接收方时优先生效
+    if body.receiver_name:
+        explicit = next((item for item in listeners if item.name == body.receiver_name), None)
+        if explicit:
+            primary_listener = explicit
     listener_memory, characters_desc, speaker_state_block, listener_state_block, consistency_block, relationship_snapshot = _build_listener_memory(
         db,
         body.conversation_id,
@@ -826,6 +1105,8 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
     )
     speaker_char = db.query(Character).filter(Character.name == body.speaker).first()
     listener_char = db.get(Character, primary_listener.id) if primary_listener and getattr(primary_listener, "id", None) else None
+    primary_name = getattr(primary_listener, "name", "") if primary_listener else ""
+    viewers_block, _viewers = _build_viewers_context(db, body.speaker, listeners, primary_name)
     evidence_pack = build_evidence_pack(
         db,
         query_text=body.content,
@@ -872,13 +1153,13 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
             conversation_id=body.conversation_id,
             speaker=body.speaker,
             content=body.content,
-            scenario=conv.scenario,
+            scenario=_compose_scene(conv),
             characters_desc=characters_desc,
             character_memory=listener_memory,
             speaker_state_block=speaker_state_block,
             listener_state_block=listener_state_block,
             consistency_block=consistency_block,
-            listener_name=relationship_snapshot.get("primary_listener_name", ""),
+            viewers_block=viewers_block,
         ):
             data = json.loads(chunk)
             if data["type"] == "done":
@@ -886,58 +1167,46 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
             yield f"data: {chunk}\n\n"
 
         if full_result:
-            strategy_payload = _parse_strategy_text(full_result.get("subtext"))
-            emotion_payload = _parse_emotion_label(full_result.get("emotion_label"))
-            user_msg.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
-            user_msg.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
-            user_msg.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
+            # AI 即接收方角色：assistant 消息以接收方身份入库
             ai_msg = Message(
                 conversation_id=body.conversation_id,
                 role="assistant",
                 message_index=next_message_index + 1,
                 branch_id=getattr(conv, "active_branch_id", None),
-                character_name="AI分析",
-                receiver_id=receiver_id,
-                receiver_name=receiver_name,
+                character_id=receiver_id,
+                character_name=receiver_name or "AI分析",
+                receiver_id=body.character_id,
+                receiver_name=body.speaker,
                 content=full_result.get("reply", ""),
-                inner_monologue=full_result.get("inner_monologue"),
-                emotion_label=full_result.get("emotion_label"),
-                emotion_score=full_result.get("emotion_score"),
-                subtext=full_result.get("subtext"),
-                psychological_tag=full_result.get("psychological_tag"),
-                intent=user_msg.intent,
-                strategy=user_msg.strategy,
-                emotion=user_msg.emotion,
                 source_type="analysis",
                 readonly=False,
                 parent_id=user_msg.id,
             )
+            _apply_analysis_to_messages(user_msg, ai_msg, full_result)
             db.add(ai_msg)
+            # 多视角分析落库（在场每个旁观角色对这句话的独立分析 + 建议回答）
+            _save_perspectives(db, conv.id, user_msg, body.speaker, full_result.get("perspectives") or [], primary_name, full_result.get("reply") or "")
+            # 演化双方心理状态（持久化，下一轮注入）
+            listener_display = relationship_snapshot.get("primary_listener_name", "")
+            if listener_display:
+                state_engine.update_after_analysis(
+                    db, conv.id, body.speaker, listener_display, full_result,
+                )
             conv.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(ai_msg)
-            report = await _run_structured_diagnosis(
-                db,
-                conv=conv,
-                user_msg=user_msg,
-                ai_msg=ai_msg,
-                speaker_char=speaker_char,
-                listener_char=listener_char,
-                analysis_result=full_result,
-                evidence_pack=evidence_pack,
-            )
-            if report:
-                yield f"data: {json.dumps({'type': 'diagnosis', 'result': StructuredDiagnosisOut.model_validate(report).model_dump(mode='json')}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'saved', 'user_message_id': user_msg.id, 'ai_message_id': ai_msg.id}, ensure_ascii=False)}\n\n"
+            # 滚动摘要按需后台刷新（深度诊断已改为消息上的按钮触发，不再拖慢主链路）
+            asyncio.create_task(_refresh_context_summary(conv.id))
+            # 每累积 20 条消息自动演化一轮特质假设——对话即建模
+            if next_message_index > 0 and (next_message_index + 1) % 20 == 0:
+                asyncio.create_task(_run_session_hypothesis_rounds(conv.id))
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@router.post("/messages/{message_id}/reanalyze", response_model=MessageOut)
-async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
-    message = db.get(Message, message_id)
-    if not message or message.role != "user":
-        raise HTTPException(404, "消息不存在")
-
+async def _reanalyze_user_message(db: Session, message: Message) -> Message:
+    """对一条 user 消息重建完整分析层（补全分析 / 编辑后重分析共用）"""
     conv = db.get(Conversation, message.conversation_id)
     if not conv:
         raise HTTPException(404, "对话不存在")
@@ -968,6 +1237,8 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
     )
     speaker_char = db.query(Character).filter(Character.name == (message.character_name or "")).first()
     listener_char = db.get(Character, primary_listener.id) if primary_listener and getattr(primary_listener, "id", None) else None
+    primary_name = getattr(primary_listener, "name", "") if primary_listener else ""
+    viewers_block, _viewers = _build_viewers_context(db, message.character_name or "", listeners, primary_name)
     evidence_pack = build_evidence_pack(
         db,
         query_text=message.content,
@@ -994,13 +1265,13 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
         conversation_id=conv.id,
         speaker=message.character_name or "",
         content=message.content,
-        scenario=conv.scenario,
+        scenario=_compose_scene(conv),
         characters_desc=characters_desc,
         character_memory=listener_memory,
         speaker_state_block=speaker_state_block,
         listener_state_block=listener_state_block,
         consistency_block=consistency_block,
-        listener_name=relationship_snapshot.get("primary_listener_name", ""),
+        viewers_block=viewers_block,
     ):
         data = json.loads(chunk)
         if data["type"] == "done":
@@ -1008,66 +1279,64 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
 
     if not result:
         raise HTTPException(500, "补全分析失败")
+    # 重建多视角分析
+    _save_perspectives(db, conv.id, message, message.character_name or "", result.get("perspectives") or [], primary_name, result.get("reply") or "")
 
     ai_msg = db.query(Message).filter(Message.parent_id == message.id).first()
-    if ai_msg:
-        strategy_payload = _parse_strategy_text(result.get("subtext"))
-        emotion_payload = _parse_emotion_label(result.get("emotion_label"))
-        message.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
-        message.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
-        message.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
-        ai_msg.content = result.get("reply", "")
-        ai_msg.inner_monologue = result.get("inner_monologue")
-        ai_msg.emotion_label = result.get("emotion_label")
-        ai_msg.emotion_score = result.get("emotion_score")
-        ai_msg.subtext = result.get("subtext")
-        ai_msg.psychological_tag = result.get("psychological_tag")
-        ai_msg.intent = message.intent
-        ai_msg.strategy = message.strategy
-        ai_msg.emotion = message.emotion
-    else:
-        strategy_payload = _parse_strategy_text(result.get("subtext"))
-        emotion_payload = _parse_emotion_label(result.get("emotion_label"))
-        message.intent = strategy_payload.get("short_term") or strategy_payload.get("long_term")
-        message.strategy = strategy_payload.get("long_term") or strategy_payload.get("short_term")
-        message.emotion = emotion_payload.get("actual_label") or emotion_payload.get("surface_label")
+    if not ai_msg:
         ai_msg = Message(
             conversation_id=conv.id,
             role="assistant",
             message_index=(message.message_index or message.id or 0) + 1,
             branch_id=message.branch_id,
-            character_name="AI分析",
-            receiver_id=message.receiver_id,
-            receiver_name=message.receiver_name,
+            character_id=message.receiver_id,
+            character_name=message.receiver_name or "AI分析",
+            receiver_id=message.character_id,
+            receiver_name=message.character_name,
             content=result.get("reply", ""),
-            inner_monologue=result.get("inner_monologue"),
-            emotion_label=result.get("emotion_label"),
-            emotion_score=result.get("emotion_score"),
-            subtext=result.get("subtext"),
-            psychological_tag=result.get("psychological_tag"),
-            intent=message.intent,
-            strategy=message.strategy,
-            emotion=message.emotion,
             source_type="analysis",
             parent_id=message.id,
         )
         db.add(ai_msg)
+    _apply_analysis_to_messages(message, ai_msg, result)
     db.commit()
     db.refresh(ai_msg)
-    await _run_structured_diagnosis(
-        db,
-        conv=conv,
-        user_msg=message,
-        ai_msg=ai_msg,
-        speaker_char=speaker_char,
-        listener_char=listener_char,
-        analysis_result=result,
-        evidence_pack=evidence_pack,
-    )
     return ai_msg
 
 
+@router.post("/messages/{message_id}/reanalyze", response_model=MessageOut)
+async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
+    message = db.get(Message, message_id)
+    if not message or message.role != "user":
+        raise HTTPException(404, "消息不存在")
+    return await _reanalyze_user_message(db, message)
+
+
+@router.put("/messages/{message_id}", response_model=MessageOut)
+async def edit_message(message_id: int, payload: dict, db: Session = Depends(get_db)):
+    """编辑对话内容并重新分析（含导入的只读消息——编辑修正不算继续发言）"""
+    message = db.get(Message, message_id)
+    if not message or message.role != "user":
+        raise HTTPException(404, "消息不存在")
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "内容不能为空")
+    message.content = content
+    db.commit()
+    # 同步更新导入交互单元的原文，保持证据一致
+    db.query(InteractionUnit).filter(
+        InteractionUnit.conversation_message_id == message.id,
+    ).update({"content": content, "source_text_snippet": content[:500]}, synchronize_session=False)
+    db.commit()
+    return await _reanalyze_user_message(db, message)
+
+
 # ─── Branch ──────────────────────────────────────────────────────────────────
+
+def _branch_point_from_id(branch_id: str | None) -> int | None:
+    matched = re.match(r"branch-(\d+)-", branch_id or "")
+    return int(matched.group(1)) if matched else None
+
 
 @router.post("/conversations/{conv_id}/branch/{message_id}")
 def create_branch(conv_id: int, message_id: int, db: Session = Depends(get_db)):
@@ -1094,6 +1363,65 @@ def create_branch(conv_id: int, message_id: int, db: Session = Depends(get_db)):
         "branch_id": branch_id,
         "branch_point": message_id,
         "context_reset": True,
+    }
+
+
+@router.get("/conversations/{conv_id}/branches")
+def list_branches(conv_id: int, db: Session = Depends(get_db)):
+    """列出会话的全部分支（含主线）"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    rows = db.query(
+        Message.branch_id,
+        func.count(Message.id),
+        func.min(Message.created_at),
+    ).filter(
+        Message.conversation_id == conv_id,
+        Message.branch_id.isnot(None),
+    ).group_by(Message.branch_id).all()
+    branches = [
+        {
+            "branch_id": branch_id,
+            "branch_point_id": _branch_point_from_id(branch_id),
+            "message_count": count,
+            "created_at": created_at.isoformat() if created_at else "",
+        }
+        for branch_id, count, created_at in rows
+    ]
+    branches.sort(key=lambda item: item["created_at"])
+    return {
+        "active_branch_id": getattr(conv, "active_branch_id", None),
+        "branches": branches,
+    }
+
+
+@router.post("/conversations/{conv_id}/switch-branch")
+def switch_branch(conv_id: int, payload: dict, db: Session = Depends(get_db)):
+    """切换分支；branch_id 为空时回到主线"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    branch_id = (payload.get("branch_id") or "").strip() or None
+    if branch_id is None:
+        conv.active_branch_id = None
+        conv.active_branch_point_id = None
+    else:
+        exists = db.query(Message).filter(
+            Message.conversation_id == conv_id,
+            Message.branch_id == branch_id,
+        ).first()
+        if not exists:
+            raise HTTPException(404, "分支不存在")
+        conv.active_branch_id = branch_id
+        conv.active_branch_point_id = _branch_point_from_id(branch_id)
+    conv.updated_at = datetime.utcnow()
+    db.commit()
+    _hydrate_context_from_db(db, conv)
+    return {
+        "ok": True,
+        "active_branch_id": conv.active_branch_id,
+        "active_branch_point_id": conv.active_branch_point_id,
     }
 
 
@@ -1137,39 +1465,39 @@ def get_emotion_tension(conv_id: int, source: str, target: str, db: Session = De
             continue
         if target and parent.receiver_name and parent.receiver_name != target:
             continue
-        parsed = _parse_emotion_label(analysis.emotion_label)
-        if not parsed:
+        parsed = _emotion_struct_for(analysis)
+        intended = parsed.get("intended") or {}
+        deep = parsed.get("deep") or {}
+        if not intended.get("label") and not deep.get("label"):
             continue
         emotions.append(
             {
                 "message_id": parent.id,
-                "label": parsed.get("intended_label", ""),
-                "score": round(parsed.get("intended_score", 0) / 10, 2),
+                "label": intended.get("label", ""),
+                "score": round(intended.get("score", 0) / 10, 2),
                 "target": target,
             }
         )
-        if parsed.get("deep_label"):
+        if deep.get("label"):
             deep_emotions.append(
                 {
                     "message_id": parent.id,
-                    "label": parsed.get("deep_label", ""),
-                    "score": round(parsed.get("deep_score", 0) / 10, 2),
+                    "label": deep.get("label", ""),
+                    "score": round(deep.get("score", 0) / 10, 2),
                     "target": target,
                 }
             )
-            dominant.append(parsed["deep_label"])
-            emotion_keywords[parsed["deep_label"]] = emotion_keywords.get(parsed["deep_label"], 0) + parsed.get("deep_score", 0)
-        if parsed.get("intended_label"):
-            emotion_keywords[parsed["intended_label"]] = emotion_keywords.get(parsed["intended_label"], 0) + parsed.get("intended_score", 0)
-        strategy_lines = [line.strip() for line in (analysis.subtext or "").splitlines() if line.strip()]
-        short_line = next((line.replace("短期策略：", "").strip() for line in strategy_lines if line.startswith("短期策略：")), "")
-        long_line = next((line.replace("长期策略：", "").strip() for line in strategy_lines if line.startswith("长期策略：")), "")
-        if short_line or long_line:
+            dominant.append(deep["label"])
+            emotion_keywords[deep["label"]] = emotion_keywords.get(deep["label"], 0) + deep.get("score", 0)
+        if intended.get("label"):
+            emotion_keywords[intended["label"]] = emotion_keywords.get(intended["label"], 0) + intended.get("score", 0)
+        strategy = _strategy_struct_for(analysis)
+        if strategy.get("short_term") or strategy.get("long_term"):
             strategy_trajectory.append(
                 {
                     "message_id": parent.id,
-                    "short_term": short_line,
-                    "long_term": long_line,
+                    "short_term": strategy.get("short_term", ""),
+                    "long_term": strategy.get("long_term", ""),
                 }
             )
 
@@ -1211,7 +1539,7 @@ def get_emotion_tension(conv_id: int, source: str, target: str, db: Session = De
 
 
 @router.post("/conversations/{conv_id}/archive")
-def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_db)):
+async def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_db)):
     conv = db.get(Conversation, conv_id)
     if not conv:
         raise HTTPException(404, "对话不存在")
@@ -1294,15 +1622,14 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
         target_char = role_map.get(listeners[0])
         if not target_char:
             continue
-        parsed = _parse_emotion_label(analysis.emotion_label)
-        actual_polarity = _emotion_polarity(parsed.get("actual_label", ""))
-        intended_polarity = _emotion_polarity(parsed.get("intended_label", ""))
+        parsed = _emotion_struct_for(analysis)
+        deep_item = parsed.get("deep") or {}
+        intended_item = parsed.get("intended") or {}
+        actual_polarity = _emotion_polarity(deep_item.get("label", ""))
+        intended_polarity = _emotion_polarity(intended_item.get("label", ""))
         delta = 0.06 if actual_polarity == intended_polarity and actual_polarity != 0 else -0.04
-        sentiment_target = max(-1.0, min(1.0, parsed.get("actual_score", 0) / 10 * actual_polarity))
-        relationship = db.query(Relationship).filter(
-            Relationship.source_id == source_char.id,
-            Relationship.target_id == target_char.id,
-        ).first()
+        sentiment_target = max(-1.0, min(1.0, deep_item.get("score", 0) / 10 * actual_polarity))
+        relationship = find_pair_relationship(db, source_char.id, target_char.id)
         if not relationship:
             relationship = Relationship(
                 source_id=source_char.id,
@@ -1325,7 +1652,8 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
             }
         )
         relationship.history = history
-        relationship.strength = max(0.0, min(1.0, relationship.strength * 0.8 + (relationship.strength + delta) * 0.2))
+        # delta 直接作用于强度（旧公式 0.2*delta 衰减过强，强度几乎不动）
+        relationship.strength = max(0.0, min(1.0, relationship.strength + delta))
         relationship.sentiment = max(-1.0, min(1.0, relationship.sentiment * 0.7 + sentiment_target * 0.3))
         relationship.updated_at = datetime.utcnow()
         db.flush()
@@ -1359,8 +1687,7 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
             evidence_ids=[relationship_evidence.id],
         )
 
-        strategy_lines = [line.strip() for line in (analysis.subtext or "").splitlines() if line.strip()]
-        long_term = next((line.replace("长期策略：", "").strip() for line in strategy_lines if line.startswith("长期策略：")), "")
+        long_term = _strategy_struct_for(analysis).get("long_term", "")
         if long_term:
             existing_pattern = db.query(CharacterObservation).filter(
                 CharacterObservation.character_id == source_char.id,
@@ -1374,6 +1701,16 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
                     old_value="",
                     new_value=long_term,
                     reason=f"归档提取到稳定行为模式：{long_term}",
+                    metadata_json={
+                        "source": "会话归档",
+                        "evidence": f"归档提取到稳定行为模式：{long_term}",
+                        "confidence": 0.74,
+                        "change_type": "新增",
+                        "module": "行为模式",
+                        "category": "互动策略",
+                        "trigger": "",
+                        "example": user_message.content[:120],
+                    },
                 )
                 db.add(obs)
                 db.flush()
@@ -1410,6 +1747,16 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
                 old_value=json.dumps(source_char.personality_tags or [], ensure_ascii=False),
                 new_value=json.dumps(source_char.personality_tags or [], ensure_ascii=False),
                 reason=f"归档时检测到潜在角色冲突：{analysis.subtext}",
+                metadata_json={
+                    "source": "会话归档",
+                    "evidence": f"归档时检测到潜在角色冲突：{(analysis.subtext or '')[:200]}",
+                    "confidence": 0.68,
+                    "change_type": "新增",
+                    "module": "人格模型",
+                    "category": "",
+                    "trigger": "",
+                    "example": user_message.content[:120],
+                },
             )
             db.add(observation)
             db.flush()
@@ -1439,9 +1786,77 @@ def archive_conversation(conv_id: int, payload: dict, db: Session = Depends(get_
             )
             observations_created += 1
 
+    # 多视角归档：每条发言的每个旁观视角 → 回流到旁观者对发言者的认知（记忆 + 关系微调）
+    perspectives_archived = _archive_perspectives(db, messages, role_map)
+
     db.commit()
+    # 归档后异步演化特质假设：会话证据流入人物模型，闭环不再依赖手动操作
+    asyncio.create_task(_run_session_hypothesis_rounds(conv_id))
     return {
         "ok": True,
         "archived_roles": archived_roles,
         "observations_created": observations_created,
+        "perspectives_archived": perspectives_archived,
     }
+
+
+def _archive_perspectives(db: Session, messages: list, role_map: dict) -> int:
+    """
+    多视角归档回流：每个旁观者对发言者这句话的理解，沉淀为旁观者的认知。
+    - 记忆：viewer 记下"我对 speaker 的判断"（关系标签 + 深层情绪）
+    - 关系：按 viewer 对 speaker 的深层情绪极性，微调 viewer→speaker 关系的情感
+    多人对话中每个角色都从旁观中"学到"对他人的理解。
+    """
+    archived = 0
+    for message in messages:
+        if message.role != "user":
+            continue
+        perspectives = db.query(MessagePerspective).filter(
+            MessagePerspective.message_id == message.id,
+        ).all()
+        for persp in perspectives:
+            viewer_char = role_map.get(persp.viewer_name) or (
+                db.get(Character, persp.viewer_character_id) if persp.viewer_character_id else None
+            )
+            speaker_char = role_map.get(persp.speaker_name) or (
+                db.query(Character).filter(Character.name == persp.speaker_name).first()
+            )
+            if not viewer_char or not speaker_char or viewer_char.id == speaker_char.id:
+                continue
+            emotions = (persp.analysis_json or {}).get("emotions") or {}
+            tags = (persp.analysis_json or {}).get("tags") or {}
+            deep = emotions.get("deep") or {}
+            deep_label = (deep.get("label") or "").strip()
+            relation_tag = (tags.get("relation") or "").strip()
+            # 记忆：viewer 对 speaker 的认知
+            content = f"对{speaker_char.name}的判断：{relation_tag or deep_label or persp.subtext or ''}".strip("：")
+            if relation_tag or deep_label:
+                evidence = _create_evidence_span(
+                    db, character_id=viewer_char.id, source_type="chat_archive",
+                    conversation_id=message.conversation_id, message_id=message.id,
+                    supports_type="perspective", quote=message.content,
+                    interpretation=persp.inner_monologue or content, confidence=0.7,
+                    metadata={"speaker": speaker_char.name, "viewer": viewer_char.name},
+                )
+                _create_memory_item(
+                    db, character_id=viewer_char.id, memory_type="relationship",
+                    content=content, confidence=0.7, source="多视角归档",
+                    evidence_ids=[evidence.id],
+                )
+            # 关系微调：viewer→speaker，按深层情绪极性
+            polarity = _emotion_polarity(deep_label)
+            if polarity != 0:
+                rel = find_pair_relationship(db, viewer_char.id, speaker_char.id)
+                if not rel:
+                    rel = Relationship(
+                        source_id=viewer_char.id, target_id=speaker_char.id,
+                        rel_type="dynamic", strength=0.5, sentiment=0.0,
+                        description="由多视角对话归档生成", history=[],
+                    )
+                    db.add(rel)
+                    db.flush()
+                score = (deep.get("score") or 0) / 10
+                rel.sentiment = max(-1.0, min(1.0, (rel.sentiment or 0.0) * 0.8 + polarity * score * 0.2))
+                rel.updated_at = datetime.utcnow()
+            archived += 1
+    return archived

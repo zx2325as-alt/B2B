@@ -7,17 +7,20 @@ from pydantic import BaseModel
 
 class CharacterCreate(BaseModel):
     name: str
+    aliases: list[str] = []
     role: str = ""
     background: str = ""
     age: Optional[int] = None
     avatar_color: str = "#00d4ff"
     personality_tags: list[str] = []
+    core_traits: dict = {}
     weakness: str = ""
     motivation: str = ""
     speaking_style: str = ""
 
 class CharacterUpdate(BaseModel):
     name: Optional[str] = None
+    aliases: Optional[list[str]] = None
     role: Optional[str] = None
     background: Optional[str] = None
     age: Optional[int] = None
@@ -28,19 +31,41 @@ class CharacterUpdate(BaseModel):
     motivation: Optional[str] = None
     speaking_style: Optional[str] = None
 
+class CharacterMergeRequest(BaseModel):
+    source_id: int  # 被合并（将被删除）的角色 ID
+
 class CharacterOut(BaseModel):
     id: int
     name: str
-    role: str
-    background: str
-    age: Optional[int]
-    avatar_color: str
-    personality_tags: list[str]
-    core_traits: dict
-    weakness: str
-    motivation: str
-    speaking_style: str
+    aliases: Optional[list[str]] = []
+    # 历史数据可能存在 NULL 列，序列化时容忍并给默认值
+    role: Optional[str] = ""
+    background: Optional[str] = ""
+    age: Optional[int] = None
+    avatar_color: Optional[str] = "#00d4ff"
+    personality_tags: Optional[list[str]] = []
+    core_traits: Optional[dict] = {}
+    weakness: Optional[str] = ""
+    motivation: Optional[str] = ""
+    speaking_style: Optional[str] = ""
+    profile_json: Optional[dict] = {}
     version: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TraitHypothesisOut(BaseModel):
+    id: int
+    character_id: int
+    hypothesis: str
+    dimension: str
+    confidence: float
+    supporting_evidence_ids: list
+    contradicting_evidence_ids: list
+    status: str
     created_at: datetime
     updated_at: datetime
 
@@ -61,11 +86,14 @@ class EventCreate(BaseModel):
 class EventOut(BaseModel):
     id: int
     character_id: int
-    title: str
-    description: str
-    event_date: str
-    emotion_label: str
-    importance: int
+    # 这些列在库中允许 NULL（如弧光转折事件无具体日期），序列化时容忍
+    title: Optional[str] = ""
+    description: Optional[str] = ""
+    event_date: Optional[str] = ""
+    emotion_label: Optional[str] = ""
+    importance: Optional[int] = 3
+    psychological_impact: Optional[str] = ""
+    arc_marker: Optional[bool] = False
     created_at: datetime
 
     class Config:
@@ -95,8 +123,9 @@ class RelationshipOut(BaseModel):
     rel_type: str
     strength: float
     sentiment: float
-    description: str
-    history: list
+    description: Optional[str] = ""
+    analysis_json: Optional[dict] = {}
+    history: Optional[list] = []
     updated_at: datetime
 
     class Config:
@@ -123,6 +152,7 @@ class ObservationOut(BaseModel):
     old_value: str
     new_value: str
     reason: str
+    metadata_json: Optional[dict] = None
     status: str
     created_at: datetime
 
@@ -240,12 +270,22 @@ class ChatMessage(BaseModel):
     speaker: str
     content: str
     character_id: Optional[int] = None
+    # 手动指定接收方（为空时由后端自动推断主要接收方）
+    receiver_name: Optional[str] = None
+    receiver_id: Optional[int] = None
     scenario: str = "general"
     active_characters: Optional[list[ActiveCharacter]] = None
 
 class ConversationCreate(BaseModel):
     title: str = "新对话"
     scenario: str = "general"
+    scene_brief: str = ""
+
+class ConversationUpdate(BaseModel):
+    title: Optional[str] = None
+    scenario: Optional[str] = None
+    scene_brief: Optional[str] = None
+    participants: Optional[list[ActiveCharacter]] = None
 
 class MessageOut(BaseModel):
     id: int
@@ -269,9 +309,31 @@ class MessageOut(BaseModel):
     emotion_score: Optional[float]
     subtext: Optional[str]
     psychological_tag: Optional[str]
+    analysis_json: Optional[dict] = None
     source_type: Optional[str]
     readonly: Optional[bool]
     timestamp: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MessagePerspectiveOut(BaseModel):
+    id: int
+    message_id: int
+    speaker_name: Optional[str] = ""
+    viewer_character_id: Optional[int] = None
+    viewer_name: Optional[str] = ""
+    stance: Optional[str] = "observer"
+    is_primary: Optional[bool] = False
+    suggested_reply: Optional[str] = ""
+    inner_monologue: Optional[str] = ""
+    emotion_label: Optional[str] = ""
+    emotion_score: Optional[float] = None
+    subtext: Optional[str] = ""
+    psychological_tag: Optional[str] = ""
+    analysis_json: Optional[dict] = None
     created_at: datetime
 
     class Config:

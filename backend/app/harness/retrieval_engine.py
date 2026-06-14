@@ -15,6 +15,8 @@ from ..models.sql_models import (
     Relationship,
     RetrievalTrace,
 )
+from ..services.relationships import find_pair_relationship
+from .embeddings import cosine_similarity, embed_text, embedding_enabled
 from .graph_store import graph_store
 
 
@@ -83,19 +85,12 @@ def _character_profile(char: Character | None) -> dict[str, Any]:
 
 
 def _relationship_context(db: Session, speaker: Character | None, listener: Character | None) -> dict[str, Any]:
+    """两人之间只存一条无向关系，直接返回这条 pair 关系"""
     if not speaker or not listener:
         return {}
-    rel = db.query(Relationship).filter(
-        Relationship.source_id == speaker.id,
-        Relationship.target_id == listener.id,
-    ).first()
-    reverse_rel = db.query(Relationship).filter(
-        Relationship.source_id == listener.id,
-        Relationship.target_id == speaker.id,
-    ).first()
+    rel = find_pair_relationship(db, speaker.id, listener.id)
     return {
-        "speaker_to_listener": _relationship_item(rel, listener),
-        "listener_to_speaker": _relationship_item(reverse_rel, speaker),
+        "pair": _relationship_item(rel, listener),
     }
 
 
@@ -148,6 +143,8 @@ def _memory_candidates(db: Session, query: str, character_ids: list[int]) -> lis
         MemoryItem.character_id.in_(character_ids),
         MemoryItem.status == "active",
     ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(120).all()
+    # 可选语义检索：embedding 启用时，查询向量与记忆向量的余弦相似度参与打分
+    query_vector = embed_text(query) if embedding_enabled() else None
     scored = []
     for memory in memories:
         score = (
@@ -155,6 +152,8 @@ def _memory_candidates(db: Session, query: str, character_ids: list[int]) -> lis
             + float(memory.confidence or 0.0) * 0.35
             + _recency_score(memory.updated_at or memory.created_at)
         )
+        if query_vector and memory.embedding:
+            score += cosine_similarity(query_vector, memory.embedding) * 0.5
         scored.append(
             {
                 "id": memory.id,
@@ -329,9 +328,9 @@ def render_evidence_pack(evidence_pack: dict[str, Any]) -> str:
             tags = "、".join(profile.get("personality_tags") or []) or "暂无"
             lines.append(f"- {label}画像：{profile.get('name', '')}｜标签：{tags}｜动机：{profile.get('motivation') or '暂无'}｜弱点：{profile.get('weakness') or '暂无'}")
     rel = evidence_pack.get("relationship_context") or {}
-    speaker_rel = rel.get("speaker_to_listener") or {}
-    if speaker_rel:
-        lines.append(f"- 关系链：{speaker_rel.get('target_name', '')}｜类型={speaker_rel.get('rel_type')}｜强度={speaker_rel.get('strength')}｜极性={speaker_rel.get('sentiment')}｜说明={speaker_rel.get('description') or '暂无'}")
+    pair_rel = rel.get("pair") or rel.get("speaker_to_listener") or {}
+    if pair_rel:
+        lines.append(f"- 关系链：{pair_rel.get('target_name', '')}｜类型={pair_rel.get('rel_type')}｜强度={pair_rel.get('strength')}｜极性={pair_rel.get('sentiment')}｜说明={pair_rel.get('description') or '暂无'}")
     graph_people = (evidence_pack.get("graph_context") or {}).get("people", [])
     if graph_people:
         lines.append("- Neo4j 图谱上下文：")

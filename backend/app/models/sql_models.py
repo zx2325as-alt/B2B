@@ -16,6 +16,8 @@ class Character(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False, index=True)
+    # 别名/称呼列表（如"张总"、"老张"），导入与归档时按别名归并到同一角色
+    aliases = Column(JSON, default=list)
     avatar_color = Column(String(20), default="#00d4ff")
     role = Column(String(100))
     background = Column(Text)
@@ -25,6 +27,9 @@ class Character(Base):
     weakness = Column(Text)
     motivation = Column(Text)
     speaking_style = Column(Text)
+    # 扩展人物模型（立体维度）：values/desires/fears/interpersonal_patterns/
+    # key_experiences/speech_fingerprint/contradictions/self_image_vs_public
+    profile_json = Column(JSON, default=dict)
     version = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -35,7 +40,7 @@ class Character(Base):
     memory_items = relationship("MemoryItem", back_populates="character", cascade="all, delete-orphan")
     personality_snapshots = relationship("PersonalitySnapshot", back_populates="character", cascade="all, delete-orphan")
     rel_from = relationship("Relationship", foreign_keys="Relationship.source_id", back_populates="source", cascade="all, delete-orphan")
-    rel_to   = relationship("Relationship", foreign_keys="Relationship.target_id", back_populates="target")
+    rel_to   = relationship("Relationship", foreign_keys="Relationship.target_id", back_populates="target", cascade="all, delete-orphan")
 
 
 class CharacterEvent(Base):
@@ -48,9 +53,28 @@ class CharacterEvent(Base):
     event_date = Column(String(50))        # flexible date string
     emotion_label = Column(String(50))
     importance = Column(Integer, default=3)  # 1-5
+    # 叙事化：这件事对人物意味着什么 / 是否人物弧光转折点
+    psychological_impact = Column(Text, default="")
+    arc_marker = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     character = relationship("Character", back_populates="events")
+
+
+class TraitHypothesis(Base):
+    """特质假设：系统对人物形成的可被验证/反驳的猜想，置信度随证据演化"""
+    __tablename__ = "trait_hypotheses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    character_id = Column(Integer, ForeignKey("characters.id"), nullable=False, index=True)
+    hypothesis = Column(Text, nullable=False)
+    dimension = Column(String(50), default="心理特征")  # 对应扩展档案维度
+    confidence = Column(Float, default=0.4)
+    supporting_evidence_ids = Column(JSON, default=list)
+    contradicting_evidence_ids = Column(JSON, default=list)
+    status = Column(String(20), default="active")  # active / confirmed / rejected
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Relationship(Base):
@@ -63,7 +87,9 @@ class Relationship(Base):
     strength = Column(Float, default=0.5)              # 0.0 ~ 1.0
     sentiment = Column(Float, default=0.0)             # -1.0 ~ 1.0
     description = Column(Text)
-    history = Column(JSON, default=list)               # [{date,strength,sentiment}]
+    # 关系深度分析：power_dynamic/interaction_pattern/perception_gap/tensions/trajectory
+    analysis_json = Column(JSON, default=dict)
+    history = Column(JSON, default=list)               # [{date,strength,sentiment,note}]
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -81,6 +107,8 @@ class CharacterObservation(Base):
     old_value = Column(Text)
     new_value = Column(Text)
     reason = Column(Text)
+    # 结构化元数据（来源/置信度/分类/触发/示例等），替代“reason 多行文本协议”
+    metadata_json = Column(JSON, default=dict)
     status = Column(String(20), default="pending")   # pending / approved / rejected
     created_at = Column(DateTime, default=datetime.utcnow)
     reviewed_at = Column(DateTime, nullable=True)
@@ -125,6 +153,8 @@ class MemoryItem(Base):
     content = Column(Text, nullable=False)
     confidence = Column(Float, default=0.0)
     evidence_ids = Column(JSON, default=list)
+    # 可选向量（embedding 服务启用时写入，用于语义检索）
+    embedding = Column(JSON, nullable=True)
     source = Column(String(100), default="")
     status = Column(String(20), default="active")
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -261,14 +291,55 @@ class Conversation(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(200), default="新对话")
     scenario = Column(String(100), default="general")
+    # 用户手写的场景背景说明（会注入分析上下文，聊天中可随时编辑）
+    scene_brief = Column(Text, default="")
     is_readonly = Column(Boolean, default=False)
     source_import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=True)
     active_branch_id = Column(String(80), nullable=True)
     active_branch_point_id = Column(Integer, nullable=True)
+    # 会话参与角色 [{id, name}]，持久化角色配置（含从未发言的听者）
+    participants = Column(JSON, default=list)
+    # 滚动摘要：超出窗口的旧消息压缩为剧情纪要
+    context_summary = Column(Text, default="")
+    summary_until_index = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+
+
+class MessagePerspective(Base):
+    """多视角分析：一条发言 × 一个在场旁观角色 = 一行（该角色站在自己立场对这句话的理解）"""
+    __tablename__ = "message_perspectives"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    speaker_name = Column(String(100), default="")     # 发言者
+    viewer_character_id = Column(Integer, ForeignKey("characters.id"), nullable=True)
+    viewer_name = Column(String(100), default="")      # 分析视角的角色
+    stance = Column(String(20), default="observer")    # speaker(发言者自述) / observer(旁观解读)
+    is_primary = Column(Boolean, default=False)        # 是否主要接收方视角
+    suggested_reply = Column(Text, default="")         # 该旁观角色会怎么回应（建议回答）
+    inner_monologue = Column(Text)
+    emotion_label = Column(String(80))
+    emotion_score = Column(Float)
+    subtext = Column(Text)
+    psychological_tag = Column(String(120))
+    analysis_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ConversationState(Base):
+    """每个会话×角色的持续心理状态（情绪向量/目标/防御机制等），进程重启不丢失"""
+    __tablename__ = "conversation_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    character_name = Column(String(100), nullable=False)
+    state_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Message(Base):
@@ -299,6 +370,8 @@ class Message(Base):
     emotion_score = Column(Float)
     subtext = Column(Text)
     psychological_tag = Column(String(100))
+    # 结构化分析结果（emotions/strategy/tags 嵌套 JSON），上述文本列仅作展示兼容
+    analysis_json = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

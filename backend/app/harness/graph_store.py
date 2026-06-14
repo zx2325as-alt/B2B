@@ -9,8 +9,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from ..models.sql_models import (
     Character,
     CharacterEvent,
@@ -18,19 +16,14 @@ from ..models.sql_models import (
     MemoryItem,
     Relationship,
 )
+from .config_loader import get_graph_config
 
 logger = logging.getLogger(__name__)
-CONF_DIR = Path(__file__).parent.parent / "conf"
-CONFIG_FILE = CONF_DIR / "config.yaml"
 ROOT_DIR = Path(__file__).resolve().parents[3]
 
 
 def _load_graph_config() -> dict[str, Any]:
-    if not CONFIG_FILE.exists():
-        return {}
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
-    graph = config.get("graph") or {}
+    graph = dict(get_graph_config())
     bundled_home = graph.get("bundled_home") or ""
     if bundled_home:
         path = Path(bundled_home)

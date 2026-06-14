@@ -30,6 +30,27 @@
         </router-link>
       </div>
 
+      <!-- 对话列表：并入导航栏，仅智能对话页显示（不再单列一栏） -->
+      <div v-if="$route.path === '/chat'" class="conv-rail">
+        <div class="conv-rail-head">
+          <span class="conv-rail-title">对话</span>
+          <button class="conv-new-btn" @click="newConv">＋ 新建</button>
+        </div>
+        <div class="conv-rail-list">
+          <div v-for="c in chat.conversations" :key="c.id"
+            class="conv-rail-item" :class="{ active: chat.activeConvId === c.id }"
+            @click="selectConv(c.id)">
+            <div class="cri-main">
+              <div class="cri-title">{{ c.title }}</div>
+              <div class="cri-meta">{{ fmtDate(c.updated_at) }}</div>
+            </div>
+            <button class="cri-del" @click.stop="delConv(c.id)" title="删除对话">✕</button>
+          </div>
+          <div v-if="!chat.conversations.length" class="cri-empty">暂无对话，点「新建」开始</div>
+        </div>
+      </div>
+      <div v-else class="nav-spacer"></div>
+
       <div class="sidebar-footer">
         <div class="status-dot"></div>
         <span class="status-text">AI Harness 在线</span>
@@ -44,8 +65,53 @@
         </transition>
       </router-view>
     </div>
+
+    <NotifyHost />
   </div>
 </template>
+
+<script setup>
+import { onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import NotifyHost from './components/NotifyHost.vue'
+import { useChatStore } from './stores/chat.js'
+import { toast, confirmDialog } from './utils/notify.js'
+
+const chat = useChatStore()
+const route = useRoute()
+
+function fmtDate(dt) {
+  if (!dt) return ''
+  return new Date(dt).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+}
+async function ensureConversations() {
+  try { await chat.loadConversations() } catch { /* 拦截器已提示 */ }
+}
+onMounted(() => { if (route.path === '/chat') ensureConversations() })
+watch(() => route.path, (p) => { if (p === '/chat') ensureConversations() })
+
+async function selectConv(id) {
+  if (chat.activeConvId === id) return
+  await chat.loadMessages(id)   // ChatUI 通过 watch(activeConvId/messages) 完成每会话设置
+}
+async function newConv() {
+  const title = '新对话 ' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  await chat.newConversation(title, 'general')
+}
+async function delConv(id) {
+  if (!await confirmDialog('确定删除这个对话吗？相关分析与检索记录将一并清理。')) return
+  await chat.deleteConversation(id)
+  toast.success('对话已删除')
+  if (chat.activeConvId === id) {
+    if (chat.conversations.length) {
+      await chat.loadMessages(chat.conversations[0].id)
+    } else {
+      chat.activeConvId = null
+      chat.messages = []
+    }
+  }
+}
+</script>
 
 <style scoped>
 .app-layout {
@@ -88,7 +154,26 @@
   margin-top: -6px;
 }
 
-.nav-links { flex: 1; padding: 0 10px; display: flex; flex-direction: column; gap: 4px; }
+.nav-links { flex: 0 0 auto; padding: 0 10px; display: flex; flex-direction: column; gap: 4px; }
+.nav-spacer { flex: 1; }
+
+/* 对话列表并入导航栏（单列，不再独占一栏） */
+.conv-rail { flex: 1; min-height: 0; display: flex; flex-direction: column; margin-top: 10px; border-top: 1px solid var(--border); }
+.conv-rail-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px 8px; }
+.conv-rail-title { font-size: 11px; font-family: var(--font-mono); color: var(--text-muted); text-transform: uppercase; letter-spacing: .08em; }
+.conv-new-btn { background: var(--cyan-dim); border: 1px solid rgba(0,212,255,0.2); color: var(--cyan); font-size: 11px; padding: 3px 10px; border-radius: 100px; cursor: pointer; transition: var(--transition); }
+.conv-new-btn:hover { background: var(--cyan); color: #080c16; }
+.conv-rail-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; display: flex; flex-direction: column; gap: 2px; }
+.conv-rail-item { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; transition: var(--transition); border: 1px solid transparent; }
+.conv-rail-item:hover { background: var(--bg-hover); }
+.conv-rail-item.active { background: var(--cyan-dim); border-color: rgba(0,212,255,0.2); }
+.cri-main { flex: 1; min-width: 0; }
+.cri-title { font-size: 13px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cri-meta { font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); margin-top: 1px; }
+.cri-del { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 11px; opacity: 0; padding: 2px 4px; border-radius: 4px; transition: var(--transition); flex-shrink: 0; }
+.conv-rail-item:hover .cri-del { opacity: .5; }
+.cri-del:hover { opacity: 1 !important; color: var(--red); }
+.cri-empty { font-size: 12px; color: var(--text-muted); text-align: center; padding: 18px 8px; line-height: 1.6; }
 .nav-link {
   display: flex;
   align-items: center;

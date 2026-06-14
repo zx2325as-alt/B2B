@@ -3,11 +3,17 @@ ai:
   task_providers:
     chat_surface_reply: "deepseek"
     chat_analysis: "deepseek"
+    multi_perspective_analysis: "deepseek"
     import_dialogue_parse: "deepseek"
     import_narrative_parse: "deepseek"
+    import_profile_document_parse: "deepseek"
     import_commit_review: "deepseek"
+    relationship_deep_analysis: "deepseek"
+    trait_hypothesis_update: "deepseek"
     interaction_analysis_rebuild: "deepseek"
+    interaction_batch_analysis: "deepseek"
     character_profile_gen: "deepseek"
+    import_profile_gen: "deepseek"
     relationship_analysis: "deepseek"
     ai_suggest_update: "deepseek"
     emotion_curve: "deepseek"
@@ -15,6 +21,7 @@ ai:
     diagnosis_critic: "deepseek"
     long_context_review: "deepseek"
     long_context_review_critic: "deepseek"
+    context_summary: "deepseek"
   task_models:
     import_dialogue_parse: "deepseek-chat"
     import_narrative_parse: "deepseek-chat"
@@ -22,42 +29,85 @@ ai:
     interaction_analysis_rebuild: "deepseek-chat"
   task_max_tokens:
     chat_analysis: 2048
+    multi_perspective_analysis: 4096
     import_dialogue_parse: 8192
     import_narrative_parse: 8192
+    import_profile_document_parse: 8192
     import_commit_review: 4096
+    relationship_deep_analysis: 2048
+    trait_hypothesis_update: 2048
     interaction_analysis_rebuild: 3072
+    interaction_batch_analysis: 8192
+    import_profile_gen: 2048
     structured_diagnosis: 3072
     diagnosis_critic: 2048
     long_context_review: 6144
     long_context_review_critic: 3072
+    context_summary: 1024
   task_temperatures:
     import_dialogue_parse: 0.3
     import_narrative_parse: 0.3
+    import_profile_document_parse: 0.2
     import_commit_review: 0.3
+    relationship_deep_analysis: 0.4
+    trait_hypothesis_update: 0.3
     interaction_analysis_rebuild: 0.4
+    interaction_batch_analysis: 0.4
+    import_profile_gen: 0.3
     structured_diagnosis: 0.3
     diagnosis_critic: 0.2
     long_context_review: 0.25
     long_context_review_critic: 0.15
-  
+    context_summary: 0.2
+  # 每个任务的 LLM 调用超时（秒），未列出的任务用 default
+  task_timeouts:
+    default: 120
+    chat_surface_reply: 90
+    chat_analysis: 120
+    multi_perspective_analysis: 180
+    import_dialogue_parse: 180
+    import_narrative_parse: 180
+    import_profile_document_parse: 240
+    import_commit_review: 180
+    relationship_deep_analysis: 120
+    trait_hypothesis_update: 120
+    interaction_analysis_rebuild: 90
+    interaction_batch_analysis: 300
+    import_profile_gen: 120
+    long_context_review: 300
+    long_context_review_critic: 180
+    context_summary: 90
+
   providers:
     openai:
       base_url: "https://api.openai.com/v1"
-      api_key: "sk-your-openai-key"
+      # 密钥放 config.local.yaml（不入库），此处仅占位
+      api_key: ""
       models:
         simple: "gpt-4o-mini"
         medium: "gpt-4o"
         complex: "gpt-4o"
-        
+
     deepseek:
       base_url: "https://api.deepseek.com/v1"
-      api_key: "sk-b485624217094c209a90af7db84ea9ab"
+      # 密钥放 config.local.yaml（不入库），此处仅占位
+      api_key: ""
       models:
         simple: "deepseek-chat"
         medium: "deepseek-chat"
         complex: "deepseek-chat"
 
+# 可选向量检索（默认关闭）：配置任意 OpenAI 兼容 embedding 服务后开启，
+# 记忆写入时计算向量、检索时按余弦相似度参与打分（DeepSeek 无 embedding API，
+# 可用 SiliconFlow bge-m3 等免费服务）
+embedding:
+  enabled: false
+  base_url: ""
+  api_key: ""
+  model: "BAAI/bge-m3"
+
 graph:
+  # Neo4j 图谱层（start.bat 会随项目启动 Neo4j；如不需要可改为 false，系统自动降级为纯 SQLite）
   enabled: true
   provider: "neo4j"
   uri: "bolt://127.0.0.1:7687"
@@ -65,4 +115,11 @@ graph:
   password: ""
   database: "neo4j"
   bundled_home: "backend/app/models/neo4j-community-5.18.1"
-        
+
+context:
+  # 对话上下文 token 预算（deepseek-chat 支持 64K，24K 留足余量）
+  token_limit: 24000
+  reserve_for_output: 1500
+  # 超过该条数的旧消息进入滚动摘要
+  summary_trigger_messages: 40
+  summary_keep_recent: 20

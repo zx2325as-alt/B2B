@@ -15,7 +15,7 @@ from ..models.sql_models import (
     EvidenceSpan, MemoryItem, PersonalitySnapshot, AgentRun, RetrievalTrace, StructuredDiagnosis,
 )
 from ..schemas import (
-    CharacterCreate, CharacterUpdate, CharacterOut,
+    CharacterCreate, CharacterUpdate, CharacterOut, CharacterMergeRequest,
     EventCreate, EventOut,
     RelationshipCreate, RelationshipUpdate, RelationshipOut,
     ObservationReview, ObservationOut, ImportCommitRequest, BehaviorPatternPayload,
@@ -25,6 +25,20 @@ from ..schemas import (
 from ..harness.orchestrator import orchestrator
 from ..harness.import_engine import extract_text_from_file, build_import_preview
 from ..harness.graph_store import graph_store
+from ..services.profiles import (
+    PROFILE_TEXT_FIELDS,
+    blend_traits,
+    merge_background,
+    merge_extended_profile,
+    merge_tags,
+    profile_completeness,
+    render_extended_profile,
+)
+from ..services.relationships import find_pair_relationship
+from ..services.identity import add_alias, find_character_by_name, merge_characters
+from ..services.hypotheses import run_hypothesis_round
+from ..models.sql_models import TraitHypothesis
+from ..schemas import TraitHypothesisOut
 from .deps import get_db, SessionLocal
 
 router = APIRouter(prefix="/characters", tags=["characters"])
@@ -88,19 +102,30 @@ def _resolve_mapping(role_mappings: list, original_name: str) -> dict:
         if mapping.original_name == original_name:
             return {
                 "name": mapping.resolved_name.strip() or original_name,
+                "original_name": original_name,
                 "action": mapping.action,
             }
-    return {"name": original_name, "action": "create"}
+    return {"name": original_name, "original_name": original_name, "action": "create"}
 
 
-async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_character: dict) -> Character:
+def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_character: dict) -> tuple[Character, bool]:
+    """
+    创建/链接角色（不做 AI 画像）。返回 (角色, 是否新建)。
+    命中顺序：本名 → 别名；用户把"张总"映射到"张三"时自动把"张总"记为别名，
+    下次导入同一称呼直接归并到同一角色。
+    """
     resolved_name = mapping["name"]
-    existing = db.query(Character).filter(Character.name == resolved_name).first()
+    original_name = (mapping.get("original_name") or "").strip()
+    existing = find_character_by_name(db, resolved_name)
     if existing:
-        return existing
+        # 原始称呼与角色本名不同 → 记为别名，沉淀同一性知识
+        if original_name and original_name != existing.name and add_alias(existing, original_name):
+            db.flush()
+        return existing, False
 
     char = Character(
         name=resolved_name,
+        aliases=[original_name] if original_name and original_name != resolved_name else [],
         role=parsed_character.get("role", "") or "",
         background=parsed_character.get("background", "") or "",
         avatar_color="#00d4ff",
@@ -114,23 +139,296 @@ async def _ensure_character_from_mapping(db: Session, mapping: dict, parsed_char
     db.flush()
     db.refresh(char)
     graph_store.sync_character(char)
-    try:
-        profile = await orchestrator.generate_character_profile(
-            char.name,
-            char.role or "",
-            char.background or "",
+    return char, True
+
+
+def _collect_character_evidence(preview: dict[str, Any], char_name: str, max_lines: int = 14) -> tuple[list[str], list[str], list[str], list[str]]:
+    """从导入预览中收集某角色的真实证据：本人台词、别人对其说的话、事件、关系、规则推断提示"""
+    lines: list[str] = []
+    received: list[str] = []
+    for unit in preview.get("interaction_units") or []:
+        speaker = (unit.get("speaker") or "").strip()
+        receiver = (unit.get("receiver") or "").strip()
+        content = (unit.get("content") or "").strip()
+        if not content:
+            continue
+        if speaker == char_name:
+            lines.append(f"对{receiver or '？'}说：「{content[:120]}」")
+        elif receiver == char_name:
+            # 别人对他说的话同样是证据：反映其地位、关系与他人对他的态度
+            received.append(f"{speaker or '某人'}对他说：「{content[:100]}」")
+    # 台词过多时均匀采样，保证覆盖开头/中段/结尾
+    if len(lines) > max_lines:
+        step = len(lines) / max_lines
+        lines = [lines[int(i * step)] for i in range(max_lines)]
+    if len(received) > 6:
+        step = len(received) / 6
+        received = [received[int(i * step)] for i in range(6)]
+    lines = lines + received
+
+    events: list[str] = []
+    for event in preview.get("events") or []:
+        participants = _dedupe_names([event.get("actor", "")] + list(event.get("participants") or []))
+        if char_name not in participants:
+            continue
+        summary = (event.get("summary") or event.get("action") or "").strip()
+        if summary:
+            events.append(summary[:100])
+
+    relationships: list[str] = []
+    for rel in preview.get("relationships") or []:
+        source = (rel.get("source") or "").strip()
+        target = (rel.get("target") or "").strip()
+        if char_name not in (source, target):
+            continue
+        other = target if source == char_name else source
+        desc = (rel.get("description") or "").strip()
+        relationships.append(f"与{other}：{rel.get('rel_type') or 'neutral'}{('，' + desc[:60]) if desc else ''}")
+
+    # 人物事实（资料型导入的主要证据来源；对话型导入的补充证据）
+    facts: list[str] = []
+    for fact in preview.get("persona_facts") or []:
+        if (fact.get("subject") or "").strip() != char_name:
+            continue
+        content = (fact.get("content") or "").strip()
+        if not content:
+            continue
+        category = (fact.get("category") or "").strip()
+        time_hint = (fact.get("time_hint") or "").strip()
+        facts.append(f"[{category}]{('(' + time_hint + ')') if time_hint else ''} {content}")
+    if len(facts) > 24:
+        step = len(facts) / 24
+        facts = [facts[int(i * step)] for i in range(24)]
+    lines = lines + facts
+
+    hints: list[str] = []
+    modeling = (preview.get("character_modeling") or {}).get(char_name) or {}
+    if modeling.get("traits"):
+        hints.append("规则推断标签：" + "、".join([str(t) for t in modeling["traits"]][:6]))
+    pattern_names = [str(p.get("name") or "") for p in (modeling.get("behavior_patterns") or [])]
+    pattern_names = [p for p in pattern_names if p]
+    if pattern_names:
+        hints.append("规则推断行为模式：" + "、".join(pattern_names[:5]))
+    return lines, events[:6], relationships[:6], hints
+
+
+def _apply_profile_candidate(
+    db: Session,
+    char: Character,
+    candidate: dict[str, Any],
+    *,
+    source: str,
+    evidence_note: str,
+    base_confidence: float = 0.78,
+    merge_mode: bool = True,
+) -> bool:
+    """
+    统一档案应用入口——新建 / 导入融合 / AI 建议三条链路共用：
+    - 文本字段：空则填；非空时融合模式直接深化（AI 已合并旧档案），非融合模式进待审核
+    - personality_tags：并集
+    - core_traits：EMA 融合
+    - conflicts：进待审核，不悄悄改写
+    返回是否发生了变更。
+    """
+    changed = False
+    evidence_note = (evidence_note or "").strip() or "AI 档案候选"
+
+    for field, module in PROFILE_TEXT_FIELDS:
+        new_value = str(candidate.get(field) or "").strip()
+        if not new_value:
+            continue
+        old_value = str(getattr(char, field, "") or "").strip()
+        if old_value == new_value:
+            continue
+        if not old_value:
+            setattr(char, field, new_value)
+            _create_change_observation(
+                db, char.id, field, old_value, new_value,
+                source, evidence_note, base_confidence, module, "新增",
+            )
+            changed = True
+        elif merge_mode:
+            # 背景故事走服务器端确定性积累：旧句子全保留，新句子去重追加，
+            # 不依赖 AI 自觉保留旧事实
+            if field == "background":
+                accumulated = merge_background(old_value, new_value)
+                if accumulated != old_value:
+                    setattr(char, field, accumulated)
+                    _create_change_observation(
+                        db, char.id, field, old_value, accumulated,
+                        source, evidence_note, base_confidence, module, "深化",
+                    )
+                    changed = True
+                continue
+            # 其余字段严格单调：候选比现有内容短即视为信息量倒退，
+            # 一律降级待审核——自动链路只许增厚，不许变薄
+            if len(old_value) >= 10 and len(new_value) < len(old_value):
+                _create_change_observation(
+                    db, char.id, field, old_value, new_value,
+                    source, f"{evidence_note}（候选内容短于现有档案，已拦截直接覆盖）",
+                    round(max(0.0, base_confidence - 0.2), 2), module, "更新",
+                    status="pending",
+                )
+                continue
+            # 融合模式：候选档案已在旧档案基础上深化，直接应用并留痕
+            setattr(char, field, new_value)
+            _create_change_observation(
+                db, char.id, field, old_value, new_value,
+                source, evidence_note, base_confidence, module, "深化",
+            )
+            changed = True
+        else:
+            # 非融合模式：不覆盖已有内容（如用户手填），进待审核
+            _create_change_observation(
+                db, char.id, field, old_value, new_value,
+                source, evidence_note, round(max(0.0, base_confidence - 0.1), 2), module, "更新",
+                status="pending",
+            )
+
+    merged_tags = merge_tags(char.personality_tags, candidate.get("personality_tags"))
+    if merged_tags != list(char.personality_tags or []):
+        _create_change_observation(
+            db, char.id, "personality_tags",
+            list(char.personality_tags or []), merged_tags,
+            source, evidence_note, base_confidence, "人格模型", "更新",
         )
-        char.personality_tags = profile.get("personality_tags", []) or char.personality_tags
-        char.core_traits = profile.get("core_traits", {}) or {}
-        char.weakness = profile.get("weakness", "") or char.weakness
-        char.motivation = profile.get("motivation", "") or char.motivation
-        char.speaking_style = profile.get("speaking_style", "") or char.speaking_style
+        char.personality_tags = merged_tags
+        changed = True
+
+    blended = blend_traits(char.core_traits, candidate.get("core_traits"))
+    current_subset = {
+        key: value for key, value in (char.core_traits or {}).items()
+        if key in BIG_FIVE_KEYS and isinstance(value, (int, float))
+    }
+    if blended and blended != current_subset:
+        char.core_traits = {**(char.core_traits or {}), **blended}
+        changed = True
+
+    # 扩展人物模型（八维度）：只增不减地合并到 profile_json
+    extended_candidate = candidate.get("extended")
+    if isinstance(extended_candidate, dict) and extended_candidate:
+        merged_extended, added_count = merge_extended_profile(char.profile_json, extended_candidate)
+        if added_count:
+            char.profile_json = merged_extended
+            _create_change_observation(
+                db, char.id, "profile_extended",
+                "", f"扩展人物模型新增 {added_count} 条（价值观/恐惧/人际模式/矛盾性等）",
+                source, evidence_note, base_confidence, "人格模型", "深化",
+            )
+            changed = True
+
+    for conflict in candidate.get("conflicts") or []:
+        if not isinstance(conflict, dict):
+            continue
+        field = (conflict.get("field") or "").strip()
+        new_evidence = str(conflict.get("new_evidence") or "").strip()
+        if not field or not new_evidence or not hasattr(char, field):
+            continue
+        _create_change_observation(
+            db, char.id, field,
+            str(conflict.get("existing") or getattr(char, field, "") or ""),
+            new_evidence,
+            source,
+            str(conflict.get("suggestion") or "新证据与已有档案矛盾，请人工确认"),
+            0.6,
+            _resolve_profile_module(field),
+            "矛盾",
+            status="pending",
+        )
+
+    if changed:
+        char.version += 1
+        char.updated_at = datetime.utcnow()
+        db.add(char)
         db.flush()
-        db.refresh(char)
         graph_store.sync_character(char)
-    except Exception:
-        pass
-    return char
+    return changed
+
+
+async def _enrich_import_profiles(
+    db: Session,
+    preview: dict[str, Any],
+    resolved_chars: dict[str, Character],
+    concurrency: int = 3,
+) -> tuple[int, dict[str, str]]:
+    """
+    渐进式档案融合：AI 同时看到角色当前档案 + 本次导入的新证据，
+    输出深化后的完整档案。多次导入 = 多轮深化，档案逐渐丰满。
+    无任何证据（台词/被提及/事件/关系）的角色不调 AI，避免凭名字脑补。
+    返回 (深化角色数, {角色名: ok|unchanged|failed|no_evidence})。
+    """
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def _enrich(original_name: str, char: Character):
+        lines, event_samples, rel_samples, hints = _collect_character_evidence(preview, original_name)
+        if not lines and not event_samples and not rel_samples:
+            return char, None, "no_evidence"
+        current_profile = json.dumps(_build_snapshot_payload(char), ensure_ascii=False)
+        try:
+            async with semaphore:
+                profile = await orchestrator.generate_import_profile(
+                    char.name,
+                    current_profile,
+                    "\n".join(f"{i + 1}. {line}" for i, line in enumerate(lines)),
+                    "\n".join(f"- {item}" for item in event_samples),
+                    "\n".join(f"- {item}" for item in rel_samples),
+                    "\n".join(hints),
+                )
+            if isinstance(profile, dict):
+                return char, profile, "ok"
+            return char, None, "failed"
+        except Exception as exc:
+            import_logger.warning("导入画像生成失败 char=%s error=%s", char.name, exc)
+            return char, None, "failed"
+
+    results = await asyncio.gather(*(_enrich(name, char) for name, char in resolved_chars.items()))
+    enriched = 0
+    status_map: dict[str, str] = {}
+    for char, profile, status in results:
+        if not profile:
+            status_map[char.name] = status
+            continue
+        evidence_note = (profile.get("evidence_notes") or "").strip() or "基于导入文本台词证据融合深化"
+        if _apply_profile_candidate(
+            db, char, profile,
+            source="AI导入画像",
+            evidence_note=evidence_note,
+            base_confidence=0.8,
+            merge_mode=True,
+        ):
+            _create_personality_snapshot(db, char, source="AI导入画像")
+            enriched += 1
+            status_map[char.name] = "ok"
+        else:
+            status_map[char.name] = "unchanged"
+
+        # 人物弧光：检测到转折点 → 写入时间线（importance=5，标注心理转折）
+        arc = profile.get("arc") or {}
+        turning_point = (arc.get("turning_point") or "").strip()
+        if turning_point:
+            impact = "；".join(filter(None, [
+                f"转折前：{(arc.get('start_state') or '').strip()}" if arc.get("start_state") else "",
+                f"转折后：{(arc.get('end_state') or '').strip()}" if arc.get("end_state") else "",
+            ]))
+            exists = db.query(CharacterEvent).filter(
+                CharacterEvent.character_id == char.id,
+                CharacterEvent.arc_marker.is_(True),
+                CharacterEvent.description == turning_point[:500],
+            ).first()
+            if not exists:
+                db.add(CharacterEvent(
+                    character_id=char.id,
+                    title=f"心理转折：{turning_point[:30]}",
+                    description=turning_point[:500],
+                    event_date="",
+                    psychological_impact=impact[:500],
+                    arc_marker=True,
+                    importance=5,
+                    emotion_label="转折",
+                ))
+                db.flush()
+    db.commit()
+    return enriched, status_map
 
 
 def _infer_rel_type(sentiment: float, interaction_type: str) -> str:
@@ -230,10 +528,12 @@ def _create_memory_item(
         db.flush()
         graph_store.sync_memory(existing)
         return existing
+    from ..harness.embeddings import embed_text
     memory = MemoryItem(
         character_id=character_id,
         memory_type=memory_type,
         content=normalized[:2000],
+        embedding=embed_text(normalized[:2000]),
         confidence=max(0.0, min(1.0, float(confidence or 0.0))),
         evidence_ids=list(evidence_ids or []),
         source=source,
@@ -628,6 +928,36 @@ def _parse_observation_reason(reason: str) -> dict[str, Any]:
     return metadata
 
 
+def _build_observation_metadata(
+    source: str,
+    evidence: str,
+    confidence: float,
+    change_type: str,
+    module: str,
+    category: str = "",
+    trigger: str = "",
+    example: str = "",
+) -> dict[str, Any]:
+    return {
+        "source": source or "AI自动识别",
+        "evidence": evidence or "AI 解析结果",
+        "confidence": round(max(0.0, min(1.0, float(confidence or 0.0))), 2),
+        "change_type": change_type or "新增",
+        "module": module or "角色档案",
+        "category": category,
+        "trigger": trigger,
+        "example": example,
+    }
+
+
+def _observation_metadata(observation: CharacterObservation) -> dict[str, Any]:
+    """读取 observation 元数据：优先结构化 metadata_json，历史数据回退解析 reason 文本"""
+    metadata = getattr(observation, "metadata_json", None)
+    if isinstance(metadata, dict) and metadata.get("source"):
+        return metadata
+    return _parse_observation_reason(observation.reason or "")
+
+
 def _resolve_profile_module(field: str, metadata: dict[str, Any] | None = None) -> str:
     if metadata and metadata.get("module"):
         return metadata["module"]
@@ -690,6 +1020,16 @@ def _create_change_observation(
         old_value=_stringify_value(old_value),
         new_value=normalized_new_value,
         reason=_build_observation_reason(
+            source=source,
+            evidence=evidence,
+            confidence=confidence,
+            change_type=change_type,
+            module=module,
+            category=category,
+            trigger=trigger,
+            example=example,
+        ),
+        metadata_json=_build_observation_metadata(
             source=source,
             evidence=evidence,
             confidence=confidence,
@@ -773,7 +1113,7 @@ def _build_profile_view(
     for observation in observations:
         if observation.field != "behavior_pattern" or observation.status != "approved":
             continue
-        metadata = _parse_observation_reason(observation.reason)
+        metadata = _observation_metadata(observation)
         category = metadata.get("category") or "互动策略"
         behavior_groups.setdefault(category, [])
         behavior_groups[category].append(
@@ -841,7 +1181,9 @@ def _build_ai_update_log(observations: list[CharacterObservation]) -> dict[str, 
     approved = 0
     pending = 0
     for observation in observations:
-        metadata = _parse_observation_reason(observation.reason)
+        if observation.status == "archived":
+            continue
+        metadata = _observation_metadata(observation)
         source = metadata.get("source") or "AI自动识别"
         if source == "手动编辑":
             continue
@@ -892,10 +1234,12 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
         personality_model = profile.get("personality_model") or {}
         speaking_style = profile.get("speaking_style") or {}
 
+        # 铁律：规则层弱推断只允许填空缺，永远不覆盖已有内容
+        # （覆盖曾导致"每次导入都把好档案冲掉"——深化只能由证据融合层做）
         for field in ("role", "background"):
-            new_value = basic_info.get(field)
-            old_value = getattr(char, field, "")
-            if new_value and new_value != old_value:
+            new_value = (basic_info.get(field) or "").strip()
+            old_value = (getattr(char, field, "") or "").strip()
+            if new_value and not old_value:
                 setattr(char, field, new_value)
                 _create_change_observation(
                     db,
@@ -907,7 +1251,7 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
                     f"{field} 已由导入档案补全",
                     0.78,
                     "基础信息",
-                    _infer_change_type(old_value, new_value, prefer_override=True),
+                    "新增",
                 )
                 changed = True
                 total_changes += 1
@@ -965,8 +1309,11 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
             ("speaking_style", speaking_style.get("summary"), "说话风格"),
         ]
         for field, new_value, module in profile_fields:
-            old_value = getattr(char, field, "")
-            if new_value and new_value != old_value:
+            new_value = (new_value or "").strip()
+            old_value = (getattr(char, field, "") or "").strip()
+            # 同上：规则层只填空缺，不覆盖（如 speaking_style 的"简短/反问"标签拼接
+            # 不能冲掉 AI 写的丰富描述）
+            if new_value and not old_value:
                 setattr(char, field, new_value)
                 evidence = speaking_style.get("summary") if field == "speaking_style" else f"{module} 已由导入解析补全"
                 _create_change_observation(
@@ -979,7 +1326,7 @@ def _apply_character_profiles(db: Session, preview: dict[str, Any], resolved_cha
                     evidence,
                     0.77,
                     module,
-                    _infer_change_type(old_value, new_value, prefer_override=True),
+                    "新增",
                 )
                 changed = True
                 total_changes += 1
@@ -1042,7 +1389,7 @@ async def _enhance_import_preview(import_file_id: int, filename: str, content_te
         if not import_file:
             return
         existing_characters = [
-            {"id": char.id, "name": char.name, "role": char.role or ""}
+            {"id": char.id, "name": char.name, "role": char.role or "", "aliases": list(char.aliases or [])}
             for char in db.query(Character).all()
         ]
         import_logger.info("导入预览 AI 增强开始 import_file_id=%s filename=%s", import_file_id, filename)
@@ -1171,11 +1518,22 @@ def _dedupe_names(names: list[str]) -> list[str]:
     return result
 
 
+def _event_title(event: dict[str, Any]) -> str:
+    """事件标题优先用真实内容：摘要 > 主体+动作 > 兜底"""
+    summary = (event.get("summary") or "").strip()
+    if summary:
+        return summary[:40]
+    actor = (event.get("actor") or "").strip()
+    action = (event.get("action") or "").strip()
+    if actor and action:
+        return f"{actor}{action}"[:40]
+    return action[:40] or "导入事件"
+
+
 def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]]:
     preview_events = preview.get("events") or []
     drafts = []
     if preview_events:
-        # 移除前 20 个事件限制，处理全部事件
         for index, event in enumerate(preview_events, start=1):
             actors = _dedupe_names([event.get("actor", "")] + list(event.get("participants") or []))
             if not actors:
@@ -1183,19 +1541,21 @@ def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]
             detail_parts = []
             if event.get("summary"):
                 detail_parts.append(event["summary"])
-            if event.get("action"):
+            if event.get("action") and event.get("action") not in (event.get("summary") or ""):
                 detail_parts.append(f"核心动作：{event['action']}")
             if event.get("time"):
                 detail_parts.append(f"时间：{event['time']}")
             if event.get("location"):
                 detail_parts.append(f"地点：{event['location']}")
+            if len(actors) > 1:
+                detail_parts.append(f"涉及：{'、'.join(actors[:6])}")
             drafts.append(
                 {
                     "actors": actors,
-                    "title": f"{'、'.join(actors[:2])}事件记录",
+                    "title": _event_title(event),
                     "description": "；".join(detail_parts)[:500],
                     "event_date": event.get("time", "") or "",
-                    "emotion_label": "",
+                    "emotion_label": (event.get("emotion_label") or "").strip(),
                     "importance": 4,
                     "source_indexes": [index],
                 }
@@ -1203,6 +1563,7 @@ def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]
     if drafts:
         return drafts
 
+    # 无 AI 事件时：把交互单元按 4 条聚簇成阶段性事件
     units = preview.get("interaction_units") or []
     for start in range(0, len(units), 4):
         cluster = units[start:start + 4]
@@ -1225,10 +1586,11 @@ def _build_timeline_event_drafts(preview: dict[str, Any]) -> list[dict[str, Any]
             )
             content = (item.get("content", "") or "").strip()
             detail_parts.append(f"{speaker}针对{receiver}{action}，核心内容为“{content[:60]}”")
+        first_content = (cluster[0].get("content", "") or "").strip()
         drafts.append(
             {
                 "actors": actors,
-                "title": f"{actors[0]}与{'、'.join(actors[1:3]) or '他人'}的阶段性事件",
+                "title": f"{actors[0]}：{first_content[:24]}…" if first_content else f"{actors[0]}与{'、'.join(actors[1:3]) or '他人'}的互动",
                 "description": "；".join(detail_parts)[:500],
                 "event_date": "",
                 "emotion_label": ((cluster[-1].get("emotion") or {}).get("value") or "").strip(),
@@ -1283,60 +1645,391 @@ def _create_import_events(db: Session, preview: dict[str, Any], resolved_chars: 
     return created_events, source_event_map
 
 
-async def _rebuild_import_analyses(preview: dict[str, Any], resolved_chars: dict[str, Character], concurrency: int = 3) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+# 批量深度分析：每批连续句数 / 并发批数 / 单批超时
+ANALYSIS_BATCH_SIZE = 8
+ANALYSIS_BATCH_CONCURRENCY = 2
+ANALYSIS_BATCH_TIMEOUT = 300.0
+
+
+def _create_import_relationships(
+    db: Session,
+    preview: dict[str, Any],
+    resolved_chars: dict[str, Character],
+) -> tuple[int, dict[tuple[str, str], int]]:
+    """
+    把 AI 解析出的关系列表直接写入关系表（此前只靠 unit 循环弱推断，导致关系大量丢失）：
+    - 新关系：按解析的类型/强度/极性/描述创建，并写入初始 history
+    - 已有关系：EMA 演化强度与极性、追加 history、补全类型与描述
+    返回 (新建数量, {(source_name, target_name): rel_id})
+    """
+    created = 0
+    rel_id_map: dict[tuple[str, str], int] = {}
+    now_iso = datetime.utcnow().isoformat()
+    for item in preview.get("relationships") or []:
+        source_name = (item.get("source") or "").strip()
+        target_name = (item.get("target") or "").strip()
+        source_char = resolved_chars.get(source_name)
+        target_char = resolved_chars.get(target_name)
+        if not source_char or not target_char or source_char.id == target_char.id:
+            continue
+        rel_type = (item.get("rel_type") or "neutral").strip() or "neutral"
+        strength = max(0.0, min(1.0, _safe_float(item.get("strength"), 0.5)))
+        sentiment = max(-1.0, min(1.0, _safe_float(item.get("sentiment"), 0.0)))
+        description = (item.get("description") or "").strip()[:500]
+        rel = find_pair_relationship(db, source_char.id, target_char.id)
+        if rel:
+            history = list(rel.history or [])
+            history.append({"date": now_iso, "strength": rel.strength, "sentiment": rel.sentiment, "source": "import"})
+            rel.history = history
+            rel.strength = max(0.0, min(1.0, (rel.strength or 0.5) * 0.6 + strength * 0.4))
+            rel.sentiment = max(-1.0, min(1.0, (rel.sentiment or 0.0) * 0.6 + sentiment * 0.4))
+            if (rel.rel_type or "neutral") in ("neutral", "dynamic", "unknown", "") and rel_type != "neutral":
+                rel.rel_type = rel_type
+            if description and len(description) > len(rel.description or ""):
+                rel.description = description
+            rel.updated_at = datetime.utcnow()
+            db.flush()
+        else:
+            rel = Relationship(
+                source_id=source_char.id,
+                target_id=target_char.id,
+                rel_type=rel_type,
+                strength=strength,
+                sentiment=sentiment,
+                description=description or "导入文本识别出的关系",
+                history=[{"date": now_iso, "strength": strength, "sentiment": sentiment, "source": "import"}],
+            )
+            db.add(rel)
+            db.flush()
+            created += 1
+            _create_change_observation(
+                db,
+                source_char.id,
+                "relationship_network",
+                "",
+                f"{source_char.name} → {target_char.name}（{rel_type}）",
+                "导入文本",
+                description or "导入文本识别出的关系",
+                max(0.6, min(0.95, strength or 0.6)),
+                "关系网络",
+                "新增",
+                example=description[:120],
+            )
+        graph_store.sync_relationship(rel, source_char, target_char)
+        rel_id_map[tuple(sorted((source_char.name, target_char.name)))] = rel.id
+    db.commit()
+    return created, rel_id_map
+
+
+# persona_facts 类目 → 记忆类型映射
+_FACT_MEMORY_TYPES = {
+    "经历": "fact", "身份背景": "fact", "技能": "fact", "健康": "fact", "价值观": "fact",
+    "习惯": "pragmatics", "语言风格": "pragmatics", "人际模式": "pragmatics",
+    "恐惧": "emotion", "欲望": "emotion", "心理特征": "diagnosis",
+}
+
+
+def _persist_persona_facts(
+    db: Session,
+    preview: dict[str, Any],
+    resolved_chars: dict[str, Character],
+    import_file_id: int,
+) -> tuple[int, dict[str, list[int]]]:
+    """
+    人物事实落库：每条事实 → 证据片段 + 长期记忆。
+    这是资料型导入（简历/自述/日记）的主要产出通道。
+    返回 (落库条数, {角色名: [evidence_id]})。
+    """
+    created = 0
+    evidence_by_char: dict[str, list[int]] = {}
+    for fact in preview.get("persona_facts") or []:
+        subject = (fact.get("subject") or "").strip()
+        char = resolved_chars.get(subject)
+        if not char:
+            continue
+        content = (fact.get("content") or "").strip()
+        if not content:
+            continue
+        category = (fact.get("category") or "心理特征").strip()
+        evidence = _create_evidence_span(
+            db,
+            character_id=char.id,
+            source_type="import",
+            source_id=import_file_id,
+            import_file_id=import_file_id,
+            supports_type="persona_fact",
+            quote=(fact.get("quote") or content)[:500],
+            interpretation=f"{category}：{content}",
+            confidence=_safe_float(fact.get("confidence"), 0.6),
+            metadata={"category": category, "time_hint": fact.get("time_hint") or ""},
+        )
+        _create_memory_item(
+            db,
+            character_id=char.id,
+            memory_type=_FACT_MEMORY_TYPES.get(category, "fact"),
+            content=f"[{category}] {content}",
+            confidence=_safe_float(fact.get("confidence"), 0.6),
+            source="导入事实",
+            evidence_ids=[evidence.id],
+        )
+        evidence_by_char.setdefault(subject, []).append(evidence.id)
+        created += 1
+    db.commit()
+    if created:
+        import_logger.info("人物事实落库完成 import_file_id=%s facts=%s", import_file_id, created)
+    return created, evidence_by_char
+
+
+# 关系深析：每次导入最多分析的关系对数 / 并发
+RELATIONSHIP_DEEP_LIMIT = 10
+RELATIONSHIP_DEEP_CONCURRENCY = 2
+
+
+async def _run_relationship_deep_analyses(
+    db: Session,
+    preview: dict[str, Any],
+    resolved_chars: dict[str, Character],
+    rel_id_map: dict[tuple[str, str], int],
+) -> int:
+    """
+    关系深度分析（自动，无需手动按钮）：
+    对每对有关系记录的人物输出权力结构/互动模式/认知差/张力/演化叙事，
+    写入 Relationship.analysis_json，trajectory 同时充实 description。
+    """
+    if not rel_id_map:
+        return 0
+    all_units = preview.get("interaction_units") or []
+    semaphore = asyncio.Semaphore(RELATIONSHIP_DEEP_CONCURRENCY)
+    analyzed = 0
+
+    async def _analyze_pair(pair: tuple[str, str], rel_id: int) -> dict | None:
+        name_a, name_b = pair
+        char_a, char_b = resolved_chars.get(name_a), resolved_chars.get(name_b)
+        if not char_a or not char_b:
+            return None
+        samples = []
+        for unit in all_units:
+            speaker = (unit.get("speaker") or "").strip()
+            receiver = (unit.get("receiver") or "").strip()
+            if {speaker, receiver} == {name_a, name_b}:
+                samples.append(f"{speaker} → {receiver}：「{(unit.get('content') or '').strip()[:100]}」")
+        # 事实型证据补充（无对话的资料导入也能分析关系）
+        for fact in (preview.get("persona_facts") or [])[:40]:
+            if (fact.get("subject") or "").strip() in pair and (fact.get("category") or "") == "人际模式":
+                samples.append(f"[事实] {fact.get('subject')}：{(fact.get('content') or '')[:80]}")
+        if len(samples) > 12:
+            step = len(samples) / 12
+            samples = [samples[int(i * step)] for i in range(12)]
+        rel = db.get(Relationship, rel_id)
+        pair_profiles = json.dumps(
+            [_build_snapshot_payload(char_a), _build_snapshot_payload(char_b)], ensure_ascii=False,
+        )
+        existing = json.dumps({
+            "rel_type": rel.rel_type, "strength": rel.strength,
+            "sentiment": rel.sentiment, "description": (rel.description or "")[:200],
+        }, ensure_ascii=False) if rel else ""
+        try:
+            async with semaphore:
+                result = await orchestrator.analyze_relationship_deep(
+                    pair_profiles, "\n".join(samples), existing,
+                )
+            return {"rel_id": rel_id, "result": result}
+        except Exception as exc:
+            import_logger.warning("关系深析失败 pair=%s error=%s", pair, exc)
+            return None
+
+    pairs = list(rel_id_map.items())[:RELATIONSHIP_DEEP_LIMIT]
+    outcomes = await asyncio.gather(*(_analyze_pair(pair, rel_id) for pair, rel_id in pairs))
+    for outcome in outcomes:
+        if not outcome or not isinstance(outcome.get("result"), dict):
+            continue
+        result = outcome["result"]
+        rel = db.get(Relationship, outcome["rel_id"])
+        if not rel:
+            continue
+        rel.analysis_json = {
+            "power_dynamic": (result.get("power_dynamic") or "")[:120],
+            "interaction_pattern": (result.get("interaction_pattern") or "")[:120],
+            "perception_gap": (result.get("perception_gap") or "")[:160],
+            "tensions": [str(t)[:80] for t in (result.get("tensions") or [])[:5]],
+            "trajectory": (result.get("trajectory") or "")[:300],
+            "evidence_notes": (result.get("evidence_notes") or "")[:160],
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        trajectory = (result.get("trajectory") or "").strip()
+        if trajectory and len(trajectory) > len(rel.description or ""):
+            rel.description = trajectory[:500]
+        rel.updated_at = datetime.utcnow()
+        analyzed += 1
+    db.commit()
+    if analyzed:
+        import_logger.info("关系深析完成 analyzed=%s", analyzed)
+    return analyzed
+
+
+_ANALYSIS_ITEM_FIELDS = ("inner_monologue", "emotion_attribution", "strategy_explanation", "behavior_tendency", "analysis_tags")
+
+
+async def _rebuild_import_analyses(
+    preview: dict[str, Any],
+    resolved_chars: dict[str, Character],
+    concurrency: int = ANALYSIS_BATCH_CONCURRENCY,
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """
+    批量深度分析（每句全覆盖，无预算上限）：
+    - 连续 ANALYSIS_BATCH_SIZE 句为一批，一次 LLM 调用输出整批分析
+    - 每批携带全部涉及角色的完整档案 + 关系 + 剧情提要，整段上下文让分析连贯且具体
+    - 单批失败只影响该批（前端可对单句手动补全），不阻塞导入
+    """
+    all_units = preview.get("interaction_units", []) or []
+    target_indexes = [
+        index for index, unit in enumerate(all_units, start=1)
+        if _should_run_import_analysis(unit) and (unit.get("speaker") or "").strip() in resolved_chars
+    ]
+    if not target_indexes:
+        return {}, []
+
+    # 涉及角色的完整档案块（让分析"结合角色的所有信息"）
+    involved_names: set[str] = set()
+    for index in target_indexes:
+        unit = all_units[index - 1]
+        for name in ((unit.get("speaker") or "").strip(), (unit.get("receiver") or "").strip()):
+            if name in resolved_chars:
+                involved_names.add(name)
+    profiles_block = json.dumps(
+        [_build_snapshot_payload(resolved_chars[name]) for name in sorted(involved_names)],
+        ensure_ascii=False,
+    )
+    relationships_block = json.dumps(
+        [
+            {
+                "source": item.get("source"), "target": item.get("target"),
+                "rel_type": item.get("rel_type"), "strength": item.get("strength"),
+                "sentiment": item.get("sentiment"), "description": (item.get("description") or "")[:120],
+            }
+            for item in (preview.get("relationships") or [])[:20]
+        ],
+        ensure_ascii=False,
+    )
+    plot = preview.get("plot_summary") or {}
+    summary_block = "；".join(filter(None, [plot.get("main_conflict"), plot.get("relationship_path")]))
+
+    def _dialogue_line(index: int) -> str:
+        unit = all_units[index - 1]
+        speaker = (unit.get("speaker") or "").strip() or "？"
+        receiver = (unit.get("receiver") or "").strip() or "？"
+        content = (unit.get("content") or "").strip()[:160]
+        return f"{index}. {speaker} → {receiver}：「{content}」"
+
+    batches = [target_indexes[i:i + ANALYSIS_BATCH_SIZE] for i in range(0, len(target_indexes), ANALYSIS_BATCH_SIZE)]
     semaphore = asyncio.Semaphore(max(1, concurrency))
     analyses: dict[int, dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
 
-    async def _analyze(index: int, unit: dict[str, Any]) -> None:
-        if not _should_run_import_analysis(unit):
-            return
-        speaker_name = (unit.get("speaker") or "").strip()
-        if not speaker_name or speaker_name not in resolved_chars:
-            return
-        speaker_char = resolved_chars[speaker_name]
-        receiver_name = (unit.get("receiver") or "").strip()
-        resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
-        context_payload = {
-            "speaker_profile": {
-                "name": speaker_char.name,
-                "role": speaker_char.role or "",
-                "personality_tags": speaker_char.personality_tags or [],
-                "motivation": speaker_char.motivation or "",
-                "weakness": speaker_char.weakness or "",
-                "speaking_style": speaker_char.speaking_style or "",
-            },
-            "receiver_profile": {
-                "name": resolved_receiver.name if resolved_receiver else receiver_name,
-                "role": resolved_receiver.role if resolved_receiver else "",
-                "personality_tags": resolved_receiver.personality_tags if resolved_receiver else [],
-                "motivation": resolved_receiver.motivation if resolved_receiver else "",
-                "weakness": resolved_receiver.weakness if resolved_receiver else "",
-                "speaking_style": resolved_receiver.speaking_style if resolved_receiver else "",
-            },
-            "relationship": {
-                "description": "",
-                "strength": 0.2,
-                "sentiment": 0.0,
-            },
-        }
+    async def _analyze_batch(batch_indexes: list[int]) -> None:
+        # 批首之前的 2 句作为衔接前文（标注不需分析）
+        lead_in = ""
+        first = batch_indexes[0]
+        if first > 1:
+            prev_lines = [_dialogue_line(i) for i in range(max(1, first - 2), first)]
+            lead_in = "（前文，仅供理解，无需分析）\n" + "\n".join(prev_lines) + "\n\n"
+        dialogue_block = lead_in + "\n".join(_dialogue_line(i) for i in batch_indexes)
         try:
             async with semaphore:
-                # 单条分析加 60 秒超时，防止卡住整个导入流程
-                analyses[index] = await asyncio.wait_for(
-                    orchestrator.rebuild_import_analysis(unit, context_payload),
-                    timeout=60.0,
+                result = await asyncio.wait_for(
+                    orchestrator.analyze_interaction_batch(
+                        profiles_block, relationships_block, summary_block,
+                        dialogue_block, len(batch_indexes),
+                    ),
+                    timeout=ANALYSIS_BATCH_TIMEOUT,
                 )
         except asyncio.TimeoutError:
-            failures.append({"index": index, "error": "分析超时"})
+            failures.append({"index": batch_indexes[0], "error": f"批量分析超时（{batch_indexes[0]}-{batch_indexes[-1]} 句）"})
+            return
         except Exception as exc:
-            failures.append({"index": index, "error": str(exc)})
+            failures.append({"index": batch_indexes[0], "error": f"批量分析失败（{batch_indexes[0]}-{batch_indexes[-1]} 句）：{str(exc)[:120]}"})
+            return
+        returned = result.get("analyses") if isinstance(result, dict) else None
+        if not isinstance(returned, list):
+            failures.append({"index": batch_indexes[0], "error": "批量分析返回格式异常"})
+            return
+        batch_set = set(batch_indexes)
+        for pos, item in enumerate(returned):
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                idx = None
+            # AI 偶尔会用批内局部编号，按位置回退映射
+            if idx not in batch_set:
+                idx = batch_indexes[pos] if pos < len(batch_indexes) else None
+            if idx is None:
+                continue
+            analyses[idx] = {key: item.get(key, "") for key in _ANALYSIS_ITEM_FIELDS}
 
-    await asyncio.gather(*[
-        _analyze(index, unit)
-        for index, unit in enumerate(preview.get("interaction_units", []), start=1)
-    ])
+    await asyncio.gather(*(_analyze_batch(batch) for batch in batches))
+    import_logger.info(
+        "批量分析完成 total=%s analyzed=%s failed_batches=%s",
+        len(target_indexes), len(analyses), len(failures),
+    )
     return analyses, failures
+
+
+# 数据治理：同一字段保留的 approved 历史记录条数 / 每类记忆保留的活跃条数
+OBSERVATION_KEEP_PER_FIELD = 5
+MEMORY_KEEP_PER_TYPE = 60
+_COMPACTABLE_FIELDS = {"role", "background", "motivation", "weakness", "speaking_style", "personality_tags", "core_traits"}
+
+
+def _compact_character_data(db: Session, char_ids: list[int]) -> dict[str, int]:
+    """
+    自动压缩：防止多次导入后 observation / memory 无限堆积。
+    - 档案字段的 approved 变更记录：每字段保留最近 N 条，更早的标记 archived（可追溯，不删除）
+    - 记忆条目：每类型保留最新 N 条活跃，超出部分按置信度低者优先标记 deprecated
+    行为模式 / 事件 / 关系类记录是内容实体，不参与压缩。
+    """
+    stats = {"observations_archived": 0, "memories_deprecated": 0}
+    for char_id in char_ids:
+        for field in _COMPACTABLE_FIELDS:
+            rows = db.query(CharacterObservation).filter(
+                CharacterObservation.character_id == char_id,
+                CharacterObservation.field == field,
+                CharacterObservation.status == "approved",
+            ).order_by(CharacterObservation.created_at.desc(), CharacterObservation.id.desc()).all()
+            for row in rows[OBSERVATION_KEEP_PER_FIELD:]:
+                row.status = "archived"
+                stats["observations_archived"] += 1
+
+        memory_types = [row[0] for row in db.query(MemoryItem.memory_type).filter(
+            MemoryItem.character_id == char_id,
+            MemoryItem.status == "active",
+        ).distinct().all()]
+        for memory_type in memory_types:
+            rows = db.query(MemoryItem).filter(
+                MemoryItem.character_id == char_id,
+                MemoryItem.memory_type == memory_type,
+                MemoryItem.status == "active",
+            ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).all()
+            overflow = rows[MEMORY_KEEP_PER_TYPE:]
+            overflow.sort(key=lambda item: float(item.confidence or 0.0))
+            for row in overflow:
+                row.status = "deprecated"
+                row.updated_at = datetime.utcnow()
+                stats["memories_deprecated"] += 1
+    if stats["observations_archived"] or stats["memories_deprecated"]:
+        db.commit()
+        import_logger.info("数据压缩完成 char_ids=%s stats=%s", char_ids, stats)
+    return stats
+
+
+@router.post("/maintenance/compact")
+def compact_all_characters(db: Session = Depends(get_db)):
+    """手动触发全库数据压缩（导入完成后也会对涉及角色自动执行）"""
+    char_ids = [row[0] for row in db.query(Character.id).all()]
+    stats = _compact_character_data(db, char_ids)
+    return {"ok": True, "characters": len(char_ids), **stats}
 
 
 def _cleanup_legacy_import_artifacts(db: Session, resolved_chars: dict[str, Character]) -> None:
@@ -1368,7 +2061,16 @@ def _cleanup_legacy_import_artifacts(db: Session, resolved_chars: dict[str, Char
     )
 
 
+# 导入提交串行化：并发导入会对同一角色交错融合档案，强制排队执行
+_IMPORT_COMMIT_LOCK = asyncio.Lock()
+
+
 async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -> None:
+    async with _IMPORT_COMMIT_LOCK:
+        await _process_import_commit_inner(import_file_id, payload)
+
+
+async def _process_import_commit_inner(import_file_id: int, payload: dict[str, Any]) -> None:
     db = SessionLocal()
     agent_run = None
     try:
@@ -1401,7 +2103,10 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
             mapping = _resolve_mapping(role_mappings, original_name)
             if mapping["action"] == "skip":
                 continue
-            resolved_chars[original_name] = await _ensure_character_from_mapping(db, mapping, parsed_char)
+            char, _created = _ensure_character_from_mapping(db, mapping, parsed_char)
+            resolved_chars[original_name] = char
+        # 注意：AI 画像生成移到 units/events/relationships 写入之后，
+        # 那时才有完整的台词证据，避免"凭名字脑补"的泛泛档案
 
         conversation = None
         if body.create_readonly_conversation:
@@ -1425,11 +2130,15 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
         )
         profile_change_count = _apply_character_profiles(db, preview, resolved_chars)
         created_events, source_event_map = _create_import_events(db, preview, resolved_chars, import_file.id)
+        # AI 解析的关系列表直接入库（类型/强度/极性/描述/history 完整保留）
+        created_relationships, rel_id_map = _create_import_relationships(db, preview, resolved_chars)
+        # 人物事实落库（资料型导入的主要产出；对话型导入的补充证据）
+        created_facts, fact_evidence_by_char = _persist_persona_facts(db, preview, resolved_chars, import_file.id)
 
         committed_units = 0
-        created_relationships = 0
         failures = {"characters": [], "events": [], "relationships": [], "analysis": []}
         preview_messages = ((preview.get("pseudo_conversation", {}) or {}).get("messages", []))
+        _update_import_status(db, import_file, "processing", "正在对每句对话做深度分析（批量）…")
         analysis_map, analysis_failures = await _rebuild_import_analyses(preview, resolved_chars)
         failures["analysis"].extend(analysis_failures)
         next_message_index = 1
@@ -1442,14 +2151,14 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 speaker_char = resolved_chars[speaker_name]
                 receiver_name = unit.get("receiver", "").strip()
                 resolved_receiver = resolved_chars.get(receiver_name) if receiver_name in resolved_chars else None
-                analysis = analysis_map.get(index) if _should_run_import_analysis(unit) else {}
-                if _should_run_import_analysis(unit) and not isinstance(analysis, dict):
-                    continue
+                # 批量分析全覆盖；个别批失败的单元无分析层，不影响单元本身入库（可手动补全）
+                analysis = analysis_map.get(index) or {}
                 if not isinstance(analysis, dict):
                     analysis = {}
+                has_analysis = bool(analysis.get("inner_monologue") or analysis.get("emotion_attribution"))
                 message_id = None
                 analysis_message_id = None
-                message_step = (2 if _should_run_import_analysis(unit) else 1) if conversation else 0
+                message_step = (2 if has_analysis else 1) if conversation else 0
                 created_relationship = False
                 with db.begin_nested():
                     message_index = next_message_index
@@ -1473,7 +2182,7 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                         db.flush()
                         message_id = msg.id
 
-                        if _should_run_import_analysis(unit):
+                        if has_analysis:
                             analysis_msg = Message(
                                 conversation_id=conversation.id,
                                 role="assistant",
@@ -1500,42 +2209,48 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
 
                     relationship_id = None
                     if resolved_receiver and _should_run_import_analysis(unit):
-                        intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
-                        sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
-                        interaction_type = (unit.get("interaction_type") or {}).get("value", "")
-                        rel = db.query(Relationship).filter(
-                            Relationship.source_id == speaker_char.id,
-                            Relationship.target_id == resolved_receiver.id,
-                        ).first()
-                        if not rel:
-                            rel = Relationship(
-                                source_id=speaker_char.id,
-                                target_id=resolved_receiver.id,
-                                rel_type=_infer_rel_type(sentiment, interaction_type),
-                                strength=max(0.2, min(1.0, intent_conf)),
-                                sentiment=max(-1.0, min(1.0, sentiment)),
-                                description=analysis.get("strategy_explanation", "")[:500],
-                                history=[],
-                            )
-                            db.add(rel)
-                            db.flush()
-                            graph_store.sync_relationship(rel, speaker_char, resolved_receiver)
-                            created_relationship = True
-                            _create_change_observation(
-                                db,
-                                speaker_char.id,
-                                "relationship_network",
-                                "",
-                                f"{speaker_char.name} → {resolved_receiver.name}（{rel.rel_type}）",
-                                "导入文本",
-                                unit.get("psychological_label", "") or analysis.get("strategy_explanation", "")[:160] or "导入文本识别出的关系变化",
-                                max(0.6, min(0.95, intent_conf)),
-                                "关系网络",
-                                "新增",
-                                example=(unit.get("content", "") or "")[:120],
-                            )
-                        relationship_id = rel.id
-                        graph_store.sync_relationship(rel, speaker_char, resolved_receiver)
+                        pair_key = tuple(sorted((speaker_char.name, resolved_receiver.name)))
+                        relationship_id = rel_id_map.get(pair_key)
+                        if relationship_id is None:
+                            # AI 关系列表未覆盖的说话对，按交互信号弱推断兜底
+                            intent_conf = _safe_float((unit.get("intent") or {}).get("confidence"), 0.5)
+                            sentiment = _safe_float((unit.get("emotion") or {}).get("confidence"), 0.5) * 2 - 1
+                            interaction_type = (unit.get("interaction_type") or {}).get("value", "")
+                            rel = find_pair_relationship(db, speaker_char.id, resolved_receiver.id)
+                            if not rel:
+                                rel = Relationship(
+                                    source_id=speaker_char.id,
+                                    target_id=resolved_receiver.id,
+                                    rel_type=_infer_rel_type(sentiment, interaction_type),
+                                    strength=max(0.2, min(1.0, intent_conf)),
+                                    sentiment=max(-1.0, min(1.0, sentiment)),
+                                    description=(unit.get("psychological_label", "") or "导入对话推断出的互动关系")[:500],
+                                    history=[{
+                                        "date": datetime.utcnow().isoformat(),
+                                        "strength": max(0.2, min(1.0, intent_conf)),
+                                        "sentiment": max(-1.0, min(1.0, sentiment)),
+                                        "source": "import",
+                                    }],
+                                )
+                                db.add(rel)
+                                db.flush()
+                                graph_store.sync_relationship(rel, speaker_char, resolved_receiver)
+                                created_relationship = True
+                                _create_change_observation(
+                                    db,
+                                    speaker_char.id,
+                                    "relationship_network",
+                                    "",
+                                    f"{speaker_char.name} → {resolved_receiver.name}（{rel.rel_type}）",
+                                    "导入文本",
+                                    unit.get("psychological_label", "") or "导入对话推断出的互动关系",
+                                    max(0.6, min(0.95, intent_conf)),
+                                    "关系网络",
+                                    "新增",
+                                    example=(unit.get("content", "") or "")[:120],
+                                )
+                            rel_id_map[pair_key] = rel.id
+                            relationship_id = rel.id
 
                     source_line_index = int(unit.get("source_line_index", index) or index)
                     event_id = source_event_map.get((speaker_char.name, source_line_index))
@@ -1638,6 +2353,40 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
 
         db.commit()
 
+        # 全部台词/事实/事件/关系落库后，自动深度分析管线（无需任何手动按钮）：
+        # ① 人物综合画像（扩展八维度 + 弧光转折） ② 关系深析（权力/模式/认知差/演化） ③ 特质假设轮
+        _update_import_status(db, import_file, "processing", "正在基于全部证据生成立体人物档案…")
+        profile_status_map: dict[str, str] = {}
+        try:
+            enriched_count, profile_status_map = await _enrich_import_profiles(db, preview, resolved_chars)
+            profile_change_count += enriched_count
+        except Exception as exc:
+            import_logger.warning("导入画像批量生成失败 import_file_id=%s error=%s", import_file.id, exc)
+
+        _update_import_status(db, import_file, "processing", "正在做关系深度分析（权力结构/互动模式/认知差）…")
+        deep_relationship_count = 0
+        try:
+            deep_relationship_count = await _run_relationship_deep_analyses(db, preview, resolved_chars, rel_id_map)
+        except Exception as exc:
+            import_logger.warning("关系深析阶段失败 import_file_id=%s error=%s", import_file.id, exc)
+
+        _update_import_status(db, import_file, "processing", "正在演化特质假设（验证/反驳/新猜想）…")
+        hypothesis_stats = {"new": 0, "confirmed": 0, "supported": 0, "contradicted": 0, "rejected": 0}
+        try:
+            for original_name, char in list(resolved_chars.items())[:8]:
+                lines, event_samples, _rels, _hints = _collect_character_evidence(preview, original_name)
+                evidence_texts = lines + event_samples
+                if not evidence_texts:
+                    continue
+                round_stats = await run_hypothesis_round(
+                    db, char, evidence_texts,
+                    evidence_ids=fact_evidence_by_char.get(original_name, []),
+                )
+                for key in hypothesis_stats:
+                    hypothesis_stats[key] += round_stats.get(key, 0)
+        except Exception as exc:
+            import_logger.warning("假设轮阶段失败 import_file_id=%s error=%s", import_file.id, exc)
+
         import_file.summary = (preview.get("plot_summary", {}) or {}).get("main_conflict", import_file.summary)
         if agent_run:
             agent_run.status = "completed"
@@ -1662,7 +2411,11 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
                 "interaction_units": committed_units,
                 "events": created_events,
                 "relationships": created_relationships,
+                "persona_facts": created_facts,
+                "deep_relationships": deep_relationship_count,
+                "hypotheses": hypothesis_stats,
                 "profile_changes": profile_change_count,
+                "profile_status": profile_status_map,
                 "failures": failures,
                 "plot_summary": preview.get("plot_summary", {}),
             },
@@ -1677,6 +2430,11 @@ async def _process_import_commit(import_file_id: int, payload: dict[str, Any]) -
             character_profiles=preview.get("character_profiles", {}),
             completed_at=datetime.utcnow().isoformat(),
         )
+        # 自动数据治理：压缩本次涉及角色的陈旧变更记录与超额记忆
+        try:
+            _compact_character_data(db, [char.id for char in resolved_chars.values()])
+        except Exception as exc:
+            import_logger.warning("导入后数据压缩失败 import_file_id=%s error=%s", import_file.id, exc)
         import_logger.info(
             "导入任务完成 import_file_id=%s chars=%s units=%s events=%s rels=%s",
             import_file.id,
@@ -1720,80 +2478,45 @@ def list_characters(db: Session = Depends(get_db)):
 
 @router.post("/", response_model=CharacterOut)
 async def create_character(body: CharacterCreate, db: Session = Depends(get_db)):
-    char = Character(**body.model_dump())
-    char.core_traits = {}
+    payload = body.model_dump()
+    core_traits = payload.pop("core_traits", None) or {}
+    char = Character(**payload)
+    char.core_traits = {
+        key: round(max(0.0, min(1.0, float(value))), 2)
+        for key, value in core_traits.items()
+        if key in BIG_FIVE_KEYS and isinstance(value, (int, float))
+    }
     db.add(char)
     db.commit()
     db.refresh(char)
     graph_store.sync_character(char)
-    # 自动生成 AI 心理档案
+    # 自动生成 AI 心理档案（统一走档案应用入口：空缺补全、与手填冲突进待审核）
     try:
         profile = await orchestrator.generate_character_profile(
             char.name, char.role, char.background
         )
-        generated_fields = {
-            "personality_tags": profile.get("personality_tags", []),
-            "core_traits": profile.get("core_traits", {}),
-            "weakness": profile.get("weakness", ""),
-            "motivation": profile.get("motivation", ""),
-            "speaking_style": profile.get("speaking_style", ""),
-        }
-        for field, new_value in generated_fields.items():
-            current_value = getattr(char, field, None)
-            is_empty = current_value in (None, "", [], {})
-            if is_empty:
-                setattr(char, field, new_value)
-            elif _stringify_value(current_value) != _stringify_value(new_value):
-                obs = CharacterObservation(
-                    character_id=char.id,
-                    field=field,
-                    old_value=_stringify_value(current_value),
-                    new_value=_stringify_value(new_value),
-                    reason=_build_observation_reason(
-                        source="角色创建",
-                        evidence="AI 根据初始角色信息生成的候选画像；已保留用户手填内容，等待人工确认。",
-                        confidence=0.7,
-                        change_type=_infer_change_type(current_value, new_value),
-                        module=_resolve_profile_module(field),
-                    ),
-                )
-                db.add(obs)
-                db.flush()
-                evidence = _create_evidence_span(
-                    db,
-                    character_id=char.id,
-                    source_type="profile",
-                    source_id=obs.id,
-                    observation_id=obs.id,
-                    supports_type=field,
-                    supports_id=obs.id,
-                    quote=_stringify_value(new_value),
-                    interpretation=f"角色创建候选画像：{field}",
-                    confidence=0.7,
-                    metadata={"field": field, "status": "pending"},
-                )
-                _create_memory_item(
-                    db,
-                    character_id=char.id,
-                    memory_type="diagnosis" if field in {"personality_tags", "core_traits"} else "fact",
-                    content=_stringify_value(new_value),
-                    confidence=0.7,
-                    source="角色创建候选画像",
-                    evidence_ids=[evidence.id],
-                )
-        db.commit()
-        db.refresh(char)
-        supporting_evidence = [
-            item.id for item in db.query(EvidenceSpan).filter(
-                EvidenceSpan.character_id == char.id,
-            ).order_by(EvidenceSpan.created_at.desc()).limit(20).all()
-        ]
-        _create_personality_snapshot(db, char, source="角色创建", supporting_evidence=supporting_evidence)
-        db.commit()
-        db.refresh(char)
-        graph_store.sync_character(char)
+        if isinstance(profile, dict):
+            changed = _apply_profile_candidate(
+                db, char, profile,
+                source="角色创建",
+                evidence_note="AI 根据初始角色信息生成的候选画像；已保留用户手填内容。",
+                base_confidence=0.7,
+                merge_mode=False,
+            )
+            db.commit()
+            db.refresh(char)
+            if changed:
+                supporting_evidence = [
+                    item.id for item in db.query(EvidenceSpan).filter(
+                        EvidenceSpan.character_id == char.id,
+                    ).order_by(EvidenceSpan.created_at.desc()).limit(20).all()
+                ]
+                _create_personality_snapshot(db, char, source="角色创建", supporting_evidence=supporting_evidence)
+                db.commit()
+                db.refresh(char)
+                graph_store.sync_character(char)
     except Exception:
-        pass  # AI 分析失败不影响创建
+        db.rollback()  # AI 分析失败不影响创建
     return char
 
 
@@ -1821,6 +2544,30 @@ def get_character_profile_view(char_id: int, db: Session = Depends(get_db)):
         CharacterObservation.created_at.desc()
     ).all()
     result = _build_profile_view(char, relationships, events, observations)
+    behavior_count = sum(len(items) for items in (result.get("behavior_patterns") or {}).values())
+    result["completeness"] = profile_completeness(
+        char,
+        behavior_pattern_count=behavior_count,
+        relationship_count=len(relationships),
+        event_count=len(events),
+    )
+    # 扩展人物模型（八维度）与进行中的特质假设
+    result["extended_profile"] = char.profile_json or {}
+    active_hypotheses = db.query(TraitHypothesis).filter(
+        TraitHypothesis.character_id == char_id,
+        TraitHypothesis.status == "active",
+    ).order_by(TraitHypothesis.confidence.desc()).limit(12).all()
+    result["hypotheses"] = [
+        {
+            "id": h.id,
+            "hypothesis": h.hypothesis,
+            "dimension": h.dimension,
+            "confidence": round(h.confidence, 2),
+            "supporting_count": len(h.supporting_evidence_ids or []),
+            "contradicting_count": len(h.contradicting_evidence_ids or []),
+        }
+        for h in active_hypotheses
+    ]
     evidence_count = db.query(EvidenceSpan).filter(EvidenceSpan.character_id == char_id).count()
     memories = db.query(MemoryItem).filter(
         MemoryItem.character_id == char_id,
@@ -1900,6 +2647,75 @@ def list_personality_snapshots(char_id: int, db: Session = Depends(get_db)):
     return db.query(PersonalitySnapshot).filter(
         PersonalitySnapshot.character_id == char_id
     ).order_by(PersonalitySnapshot.version.desc()).all()
+
+
+@router.get("/{char_id}/hypotheses", response_model=list[TraitHypothesisOut])
+def list_trait_hypotheses(char_id: int, status: str = "", db: Session = Depends(get_db)):
+    """角色的特质假设：active=系统正在琢磨的猜想；confirmed=已转正；rejected=已排除"""
+    char = db.get(Character, char_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    query = db.query(TraitHypothesis).filter(TraitHypothesis.character_id == char_id)
+    if status:
+        query = query.filter(TraitHypothesis.status == status)
+    return query.order_by(TraitHypothesis.confidence.desc(), TraitHypothesis.updated_at.desc()).limit(50).all()
+
+
+@router.post("/{char_id}/snapshots/{snapshot_id}/restore", response_model=CharacterOut)
+def restore_personality_snapshot(char_id: int, snapshot_id: int, db: Session = Depends(get_db)):
+    """把角色档案回滚到指定快照（融合出错时的自救入口）"""
+    char = db.get(Character, char_id)
+    snapshot = db.get(PersonalitySnapshot, snapshot_id)
+    if not char or not snapshot or snapshot.character_id != char_id:
+        raise HTTPException(404, "快照不存在")
+    payload = snapshot.profile_json or {}
+    # 长上下文复盘快照的档案在 current_profile 子键下
+    if "current_profile" in payload and isinstance(payload.get("current_profile"), dict):
+        payload = payload["current_profile"]
+    basic_info = payload.get("basic_info") or {}
+    personality_model = payload.get("personality_model") or {}
+    if not basic_info and not personality_model:
+        raise HTTPException(400, "该快照不包含可恢复的档案数据")
+
+    restore_map = {
+        "role": basic_info.get("role"),
+        "background": basic_info.get("background"),
+        "motivation": payload.get("core_motivation"),
+        "weakness": payload.get("core_weakness"),
+        "speaking_style": payload.get("speaking_style"),
+    }
+    for field, value in restore_map.items():
+        value = str(value or "").strip()
+        old_value = str(getattr(char, field, "") or "").strip()
+        if value and value != old_value:
+            setattr(char, field, value)
+            _create_change_observation(
+                db, char.id, field, old_value, value,
+                "快照回滚", f"恢复到快照 v{snapshot.version}（{snapshot.source or '未知来源'}）",
+                1.0, _resolve_profile_module(field), "回滚",
+            )
+    if basic_info.get("age") is not None:
+        char.age = basic_info.get("age")
+    tags = [str(t).strip() for t in (personality_model.get("tags") or []) if str(t).strip()]
+    if tags:
+        char.personality_tags = tags[:12]
+    traits = personality_model.get("core_traits") or {}
+    if isinstance(traits, dict) and traits:
+        char.core_traits = {
+            key: round(max(0.0, min(1.0, float(value))), 2)
+            for key, value in traits.items()
+            if key in BIG_FIVE_KEYS and isinstance(value, (int, float))
+        }
+    char.version += 1
+    char.updated_at = datetime.utcnow()
+    _create_personality_snapshot(
+        db, char, source="快照回滚",
+        critic_result={"status": "restored", "reason": f"用户回滚到快照 v{snapshot.version}"},
+    )
+    db.commit()
+    db.refresh(char)
+    graph_store.sync_character(char)
+    return char
 
 
 @router.get("/{char_id}/diagnoses", response_model=list[StructuredDiagnosisOut])
@@ -2062,7 +2878,26 @@ def update_character(char_id: int, body: CharacterUpdate, db: Session = Depends(
     if not char:
         raise HTTPException(404, "角色不存在")
     for k, v in body.model_dump(exclude_none=True).items():
+        old_value = getattr(char, k, None)
+        # core_traits 允许前端只提交改动过的维度：做字典合并而非整体替换，
+        # 避免部分提交把其余维度抹掉
+        if k == "core_traits" and isinstance(v, dict):
+            v = {**(char.core_traits or {}), **{
+                key: round(max(0.0, min(1.0, float(val))), 2)
+                for key, val in v.items()
+                if key in BIG_FIVE_KEYS and isinstance(val, (int, float))
+            }}
+        if _stringify_value(old_value) == _stringify_value(v):
+            continue
         setattr(char, k, v)
+        # 手动编辑同样留痕（来源=手动编辑，不进 AI 更新记录页，但保证档案变更可追溯）
+        if k in {"role", "background", "motivation", "weakness", "speaking_style", "personality_tags", "core_traits", "age", "name", "aliases"}:
+            _create_change_observation(
+                db, char.id, k, old_value, v,
+                "手动编辑", "用户在编辑表单中修改", 1.0,
+                _resolve_profile_module(k),
+                _infer_change_type(old_value, v, prefer_override=True),
+            )
     char.version += 1
     char.updated_at = datetime.utcnow()
     db.commit()
@@ -2071,11 +2906,52 @@ def update_character(char_id: int, body: CharacterUpdate, db: Session = Depends(
     return char
 
 
+@router.post("/{char_id}/merge", response_model=CharacterOut)
+def merge_character(char_id: int, body: CharacterMergeRequest, db: Session = Depends(get_db)):
+    """把另一个角色完整并入当前角色（补救'同一人分裂成多个角色'）"""
+    target = db.get(Character, char_id)
+    source = db.get(Character, body.source_id)
+    if not target or not source:
+        raise HTTPException(404, "角色不存在")
+    if target.id == source.id:
+        raise HTTPException(400, "不能将角色与自身合并")
+    source_name = source.name
+    try:
+        stats = merge_characters(db, target, source)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _create_change_observation(
+        db, target.id, "background",
+        "", f"已合并角色「{source_name}」的全部数据（事件 {stats['events']}、记忆 {stats['memories']}、证据 {stats['evidence']}）",
+        "角色合并", f"用户确认「{source_name}」与「{target.name}」为同一人物", 1.0,
+        "基础信息", "合并",
+    )
+    _create_personality_snapshot(db, target, source="角色合并")
+    db.commit()
+    db.refresh(target)
+    graph_store.sync_character(target)
+    return target
+
+
 @router.delete("/{char_id}")
 def delete_character(char_id: int, db: Session = Depends(get_db)):
     char = db.get(Character, char_id)
     if not char:
         raise HTTPException(404, "角色不存在")
+    # 清理无 ORM 级联的松散引用，避免孤儿外键
+    db.query(Message).filter(Message.character_id == char_id).update(
+        {"character_id": None}, synchronize_session=False)
+    db.query(Message).filter(Message.receiver_id == char_id).update(
+        {"receiver_id": None}, synchronize_session=False)
+    db.query(StructuredDiagnosis).filter(StructuredDiagnosis.speaker_id == char_id).update(
+        {"speaker_id": None}, synchronize_session=False)
+    db.query(StructuredDiagnosis).filter(StructuredDiagnosis.listener_id == char_id).update(
+        {"listener_id": None}, synchronize_session=False)
+    db.query(RetrievalTrace).filter(RetrievalTrace.speaker_id == char_id).update(
+        {"speaker_id": None}, synchronize_session=False)
+    db.query(RetrievalTrace).filter(RetrievalTrace.listener_id == char_id).update(
+        {"listener_id": None}, synchronize_session=False)
+    db.query(TraitHypothesis).filter(TraitHypothesis.character_id == char_id).delete(synchronize_session=False)
     db.delete(char)
     db.commit()
     return {"ok": True}
@@ -2091,7 +2967,7 @@ async def preview_import(background_tasks: BackgroundTasks, file: UploadFile = F
         ).order_by(ImportFile.created_at.desc()).first()
         next_version = (latest_same_file.version if latest_same_file else 0) + 1
         existing_characters = [
-            {"id": char.id, "name": char.name, "role": char.role or ""}
+            {"id": char.id, "name": char.name, "role": char.role or "", "aliases": list(char.aliases or [])}
             for char in db.query(Character).all()
         ]
         preview = await build_import_preview(file.filename or "unknown.txt", content_text, existing_characters, enable_ai=False)
@@ -2428,6 +3304,13 @@ async def suggest_update(char_id: int, db: Session = Depends(get_db)):
                 change_type=_infer_change_type(s.get("old_value", ""), s.get("new_value", "")),
                 module=_resolve_profile_module(field),
             ),
+            metadata_json=_build_observation_metadata(
+                source="对话",
+                evidence=s.get("reason", "") or "基于最近对话生成的更新建议",
+                confidence=0.72,
+                change_type=_infer_change_type(s.get("old_value", ""), s.get("new_value", "")),
+                module=_resolve_profile_module(field),
+            ),
         )
         db.add(obs)
         db.flush()
@@ -2526,6 +3409,16 @@ def create_behavior_pattern(char_id: int, body: BehaviorPatternPayload, db: Sess
         old_value="",
         new_value=body.new_value.strip(),
         reason=_format_behavior_pattern_reason(body.source, body.confidence, body.category, body.trigger, body.example),
+        metadata_json=_build_observation_metadata(
+            source=body.source or "手动编辑",
+            evidence=body.example or body.trigger or "行为模式识别结果",
+            confidence=body.confidence,
+            change_type="新增",
+            module="行为模式",
+            category=body.category or "互动策略",
+            trigger=body.trigger,
+            example=body.example,
+        ),
         status="approved",
         reviewed_at=datetime.utcnow(),
     )
@@ -2565,6 +3458,16 @@ def update_behavior_pattern(char_id: int, obs_id: int, body: BehaviorPatternPayl
         raise HTTPException(404, "行为模式不存在")
     obs.new_value = body.new_value.strip()
     obs.reason = _format_behavior_pattern_reason(body.source, body.confidence, body.category, body.trigger, body.example)
+    obs.metadata_json = _build_observation_metadata(
+        source=body.source or "手动编辑",
+        evidence=body.example or body.trigger or "行为模式识别结果",
+        confidence=body.confidence,
+        change_type="更新",
+        module="行为模式",
+        category=body.category or "互动策略",
+        trigger=body.trigger,
+        example=body.example,
+    )
     obs.status = "approved"
     obs.reviewed_at = datetime.utcnow()
     evidence = _create_evidence_span(
@@ -2653,12 +3556,12 @@ def list_all_relationships(db: Session = Depends(get_db)):
 
 @router.post("/relationships/", response_model=RelationshipOut)
 def create_relationship(body: RelationshipCreate, db: Session = Depends(get_db)):
-    # 检查是否已存在
-    existing = db.query(Relationship).filter_by(
-        source_id=body.source_id, target_id=body.target_id
-    ).first()
+    if body.source_id == body.target_id:
+        raise HTTPException(400, "不能创建指向自己的关系")
+    # 两个人物之间只允许一条关系（方向无关）
+    existing = find_pair_relationship(db, body.source_id, body.target_id)
     if existing:
-        raise HTTPException(400, "关系已存在")
+        raise HTTPException(400, "这两个角色之间已存在关系，请直接编辑")
     rel = Relationship(**body.model_dump(), history=[])
     db.add(rel)
     db.commit()

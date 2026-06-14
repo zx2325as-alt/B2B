@@ -1,34 +1,15 @@
 """
 AI Harness: Model Router + Guardrails
-- Model Router: 根据任务复杂度选择模型
-- Guardrails: 输出格式校验 + 内容安全
+- Model Router: 根据任务复杂度选择模型（配置实时生效，无需重启）
+- Guardrails: 输出格式校验（含嵌套结构校验）+ 截断 JSON 修复
 """
 import json
 import re
-import yaml
-from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-# 读取 YAML 配置文件
-CONF_DIR = Path(__file__).parent.parent / "conf"
-CONFIG_FILE = CONF_DIR / "config.yaml"
-
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-config_data = load_config()
-ai_config = config_data.get("ai", {})
-default_provider_name = ai_config.get("default_provider", "deepseek")
-providers_config = ai_config.get("providers", {})
-task_providers = ai_config.get("task_providers", {})
-task_models = ai_config.get("task_models", {})
-task_max_tokens = ai_config.get("task_max_tokens", {})
-task_temperatures = ai_config.get("task_temperatures", {})
+from .config_loader import get_ai_config
 
 # ─── Model Router ─────────────────────────────────────────────────────────────
 
@@ -51,15 +32,20 @@ class ModelRouter:
     根据 Prompt 类型或内容长度自动路由到合适的模型
     """
 
-    # 哪些 prompt 类型使用什么复杂度
     TASK_MAP: dict[str, TaskComplexity] = {
         "chat_surface_reply": TaskComplexity.MEDIUM,
         "chat_analysis": TaskComplexity.MEDIUM,
+        "multi_perspective_analysis": TaskComplexity.COMPLEX,
         "import_dialogue_parse": TaskComplexity.COMPLEX,
         "import_narrative_parse": TaskComplexity.COMPLEX,
+        "import_profile_document_parse": TaskComplexity.COMPLEX,
         "import_commit_review": TaskComplexity.COMPLEX,
         "interaction_analysis_rebuild": TaskComplexity.COMPLEX,
+        "interaction_batch_analysis": TaskComplexity.COMPLEX,
         "character_profile_gen": TaskComplexity.COMPLEX,
+        "import_profile_gen": TaskComplexity.COMPLEX,
+        "relationship_deep_analysis": TaskComplexity.COMPLEX,
+        "trait_hypothesis_update": TaskComplexity.COMPLEX,
         "relationship_analysis": TaskComplexity.MEDIUM,
         "ai_suggest_update": TaskComplexity.COMPLEX,
         "emotion_curve": TaskComplexity.SIMPLE,
@@ -67,15 +53,22 @@ class ModelRouter:
         "diagnosis_critic": TaskComplexity.COMPLEX,
         "long_context_review": TaskComplexity.COMPLEX,
         "long_context_review_critic": TaskComplexity.COMPLEX,
+        "context_summary": TaskComplexity.SIMPLE,
     }
 
     JSON_TASKS = {
         "chat_analysis",
+        "multi_perspective_analysis",
         "import_dialogue_parse",
         "import_narrative_parse",
+        "import_profile_document_parse",
         "import_commit_review",
         "interaction_analysis_rebuild",
+        "interaction_batch_analysis",
         "character_profile_gen",
+        "import_profile_gen",
+        "relationship_deep_analysis",
+        "trait_hypothesis_update",
         "relationship_analysis",
         "ai_suggest_update",
         "emotion_curve",
@@ -86,18 +79,19 @@ class ModelRouter:
     }
 
     def resolve_provider(self, task_name: str) -> str:
-        candidate = task_providers.get(task_name) or default_provider_name or "deepseek"
+        ai_config = get_ai_config()
+        providers_config = ai_config.get("providers", {}) or {}
+        task_providers = ai_config.get("task_providers", {}) or {}
+        default_provider = ai_config.get("default_provider", "deepseek")
+        candidate = task_providers.get(task_name) or default_provider or "deepseek"
         if candidate in providers_config:
             return candidate
         if "deepseek" in providers_config:
             return "deepseek"
         return next(iter(providers_config.keys()), "deepseek")
 
-    def _provider_models(self, provider_name: str) -> dict[str, str]:
-        provider_cfg = providers_config.get(provider_name, {})
-        return provider_cfg.get("models", {})
-
     def route(self, task_name: str, content_length: int = 0) -> ModelConfig:
+        ai_config = get_ai_config()
         complexity = self.TASK_MAP.get(task_name, TaskComplexity.MEDIUM)
 
         # 内容超长时升级复杂度
@@ -107,15 +101,13 @@ class ModelRouter:
             complexity = TaskComplexity.COMPLEX
 
         provider_name = self.resolve_provider(task_name)
-        models_config = self._provider_models(provider_name)
-        default_models = {
-            TaskComplexity.SIMPLE: "deepseek-chat",
-            TaskComplexity.MEDIUM: "deepseek-chat",
-            TaskComplexity.COMPLEX: "deepseek-chat",
-        }
-        model_name = task_models.get(task_name) or models_config.get(complexity.value) or default_models[complexity]
-        if task_name in self.JSON_TASKS and provider_name == "deepseek" and model_name == "deepseek-chat":
-            model_name = "deepseek-chat"
+        providers_config = ai_config.get("providers", {}) or {}
+        models_config = (providers_config.get(provider_name, {}) or {}).get("models", {}) or {}
+        model_name = (
+            (ai_config.get("task_models", {}) or {}).get(task_name)
+            or models_config.get(complexity.value)
+            or "deepseek-chat"
+        )
         base_tokens = {
             TaskComplexity.SIMPLE: 512,
             TaskComplexity.MEDIUM: 1024,
@@ -126,6 +118,8 @@ class ModelRouter:
             TaskComplexity.MEDIUM: 0.5,
             TaskComplexity.COMPLEX: 0.7,
         }
+        task_max_tokens = ai_config.get("task_max_tokens", {}) or {}
+        task_temperatures = ai_config.get("task_temperatures", {}) or {}
         return ModelConfig(
             provider=provider_name,
             model=model_name,
@@ -149,14 +143,20 @@ class GuardrailError(Exception):
 class OutputGuardrails:
     """
     输出校验护栏
-    - JSON 格式校验
-    - 必填字段校验
-    - 安全内容过滤
+    - JSON 提取与截断修复
+    - 顶层必填字段校验
+    - 嵌套结构校验（chat_analysis 等结构化协议）
     """
 
     REQUIRED_FIELDS: dict[str, list[str]] = {
-        "chat_analysis": ["reply", "inner_monologue", "emotion_label", "emotion_score", "subtext"],
+        "chat_analysis": ["reply", "inner_monologue", "emotions", "strategy", "tags"],
+        "multi_perspective_analysis": ["perspectives"],
         "character_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation"],
+        "import_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation", "speaking_style"],
+        "interaction_batch_analysis": ["analyses"],
+        "import_profile_document_parse": ["subject", "persona_facts"],
+        "relationship_deep_analysis": ["power_dynamic", "interaction_pattern", "tensions", "trajectory"],
+        "trait_hypothesis_update": ["updates", "new_hypotheses"],
         "relationship_analysis": ["relationship_summary", "predicted_trend"],
         "emotion_curve": ["emotions", "trend"],
         "ai_suggest_update": ["updates"],
@@ -166,11 +166,15 @@ class OutputGuardrails:
         "long_context_review_critic": ["final_status", "confidence_adjustment", "issues", "approved_update_indexes", "approved_memory_indexes"],
     }
 
-    FORBIDDEN_PATTERNS = [
-        r"ignore (all |previous |above )?instructions",
-        r"system prompt",
-        r"jailbreak",
-    ]
+    # 嵌套结构要求：{字段: {子字段: 类型}}；类型为 None 表示只要求存在
+    NESTED_FIELDS: dict[str, dict[str, dict[str, type | None]]] = {
+        "chat_analysis": {
+            "inner_monologue": {"first_reaction": str, "defense": str, "tendency": str},
+            "emotions": {"intended": dict, "surface": dict, "deep": dict, "suppressed": dict},
+            "strategy": {"short_term": str, "long_term": str, "consistency_note": str},
+            "tags": {"primary": str, "secondary": str, "relation": str},
+        },
+    }
 
     def _balance_json_suffix(self, text: str) -> str:
         stack: list[str] = []
@@ -245,21 +249,24 @@ class OutputGuardrails:
         if required:
             if not isinstance(output, dict):
                 raise GuardrailError(f"期望 dict 输出，实际: {type(output)}")
-            for f in required:
-                if f not in output:
-                    raise GuardrailError(f"输出缺少必填字段: {f}")
+            missing = [f for f in required if f not in output]
+            if missing:
+                raise GuardrailError(f"输出缺少必填字段: {missing}")
+        nested = self.NESTED_FIELDS.get(task_name, {})
+        for field, children in nested.items():
+            value = output.get(field)
+            if not isinstance(value, dict):
+                raise GuardrailError(f"字段 {field} 应为对象，实际: {type(value)}")
+            for child, expected_type in children.items():
+                if child not in value:
+                    raise GuardrailError(f"字段 {field}.{child} 缺失")
+                if expected_type is not None and not isinstance(value[child], expected_type):
+                    raise GuardrailError(
+                        f"字段 {field}.{child} 类型错误：期望 {expected_type.__name__}，实际 {type(value[child]).__name__}"
+                    )
         return output
 
-    def check_safety(self, text: str) -> bool:
-        lower = text.lower()
-        for pattern in self.FORBIDDEN_PATTERNS:
-            if re.search(pattern, lower):
-                return False
-        return True
-
     def process(self, task_name: str, raw_output: str) -> Any:
-        if not self.check_safety(raw_output):
-            raise GuardrailError("输出包含不安全内容")
         parsed = self.extract_json(raw_output)
         return self.validate(task_name, parsed)
 
