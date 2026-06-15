@@ -136,6 +136,107 @@ def _recent_events(db: Session, character_ids: list[int]) -> list[dict[str, Any]
     ]
 
 
+# 持久知识类型：上传资料 / 诊断沉淀，不随时间过期，给新鲜度地板避免被对话记忆冲掉
+_DURABLE_TYPES = {"reference", "diagnosis"}
+_RRF_K = 60  # 倒数排名融合常数：越大越平滑，淡化头部排名的绝对差距
+_MMR_LAMBDA = 0.7  # MMR 权衡：0.7 偏相关、0.3 罚冗余
+_DUP_THRESHOLD = 0.85  # 与已选项相似度超过此值视为近重复，硬性降级（除非别无可选）
+_MEMORY_TOP_N = 12
+_REFERENCE_QUOTA = 3  # 命中资料时至少保留这么多块，保证上传资料能进上下文
+
+
+def _pair_similarity(item_a: dict[str, Any], item_b: dict[str, Any]) -> float:
+    """两条候选的冗余度：有向量用余弦，否则退化为内容词 Jaccard。"""
+    emb_a, emb_b = item_a.get("_emb"), item_b.get("_emb")
+    if emb_a and emb_b:
+        return cosine_similarity(emb_a, emb_b)
+    tokens_a, tokens_b = _tokens(item_a.get("content")), _tokens(item_b.get("content"))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / max(1, len(tokens_a | tokens_b))
+
+
+def _rerank_memory(pool: list[dict[str, Any]], has_vector: bool, top_n: int = _MEMORY_TOP_N) -> list[dict[str, Any]]:
+    """
+    两阶段召回的第二阶段：RRF 融合 + MMR 去冗余。
+    - RRF：分别按关键词分、向量分排名，倒数排名融合（量纲无关，比线性加权稳健）
+    - 先验：置信度 + 新鲜度 + 持久知识小幅加权
+    - MMR：相关性高且与已选差异大者优先，避免返回同一份资料的多个近重复块
+    - 配额：命中资料时保底纳入若干 reference 块
+    """
+    if not pool:
+        return []
+    size = len(pool)
+    rrf = [0.0] * size
+    for rank, idx in enumerate(sorted(range(size), key=lambda i: pool[i]["_kw"], reverse=True)):
+        rrf[idx] += 1.0 / (_RRF_K + rank + 1)
+    if has_vector:
+        for rank, idx in enumerate(sorted(range(size), key=lambda i: pool[i]["_vec"], reverse=True)):
+            rrf[idx] += 1.0 / (_RRF_K + rank + 1)
+    for idx, item in enumerate(pool):
+        prior = float(item["confidence"] or 0.0) * 0.02 + item["_rec"] * 0.02
+        if item["memory_type"] in _DURABLE_TYPES:
+            prior += 0.005
+        item["_rel"] = rrf[idx] + prior
+    # 相关性归一到 [0,1]，让 MMR 的相关项与冗余罚项处于同一量纲
+    rels = [item["_rel"] for item in pool]
+    low, high = min(rels), max(rels)
+    span = (high - low) or 1.0
+    for item in pool:
+        item["_reln"] = (item["_rel"] - low) / span
+
+    remaining = sorted(range(size), key=lambda i: pool[i]["_reln"], reverse=True)
+    selected: list[int] = []
+    while remaining and len(selected) < top_n:
+        if not selected:
+            selected.append(remaining.pop(0))
+            continue
+        scored = []
+        for idx in remaining:
+            max_sim = max(_pair_similarity(pool[idx], pool[j]) for j in selected)
+            mmr = _MMR_LAMBDA * pool[idx]["_reln"] - (1 - _MMR_LAMBDA) * max_sim
+            scored.append((idx, mmr, max_sim))
+        # 近重复硬过滤：优先选与已选差异足够大的；全是近重复时再退而求其次
+        novel = [entry for entry in scored if entry[2] < _DUP_THRESHOLD]
+        best_idx = max(novel or scored, key=lambda entry: entry[1])[0]
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    # 资料配额：若命中的 reference 块没进结果，挤掉分数最低的非资料项补进来
+    ref_pool = sorted(
+        (i for i in range(size) if pool[i]["memory_type"] == "reference"),
+        key=lambda i: pool[i]["_rel"], reverse=True,
+    )
+    have_ref = sum(1 for i in selected if pool[i]["memory_type"] == "reference")
+    for idx in ref_pool:
+        if have_ref >= _REFERENCE_QUOTA:
+            break
+        if idx in selected:
+            continue
+        non_ref = [i for i in selected if pool[i]["memory_type"] != "reference"]
+        if not non_ref:
+            break
+        victim = min(non_ref, key=lambda i: pool[i]["_rel"])
+        selected[selected.index(victim)] = idx
+        have_ref += 1
+    selected.sort(key=lambda i: pool[i]["_rel"], reverse=True)
+
+    results = []
+    for idx in selected:
+        item = pool[idx]
+        results.append({
+            "id": item["id"],
+            "character_id": item["character_id"],
+            "memory_type": item["memory_type"],
+            "content": item["content"],
+            "confidence": item["confidence"],
+            "source": item["source"],
+            "evidence_ids": item["evidence_ids"],
+            "score": round(item["_rel"], 4),
+        })
+    return results
+
+
 def _memory_candidates(db: Session, query: str, character_ids: list[int]) -> list[dict[str, Any]]:
     if not character_ids:
         return []
@@ -147,31 +248,28 @@ def _memory_candidates(db: Session, query: str, character_ids: list[int]) -> lis
         MemoryItem.character_id.in_(character_ids),
         MemoryItem.status == "active",
     ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(candidate_cap).all()
-    # 可选语义检索：embedding 启用时，查询向量与记忆向量的余弦相似度参与打分
+    # 第一阶段召回：对每条候选独立算关键词分与向量分（不再线性混合，留给 rerank 融合）
     query_vector = embed_text(query) if semantic_on else None
-    scored = []
+    pool = []
     for memory in memories:
-        score = (
-            _score_text(query, memory.content, memory.memory_type, memory.source)
-            + float(memory.confidence or 0.0) * 0.35
-            + _recency_score(memory.updated_at or memory.created_at)
-        )
-        if query_vector and memory.embedding:
-            score += cosine_similarity(query_vector, memory.embedding) * 0.5
-        scored.append(
-            {
-                "id": memory.id,
-                "character_id": memory.character_id,
-                "memory_type": memory.memory_type,
-                "content": _clip(memory.content, 260),
-                "confidence": memory.confidence,
-                "source": memory.source,
-                "evidence_ids": memory.evidence_ids or [],
-                "score": round(score, 4),
-            }
-        )
-    scored.sort(key=lambda item: item["score"], reverse=True)
-    return scored[:12]
+        recency = _recency_score(memory.updated_at or memory.created_at)
+        # 持久知识不随时间衰减——给新鲜度地板，避免老资料被近期对话记忆压没
+        if memory.memory_type in _DURABLE_TYPES:
+            recency = max(recency, 0.1)
+        pool.append({
+            "id": memory.id,
+            "character_id": memory.character_id,
+            "memory_type": memory.memory_type,
+            "content": _clip(memory.content, 260),
+            "confidence": memory.confidence,
+            "source": memory.source,
+            "evidence_ids": memory.evidence_ids or [],
+            "_kw": _score_text(query, memory.content, memory.memory_type, memory.source),
+            "_vec": cosine_similarity(query_vector, memory.embedding) if (query_vector and memory.embedding) else 0.0,
+            "_rec": recency,
+            "_emb": memory.embedding,
+        })
+    return _rerank_memory(pool, query_vector is not None)
 
 
 def _evidence_candidates(
@@ -233,6 +331,8 @@ def build_evidence_pack(
         conversation.id if conversation else None,
     )
     memory_hits = _memory_candidates(db, query_text, character_ids)
+    # 上传资料单独拎出，便于在 prompt 里明确标注为"外部依据"供模型引用
+    reference_hits = [hit for hit in memory_hits if hit.get("memory_type") == "reference"][:4]
     recent_events = _recent_events(db, character_ids)
     relationship_context = _relationship_context(db, speaker, listener)
     graph_context = graph_store.get_graph_context(
@@ -276,16 +376,18 @@ def build_evidence_pack(
         "graph_context": graph_context,
         "recent_events": recent_events,
         "memory_hits": memory_hits,
+        "reference_hits": reference_hits,
         "supporting_evidence": supporting_evidence,
         "conflicting_evidence": conflicting_evidence,
         "retrieval_notes": {
-                "strategy": "hybrid_sqlite_keyword_memory_graph_time",
+                "strategy": "rrf_mmr_rerank_keyword_vector_graph",
             "vector_hits": [],
             "keyword_hits": keyword_hits,
                 "graph_hits": graph_hits[:8],
             "time_hits": time_hits,
             "candidate_counts": {
                 "memories": len(memory_hits),
+                "references": len(reference_hits),
                 "supporting_evidence": len(supporting_evidence),
                 "conflicting_evidence": len(conflicting_evidence),
                 "recent_events": len(recent_events),
@@ -344,7 +446,12 @@ def render_evidence_pack(evidence_pack: dict[str, Any]) -> str:
             memory_count = len([item for item in (group.get("memories") or []) if item.get("id")])
             evidence_count = len([item for item in (group.get("evidence") or []) if item.get("id")])
             lines.append(f"  - {person.get('name') or person.get('id')}：关系 {rel_count}，记忆 {memory_count}，证据 {evidence_count}")
-    memories = evidence_pack.get("memory_hits", [])[:6]
+    references = evidence_pack.get("reference_hits", [])[:4]
+    if references:
+        lines.append("- 参考资料命中（用户上传的外部依据，可直接引用作答）：")
+        for item in references:
+            lines.append(f"  - {item.get('content')}（来源：{item.get('source') or '上传资料'}）")
+    memories = [item for item in evidence_pack.get("memory_hits", []) if item.get("memory_type") != "reference"][:6]
     if memories:
         lines.append("- 长期记忆命中：")
         for item in memories:

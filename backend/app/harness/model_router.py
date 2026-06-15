@@ -36,6 +36,7 @@ class ModelRouter:
         "chat_surface_reply": TaskComplexity.MEDIUM,
         "chat_analysis": TaskComplexity.MEDIUM,
         "multi_perspective_analysis": TaskComplexity.COMPLEX,
+        "perspective_critic_revise": TaskComplexity.COMPLEX,
         "import_dialogue_parse": TaskComplexity.COMPLEX,
         "import_narrative_parse": TaskComplexity.COMPLEX,
         "import_profile_document_parse": TaskComplexity.COMPLEX,
@@ -61,6 +62,7 @@ class ModelRouter:
     JSON_TASKS = {
         "chat_analysis",
         "multi_perspective_analysis",
+        "perspective_critic_revise",
         "import_dialogue_parse",
         "import_narrative_parse",
         "import_profile_document_parse",
@@ -155,6 +157,7 @@ class OutputGuardrails:
     REQUIRED_FIELDS: dict[str, list[str]] = {
         "chat_analysis": ["reply", "inner_monologue", "emotions", "strategy", "tags"],
         "multi_perspective_analysis": ["perspectives"],
+        "perspective_critic_revise": ["reviewed"],
         "character_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation"],
         "import_profile_gen": ["personality_tags", "core_traits", "weakness", "motivation", "speaking_style"],
         "interaction_batch_analysis": ["analyses"],

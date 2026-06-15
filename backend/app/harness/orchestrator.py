@@ -231,6 +231,7 @@ class AIOrchestrator:
         listener_state_block: str = "",
         consistency_block: str = "",
         viewers_block: str = "",
+        goal: str = "",
     ) -> AsyncGenerator[str, None]:
         """
         流式聊天分析（表层回复流式 + 主接收方结构化分析 + 多视角分析）
@@ -299,7 +300,7 @@ class AIOrchestrator:
                     perspectives = await self.analyze_multi_perspective(
                         scenario=scenario, speaker=speaker, content=content,
                         viewers_block=viewers_block, context=ctx.to_text(8),
-                        memory_block=character_memory,
+                        memory_block=character_memory, goal=goal,
                     )
                     result["perspectives"] = perspectives
                 except Exception as exc:
@@ -316,16 +317,17 @@ class AIOrchestrator:
 
     async def analyze_multi_perspective(
         self, scenario: str, speaker: str, content: str, viewers_block: str, context: str,
-        memory_block: str = "",
+        memory_block: str = "", goal: str = "",
     ) -> list[dict]:
         """多视角分析：在场每个旁观角色对这句话的独立分析。返回 normalize 后的 perspective 列表。
-        memory_block 注入向量语义召回的相关历史/证据，让"他什么意思 / 我怎么接"更贴合过往。"""
+        memory_block 注入向量语义召回的相关历史/证据；goal 给定时让「我」的 moves 围绕目标排序。"""
         result = await self.call(
             "multi_perspective_analysis",
             {
                 "scenario": scenario, "speaker": speaker, "content": content,
                 "viewers_block": viewers_block, "context": context or "（对话开始）",
                 "memory_block": memory_block or "（暂无相关历史记忆）",
+                "goal": goal or "（未指定具体目标，给出通用而稳妥的应对即可）",
             },
             retries=1,
         )
@@ -346,6 +348,20 @@ class AIOrchestrator:
             out.append(normalized)
         return out
 
+    async def critique_perspectives(self, utterance: str, perspectives_payload: list, evidence_block: str = "") -> dict:
+        """多视角分析的 LLM 复核(critic-revise)：逐视角审查过度推断/引用不实，回传修订与问题清单。
+        这是确定性接地核查之上的更深一层——确定性层只验证引用是否真实，本层判断结论是否超出原文支撑。"""
+        result = await self.call(
+            "perspective_critic_revise",
+            {
+                "utterance": utterance,
+                "perspectives": json.dumps(perspectives_payload, ensure_ascii=False),
+                "evidence_block": evidence_block or "（无额外证据，仅依据发言原文判断）",
+            },
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def analyze_theory_of_mind(self, me: str, counterpart: str, counterpart_block: str, dialogue: str) -> dict:
         """信息差/心智模型：推断对方知道什么、不知道什么、在隐瞒什么、对我抱有哪些假设。"""
         result = await self.call(
@@ -355,8 +371,8 @@ class AIOrchestrator:
         )
         return result if isinstance(result, dict) else {}
 
-    async def predict_counterfactual(self, me: str, counterpart: str, candidate: str, counterpart_block: str, memory_block: str, context: str) -> dict:
-        """反事实预测：如果我对对方说出 candidate，预测他的反应/情绪/达成意图的可能性。"""
+    async def predict_counterfactual(self, me: str, counterpart: str, candidate: str, counterpart_block: str, memory_block: str, context: str, goal: str = "") -> dict:
+        """反事实预测：如果我对对方说出 candidate，预测他的反应/情绪/达成目标的可能性。"""
         result = await self.call(
             "counterfactual_predict",
             {
@@ -364,6 +380,7 @@ class AIOrchestrator:
                 "counterpart_block": counterpart_block or "（档案有限）",
                 "memory_block": memory_block or "（无相关历史）",
                 "context": context or "（对话开始）",
+                "goal": goal or "（未指定，按推进当前互动评估）",
             },
             retries=1,
         )

@@ -63,6 +63,60 @@ def chunk_text(content_text: str, chunk_size: int = 2400, overlap: int = 240) ->
     return chunks
 
 
+# ── 语义分块：按句/段边界打包，整句不切，块间留句子重叠 ──────────────────
+# 比定长硬切更利于 embedding：每块是连贯语义单元，不会把一句话拦腰截断。
+_SENTENCE_SPLIT_RE = re.compile(r"[^。！？!?\n…]+(?:[。！？!?…]+|\n+|$)")
+
+
+def split_sentences(text: str) -> list[str]:
+    """按中英文句末标点 / 换行切句，保留句末标点，去空白。"""
+    if not text:
+        return []
+    pieces = [match.group(0).strip() for match in _SENTENCE_SPLIT_RE.finditer(text)]
+    return [piece for piece in pieces if piece]
+
+
+def semantic_chunk_text(
+    content_text: str,
+    target_size: int = 700,
+    overlap_sentences: int = 1,
+    hard_cap: int = 1200,
+) -> list[str]:
+    """
+    语义分块：整句贪心打包到接近 target_size，绝不切断句子；
+    块之间携带尾部 overlap_sentences 句作为重叠，保持上下文连续。
+    超长单句（> hard_cap）退化为字符切分，避免单块爆炸。
+    """
+    text = (content_text or "").strip()
+    if not text:
+        return []
+    sentences = split_sentences(text)
+    if not sentences:
+        return [text[:hard_cap]]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for sentence in sentences:
+        # 超长单句：收掉当前块，再按 hard_cap 直接切为独立块（不进重叠累积，避免块膨胀）
+        if len(sentence) > hard_cap:
+            if current:
+                chunks.append("".join(current))
+                current, current_len = [], 0
+            for i in range(0, len(sentence), hard_cap):
+                chunks.append(sentence[i:i + hard_cap])
+            continue
+        if current and current_len + len(sentence) > target_size:
+            chunks.append("".join(current))
+            tail = current[-overlap_sentences:] if overlap_sentences > 0 else []
+            current = list(tail)
+            current_len = sum(len(item) for item in current)
+        current.append(sentence)
+        current_len += len(sentence)
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 # ── 真实聊天记录归一化 ────────────────────────────────────────────────
 # 把常见聊天记录格式（带时间戳 / "名字+时间"头行+内容块）归一为「名字: 内容」逐行，
 # 从而复用现有 dialogue 解析管线。保守策略：不像聊天记录就原样返回，不影响其它导入。

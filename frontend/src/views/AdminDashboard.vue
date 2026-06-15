@@ -144,9 +144,11 @@
                     :key="`behavior-${category}-${item.id || item.label}`"
                     type="button"
                     class="tag behavior-tag-btn"
+                    :class="{ derived: item.derived }"
+                    :title="item.derived ? (item.source + '（派生，点开看依据）') : item.source"
                     @click="toggleBehaviorItem(`${category}-${item.id || item.label}`)"
                   >
-                    {{ item.label }}
+                    {{ item.label }}<span v-if="item.derived" class="derived-dot">·派生</span>
                   </button>
                 </div>
                 <div v-for="item in items" :key="`behavior-detail-${category}-${item.id || item.label}`">
@@ -350,6 +352,30 @@
             </div>
             <div v-if="!charRelationships.length" class="empty-hint" style="padding:40px 0">暂无关系记录</div>
           </div>
+        </div>
+
+        <!-- 参考资料（RAG）：上传的资料切块入向量库，对话/分析时作为依据被检索召回 -->
+        <div v-if="activeTab === 'knowledge'" class="tab-content">
+          <div class="rel-header">
+            <div class="section-title" style="margin:0">参考资料库</div>
+            <label class="btn btn-primary" style="font-size:12px;padding:6px 12px;cursor:pointer">
+              {{ knowledgeUploading ? '上传中…' : '＋ 上传资料' }}
+              <input type="file" accept=".txt,.md,.pdf,.docx" style="display:none" :disabled="knowledgeUploading" @change="handleUploadKnowledge" />
+            </label>
+          </div>
+          <div class="obs-reason" style="margin:-4px 0 12px;opacity:.8">
+            上传与 TA 相关的资料（文章 / 笔记 / 长文档）。系统切块入向量库，分析对话时会按语义召回相关片段作为依据，并标注来源。
+          </div>
+          <div v-if="knowledgeFiles.length" class="rel-list">
+            <div v-for="f in knowledgeFiles" :key="f.source" class="card" style="padding:12px 14px;display:flex;align-items:center;gap:12px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ f.source.replace(/^资料:/,'') }}</div>
+                <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:2px">{{ f.chunks }} 块 · {{ f.embedded }} 已向量化</div>
+              </div>
+              <button class="btn btn-danger" style="font-size:11px;padding:4px 10px" @click="handleDeleteKnowledge(f.source)">删除</button>
+            </div>
+          </div>
+          <div v-else class="empty-hint" style="padding:40px 0">还没有参考资料，点「上传资料」添加。</div>
         </div>
       </template>
     </div>
@@ -628,6 +654,34 @@
               <div v-if="importError" class="tag red" style="width:fit-content;margin-top:8px">{{ importError }}</div>
               <div v-else-if="importNotice" class="tag amber" style="width:fit-content;margin-top:8px">{{ importNotice }}</div>
               <div class="empty-hint" style="padding:8px 0 0;text-align:left">支持 TXT / MD / PDF / DOCX / JSON / CSV。上传后先生成预览，确认无误再写入系统。</div>
+
+              <!-- JSON 直接导入：所见即所存，不走 AI 分析 -->
+              <div v-if="importStep === 'upload'" class="card" style="margin-top:14px;padding:14px 16px;border:1px dashed var(--border-strong)">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+                  <div>
+                    <div class="section-title" style="margin:0">按 JSON 直接导入人物档案</div>
+                    <div class="empty-hint" style="padding:2px 0 0;text-align:left">直接保存为最终档案，不经过 AI 分析。同名（或别名命中）则更新，否则新建。</div>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center">
+                    <button type="button" class="btn btn-ghost" @click.prevent="downloadProfileJsonTemplate">下载模板</button>
+                    <label class="btn btn-primary" :class="{ disabled: profileJsonImporting }" style="cursor:pointer">
+                      {{ profileJsonImporting ? '导入中…' : '选择 JSON 上传' }}
+                      <input type="file" accept=".json" style="display:none" :disabled="profileJsonImporting" @change="handleProfileJsonImport"/>
+                    </label>
+                  </div>
+                </div>
+                <div v-if="profileJsonError" class="tag red" style="width:fit-content;margin-top:10px">{{ profileJsonError }}</div>
+                <div v-else-if="profileJsonResult" class="card" style="margin-top:10px;padding:10px 12px;background:rgba(0,212,255,.05)">
+                  <div style="font-size:13px;color:var(--text-primary)">
+                    ✅ 新建 {{ profileJsonResult.characters_created }} · 更新 {{ profileJsonResult.characters_updated }} · 事件 +{{ profileJsonResult.events_added }} · 关系 +{{ profileJsonResult.relationships_added }}
+                  </div>
+                  <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+                    <span v-for="d in profileJsonResult.details" :key="d.id" class="tag" :class="d.action === 'created' ? 'green' : 'amber'">
+                      {{ d.name }} · {{ d.action === 'created' ? '新建' : '更新' }}
+                    </span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <!-- ② 预览确认 -->
@@ -850,6 +904,43 @@ const route = useRoute()
 const searchQ = ref('')
 const activeChar = ref(null)
 const activeTab = ref('profile')
+
+// ── 参考资料库（RAG 上传） ──────────────────────────────────────
+const knowledgeFiles = ref([])
+const knowledgeUploading = ref(false)
+async function loadKnowledge() {
+  if (!activeChar.value) { knowledgeFiles.value = []; return }
+  try {
+    const res = await characterApi.listKnowledge(activeChar.value.id)
+    knowledgeFiles.value = res.data.files || []
+  } catch { knowledgeFiles.value = [] }
+}
+async function handleUploadKnowledge(e) {
+  const file = e.target.files && e.target.files[0]
+  if (!file || !activeChar.value) return
+  knowledgeUploading.value = true
+  try {
+    const res = await characterApi.uploadKnowledge(activeChar.value.id, file)
+    const d = res.data || {}
+    toast.success(`已入库 ${d.chunks_added} 块${d.embedded ? '（已向量化）' : '（未向量化，检查 embedding 配置）'}${d.hint ? '；' + d.hint : ''}`)
+    await loadKnowledge()
+  } catch (err) {
+    toast.error('上传失败：' + (err?.response?.data?.detail || err?.message || ''))
+  } finally {
+    knowledgeUploading.value = false
+    e.target.value = ''
+  }
+}
+async function handleDeleteKnowledge(source) {
+  if (!activeChar.value) return
+  if (!await confirmDialog('删除这份参考资料的全部片段？')) return
+  await characterApi.deleteKnowledge(activeChar.value.id, source)
+  toast.success('已删除')
+  await loadKnowledge()
+}
+watch([activeTab, () => activeChar.value?.id], () => {
+  if (activeTab.value === 'knowledge') loadKnowledge()
+})
 const events = ref([])
 const observations = ref([])
 const profileView = ref(null)
@@ -924,12 +1015,18 @@ const EXTENDED_DIM_META = [
   { key: 'contradictions', label: '矛盾性' },
   { key: 'self_image_vs_public', label: '自我认知 vs 外部印象' },
 ]
+const FACT_META = ['content', 'confidence', 'evidence_ids', 'updated_at']
 function extEntryText(entry) {
   if (entry == null) return ''
   if (typeof entry === 'string') return entry
   if (Array.isArray(entry)) return entry.filter(Boolean).join('、')
   if (typeof entry === 'object') {
-    return Object.entries(entry).filter(([, v]) => v && (!Array.isArray(v) || v.length))
+    if (entry.content) {   // 新规范形态：内容 + 低置信标"推测"
+      const conf = typeof entry.confidence === 'number' ? entry.confidence : null
+      const ev = Array.isArray(entry.evidence_ids) ? entry.evidence_ids.length : 0
+      return entry.content + (conf !== null && conf < 0.5 ? '（推测）' : '') + (ev ? ` ·据${ev}` : '')
+    }
+    return Object.entries(entry).filter(([k, v]) => !FACT_META.includes(k) && v && (!Array.isArray(v) || v.length))
       .map(([k, v]) => `${dimSubLabel(k)}${Array.isArray(v) ? v.join('、') : v}`).join('，')
   }
   return String(entry)
@@ -967,6 +1064,7 @@ const tabs = [
   { key: 'profile', label: '角色档案' },
   { key: 'timeline', label: '时间线' },
   { key: 'relations', label: '关系' },
+  { key: 'knowledge', label: '参考资料' },
 ]
 
 const BIG_FIVE_KEYS = ['openness', 'conscientiousness', 'extraversion', 'agreeableness', 'neuroticism']
@@ -1519,6 +1617,43 @@ async function downloadExport() {
   }
 }
 
+// ── JSON 直接导入人物档案（所见即所存，不走 AI 分析） ──────────────────────
+const profileJsonImporting = ref(false)
+const profileJsonResult = ref(null)
+const profileJsonError = ref('')
+async function downloadProfileJsonTemplate() {
+  try {
+    const res = await characterApi.getProfileJsonTemplate()
+    const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'profile-import-template.json'
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    toast.error('模板下载失败：' + (err?.response?.data?.detail || err?.message || ''))
+  }
+}
+async function handleProfileJsonImport(e) {
+  const file = e.target.files?.[0]
+  e.target.value = ''  // 允许重复选同一文件
+  if (!file) return
+  profileJsonImporting.value = true
+  profileJsonError.value = ''
+  profileJsonResult.value = null
+  try {
+    const res = await characterApi.importProfileJson(file)
+    profileJsonResult.value = res.data
+    await chars.fetchAll()
+    toast.success(`导入完成：新建 ${res.data.characters_created}、更新 ${res.data.characters_updated}`)
+  } catch (err) {
+    profileJsonError.value = err?.response?.data?.detail || err?.message || '导入失败，请检查 JSON 格式。'
+  } finally {
+    profileJsonImporting.value = false
+  }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 function getCharName(id) { return chars.characterMap[id]?.name || '未知' }
 function getCharColor(id) { return chars.characterMap[id]?.avatar_color || '#475569' }
@@ -1859,6 +1994,8 @@ function renderGraph() {
 .behavior-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }
 .behavior-group { padding:12px; }
 .behavior-tag-btn { border:none; cursor:pointer; }
+.behavior-tag-btn.derived { opacity:.82; border:1px dashed var(--border-strong); background:transparent; }
+.derived-dot { margin-left:4px; font-size:9px; opacity:.6; }
 .compact-list { display:flex; flex-direction:column; gap:8px; }
 .update-summary-card { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 

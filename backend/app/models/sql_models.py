@@ -295,6 +295,8 @@ class Conversation(Base):
     scene_brief = Column(Text, default="")
     # 「我」在本对话中的称呼（导入真实聊天时标记哪一方是用户本人；为空表示未指定）
     self_name = Column(String(100), default="")
+    # 「我」跟对方在这段关系里想达成的目标（注入分析，让应对策略围绕它排序）
+    goal = Column(Text, default="")
     is_readonly = Column(Boolean, default=False)
     source_import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=True)
     active_branch_id = Column(String(80), nullable=True)

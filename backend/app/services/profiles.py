@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 BIG_FIVE_KEYS = ["openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"]
@@ -56,14 +57,47 @@ _DICT_DIMENSIONS = {"speech_fingerprint", "self_image_vs_public"}
 _MAX_ITEMS_PER_DIMENSION = 10
 
 
-def _entry_key(entry: Any) -> str:
-    """条目去重键：字符串直接用，dict 取主要内容字段拼接"""
+# ── 档案事实可追溯：条目统一为 {content, confidence, evidence_ids, updated_at} ──
+# 读取三种历史形态兼容：裸字符串 / 旧结构 dict(如 {surface,deep}) / 新规范 dict
+_FACT_META_KEYS = {"content", "confidence", "evidence_ids", "updated_at"}
+
+
+def fact_content(entry: Any) -> str:
+    """取一条事实的展示文本，兼容旧裸串 / 旧结构 dict / 新规范 dict。"""
     if isinstance(entry, str):
-        return re.sub(r"\s", "", entry)[:60]
+        return entry.strip()
     if isinstance(entry, dict):
-        joined = "|".join(str(entry.get(k, "")) for k in sorted(entry.keys()))
-        return re.sub(r"\s", "", joined)[:80]
-    return str(entry)[:60]
+        if entry.get("content"):
+            return str(entry["content"]).strip()
+        parts = [str(v).strip() for k, v in entry.items() if k not in _FACT_META_KEYS and v]
+        return "；".join(p for p in parts if p)
+    return str(entry or "").strip()
+
+
+def fact_confidence(entry: Any) -> float | None:
+    if isinstance(entry, dict) and isinstance(entry.get("confidence"), (int, float)):
+        return float(entry["confidence"])
+    return None
+
+
+def fact_evidence_ids(entry: Any) -> list:
+    if isinstance(entry, dict) and isinstance(entry.get("evidence_ids"), list):
+        return list(entry["evidence_ids"])
+    return []
+
+
+def _canonical_fact(content: str, confidence: float | None, evidence_ids: list | None) -> dict:
+    return {
+        "content": content[:300],
+        "confidence": round(float(confidence), 2) if isinstance(confidence, (int, float)) else 0.6,
+        "evidence_ids": list(evidence_ids or []),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _entry_key(entry: Any) -> str:
+    """条目去重键：统一按展示文本归一，跨形态去重（旧串与新对象同一事实视为重复）"""
+    return re.sub(r"\s", "", fact_content(entry))[:80]
 
 
 def merge_extended_profile(old_profile: dict | None, new_profile: dict | None) -> tuple[dict, int]:
@@ -83,12 +117,14 @@ def merge_extended_profile(old_profile: dict | None, new_profile: dict | None) -
         existing = list(old.get(dim) or []) if isinstance(old.get(dim), list) else []
         seen = {_entry_key(item) for item in existing}
         for item in new_items:
-            key = _entry_key(item)
+            content = fact_content(item)
+            key = re.sub(r"\s", "", content)[:80]
             if not key or key in seen:
                 continue
             if len(existing) >= _MAX_ITEMS_PER_DIMENSION:
                 break
-            existing.append(item)
+            # 新写入一律落规范形态：保留来源带的置信/证据，没有就给默认
+            existing.append(_canonical_fact(content, fact_confidence(item), fact_evidence_ids(item)))
             seen.add(key)
             added += 1
         old[dim] = existing
@@ -122,19 +158,25 @@ def render_extended_profile(profile_json: dict | None, limit_per_dim: int = 5) -
     lines: list[str] = []
 
     def _entry_text(entry: Any) -> str:
-        if isinstance(entry, str):
-            return entry
-        if isinstance(entry, dict):
-            return "；".join(f"{k}:{v}" for k, v in entry.items() if v)
-        return str(entry)
+        text = fact_content(entry)
+        if not text:
+            return ""
+        conf = fact_confidence(entry)
+        # 低置信事实在注入分析时标"推测"，让模型谨慎看待
+        if conf is not None and conf < 0.5:
+            text += "(推测)"
+        return text
 
     for dim, label in EXTENDED_DIMENSIONS.items():
         value = profile.get(dim)
         if isinstance(value, list) and value:
-            items = "；".join(_entry_text(item) for item in value[:limit_per_dim])
-            lines.append(f"- {label}：{items}")
+            items = "；".join(t for t in (_entry_text(item) for item in value[:limit_per_dim]) if t)
+            if items:
+                lines.append(f"- {label}：{items}")
         elif isinstance(value, dict) and any(v for v in value.values()):
-            lines.append(f"- {label}：{_entry_text(value)}")
+            text = _entry_text(value)
+            if text:
+                lines.append(f"- {label}：{text}")
     return "\n".join(lines)
 
 

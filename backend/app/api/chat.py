@@ -500,6 +500,57 @@ def _build_viewers_context(db: Session, speaker: str, listeners: list, primary_n
     return "\n\n".join(blocks), viewers
 
 
+_GROUNDING_DROP = set(" \t\r\n，。！？、；：…·（）()—-~～!?,.:;\"'“”‘’")
+
+
+def _deterministic_grounding(evidence: str, utterance: str, declared_grounded, confidence):
+    """确定性接地核查（信任底线第一层，免费且永远在线）：
+    证据片段必须真出现在发言原文里，否则判为「推测」、置信封顶 0.45。返回 (grounded, confidence)。"""
+    strip = lambda s: "".join(c for c in (s or "") if c not in _GROUNDING_DROP)
+    utter_norm = strip(utterance)
+    ev_norm = strip(evidence)
+    grounded = bool(ev_norm) and len(ev_norm) >= 2 and ev_norm in utter_norm
+    if declared_grounded is False:
+        grounded = False
+    if not grounded and confidence is not None:
+        confidence = min(confidence, 0.45)
+    return grounded, confidence
+
+
+def _perspective_claim_text(analysis_json: dict) -> str:
+    """把某视角的内心独白拼成一句，供 critic 复核其判断是否过度推断。"""
+    inner = (analysis_json or {}).get("inner_monologue") or {}
+    if isinstance(inner, dict):
+        parts = [str(inner.get(k) or "").strip() for k in ("first_reaction", "defense", "tendency")]
+        return " / ".join(p for p in parts if p)
+    return str(inner or "").strip()
+
+
+def _apply_critic_review(analysis_json: dict, review_item: dict) -> dict:
+    """把一条 LLM 复核结果并入某视角的 analysis_json（信任底线第二层）：
+    不抹掉原判断，叠加 critic 注记；置信只能调低、引用不实/过度推断则标 grounded=false。返回新 dict。"""
+    aj = dict(analysis_json or {})
+    issues = [str(i).strip() for i in (review_item.get("issues") or []) if str(i).strip()]
+    verdict = (review_item.get("verdict") or "").strip().lower() or ("downgraded" if issues else "approved")
+    cur = aj.get("confidence")
+    rev = review_item.get("confidence")
+    rev = float(rev) if isinstance(rev, (int, float)) else None
+    # critic 只能更保守：取原值与复核值的较低者
+    if rev is not None:
+        aj["confidence"] = round(min(cur, rev) if isinstance(cur, (int, float)) else rev, 2)
+    if review_item.get("grounded") is False:
+        aj["grounded"] = False
+        if isinstance(aj.get("confidence"), (int, float)):
+            aj["confidence"] = min(aj["confidence"], 0.45)
+    aj["critic"] = {
+        "verdict": verdict,
+        "issues": issues[:5],
+        "revised_subtext": (review_item.get("revised_subtext") or "").strip()[:300],
+        "revised_inner_monologue": (review_item.get("revised_inner_monologue") or "").strip()[:400],
+    }
+    return aj
+
+
 def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: str, perspectives: list, primary_name: str, primary_reply: str = "") -> int:
     """保存一条发言的多视角分析（先清旧视角，再写新视角）。
     每个旁观视角带"建议回答"；主要接收方的建议回答用流式生成的自然回复。"""
@@ -533,20 +584,13 @@ def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: st
                 primary_reply if is_primary and primary_reply
                 else (persp.get("reply") or (moves[0]["reply"] if moves else ""))
             ).strip()
-        # ── 自评-修订：确定性接地核查（信任底线）──
+        # ── 自评-修订第一层：确定性接地核查（信任底线，免费且永远在线）──
         # 证据必须真出现在发言原文里，否则判为「推测」、置信封顶 0.45，不靠模型自觉
+        # （更深一层「LLM 复核员」由 /messages/{id}/critique-analysis 端点按需触发）
         evidence = (persp.get("evidence") or "").strip()
         raw_conf = persp.get("confidence")
         confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) else None
-        _drop = " \t\r\n，。！？、；：…·（）()—-~～!?,.:;\"'“”‘’"
-        _strip = lambda s: "".join(c for c in (s or "") if c not in _drop)
-        utter_norm = _strip(user_msg.content)
-        ev_norm = _strip(evidence)
-        grounded = bool(ev_norm) and len(ev_norm) >= 2 and ev_norm in utter_norm
-        if persp.get("grounded") is False:
-            grounded = False
-        if not grounded and confidence is not None:
-            confidence = min(confidence, 0.45)
+        grounded, confidence = _deterministic_grounding(evidence, user_msg.content, persp.get("grounded"), confidence)
         db.add(MessagePerspective(
             conversation_id=conv_id,
             message_id=user_msg.id,
@@ -847,6 +891,7 @@ def _conversation_payload(c: Conversation) -> dict:
         "scenario": c.scenario,
         "scene_brief": getattr(c, "scene_brief", "") or "",
         "self_name": getattr(c, "self_name", "") or "",
+        "goal": getattr(c, "goal", "") or "",
         "updated_at": c.updated_at,
         "is_readonly": bool(getattr(c, "is_readonly", False)),
         "source_import_file_id": getattr(c, "source_import_file_id", None),
@@ -884,6 +929,8 @@ def update_conversation(conv_id: int, body: ConversationUpdate, db: Session = De
         conv.scene_brief = body.scene_brief.strip()[:2000]
     if body.self_name is not None:
         conv.self_name = body.self_name.strip()[:100]
+    if body.goal is not None:
+        conv.goal = body.goal.strip()[:500]
     if body.participants is not None:
         conv.participants = [
             {"id": item.id, "name": item.name.strip()}
@@ -1203,6 +1250,7 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
             listener_state_block=listener_state_block,
             consistency_block=consistency_block,
             viewers_block=viewers_block,
+            goal=getattr(conv, "goal", "") or "",
         ):
             data = json.loads(chunk)
             if data["type"] == "done":
@@ -1322,6 +1370,7 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
         listener_state_block=listener_state_block,
         consistency_block=consistency_block,
         viewers_block=viewers_block,
+        goal=getattr(conv, "goal", "") or "",
     ):
         data = json.loads(chunk)
         if data["type"] == "done":
@@ -1360,6 +1409,75 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
     if not message or message.role != "user":
         raise HTTPException(404, "消息不存在")
     return await _reanalyze_user_message(db, message)
+
+
+@router.post("/messages/{message_id}/critique-analysis")
+async def critique_message_analysis(message_id: int, db: Session = Depends(get_db)):
+    """对一条发言已存的多视角分析跑一轮 LLM 复核(critic-revise)：逐视角审查过度推断/脑补/引用不实，
+    下调置信、标推测、给保守修订，并透明回传抓到的问题。这是确定性接地核查之上的更深一层。"""
+    message = db.get(Message, message_id)
+    if not message:
+        raise HTTPException(404, "消息不存在")
+    rows = db.query(MessagePerspective).filter(MessagePerspective.message_id == message_id).all()
+    if not rows:
+        raise HTTPException(400, "这条消息还没有可复核的分析")
+    conv = db.get(Conversation, message.conversation_id)
+
+    # 复核证据：与分析同源（对方原话 + 语义召回证据），critic 只能用这些，不许臆造
+    evidence_block = ""
+    try:
+        speaker_char = db.query(Character).filter(Character.name == (message.character_name or "")).first()
+        pack = build_evidence_pack(db, query_text=message.content, speaker=speaker_char, listener=None, conversation=conv)
+        evidence_block = render_evidence_pack(pack)
+    except Exception:
+        evidence_block = ""
+
+    payload = [
+        {
+            "viewer": row.viewer_name,
+            "stance": row.stance,
+            "evidence": ((row.analysis_json or {}).get("evidence") or "")[:300],
+            "confidence": (row.analysis_json or {}).get("confidence"),
+            "subtext": row.subtext or "",
+            "claim": _perspective_claim_text(row.analysis_json or {}),
+        }
+        for row in rows
+    ]
+    try:
+        review = await orchestrator.critique_perspectives(message.content, payload, evidence_block)
+    except Exception as exc:
+        raise HTTPException(502, f"复核调用失败：{exc}")
+    by_viewer = {
+        (item.get("viewer") or "").strip(): item
+        for item in (review.get("reviewed") or [])
+        if isinstance(item, dict) and (item.get("viewer") or "").strip()
+    }
+
+    corrections = []
+    for row in rows:
+        item = by_viewer.get((row.viewer_name or "").strip())
+        if not item:
+            continue
+        before = (row.analysis_json or {}).get("confidence")
+        row.analysis_json = _apply_critic_review(row.analysis_json, item)  # 重新赋值新 dict，触发脏标记
+        critic = row.analysis_json["critic"]
+        corrections.append({
+            "viewer": row.viewer_name,
+            "stance": row.stance,
+            "verdict": critic["verdict"],
+            "issues": critic["issues"],
+            "confidence_before": round(before, 2) if isinstance(before, (int, float)) else None,
+            "confidence_after": row.analysis_json.get("confidence"),
+        })
+    db.commit()
+    downgraded = sum(1 for c in corrections if c["verdict"] in ("downgraded", "softened"))
+    return {
+        "message_id": message_id,
+        "overall": (review.get("overall") or "").strip(),
+        "reviewed_count": len(corrections),
+        "flagged_count": downgraded,
+        "corrections": corrections,
+    }
 
 
 @router.post("/conversations/{conv_id}/generate-advice")
@@ -1679,7 +1797,8 @@ async def conversation_predict(conv_id: int, payload: dict, db: Session = Depend
     except Exception:
         memory_block = ""
     context = _recent_dialogue_text(db, conv)
-    result = await orchestrator.predict_counterfactual(me, counterpart, candidate, block, memory_block, context)
+    goal = (payload.get("goal") or getattr(conv, "goal", "") or "").strip()
+    result = await orchestrator.predict_counterfactual(me, counterpart, candidate, block, memory_block, context, goal)
     return {"me": me, "counterpart": counterpart, "candidate": candidate, **(result or {})}
 
 

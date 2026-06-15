@@ -23,11 +23,14 @@ from ..schemas import (
     CharacterReviewRequest, CharacterReviewOut,
 )
 from ..harness.orchestrator import orchestrator
-from ..harness.import_engine import extract_text_from_file, build_import_preview
+from ..harness.import_engine import extract_text_from_file, build_import_preview, chunk_text, semantic_chunk_text, detect_import_type, classify_behavior_pattern_category
 from ..harness.graph_store import graph_store
 from ..services.profiles import (
+    EXTENDED_DIMENSIONS,
     PROFILE_TEXT_FIELDS,
     blend_traits,
+    fact_confidence,
+    fact_content,
     merge_background,
     merge_extended_profile,
     merge_tags,
@@ -572,6 +575,327 @@ def backfill_embeddings(limit: int = 500, db: Session = Depends(get_db)):
     db.commit()
     remaining = db.query(MemoryItem).filter(MemoryItem.embedding.is_(None), MemoryItem.status == "active").count()
     return {"ok": True, "updated": updated, "remaining": remaining}
+
+
+# ── RAG 参考资料库（上传的资料切块入向量库，对话/分析时作为依据被检索召回） ──
+KNOWLEDGE_CHUNK_SIZE = 700
+KNOWLEDGE_CHUNK_OVERLAP = 100
+KNOWLEDGE_MAX_CHUNKS = 80
+
+
+@router.post("/{character_id}/knowledge")
+async def upload_knowledge(character_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """给角色上传参考资料：抽取文本 → 切块 → 算向量 → 存为 reference 记忆。
+    这些块会被现有语义检索自动召回，作为对话/分析的依据。"""
+    char = db.get(Character, character_id)
+    if not char:
+        raise HTTPException(404, "角色不存在")
+    from ..harness.embeddings import embed_text, embedding_enabled
+    raw = await file.read()
+    try:
+        text = await extract_text_from_file(file.filename, raw)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    text = (text or "").strip()
+    if len(text) < 10:
+        raise HTTPException(400, "未能从文件中提取到有效文本")
+
+    source = f"资料:{file.filename}"[:200]
+    # 同名资料先清掉旧块，避免重复
+    db.query(MemoryItem).filter(MemoryItem.character_id == character_id, MemoryItem.source == source).delete(synchronize_session=False)
+    # 语义分块：整句打包不切句，每块是连贯语义单元 → embedding 更准、召回更稳
+    chunks = semantic_chunk_text(text, target_size=KNOWLEDGE_CHUNK_SIZE, overlap_sentences=1)
+    truncated = len(chunks) > KNOWLEDGE_MAX_CHUNKS
+    chunks = chunks[:KNOWLEDGE_MAX_CHUNKS]
+    added = 0
+    for chunk in chunks:
+        content = chunk.strip()
+        if len(content) < 10:
+            continue
+        db.add(MemoryItem(
+            character_id=character_id,
+            memory_type="reference",
+            content=content[:2000],
+            embedding=embed_text(content[:2000]) if embedding_enabled() else None,
+            confidence=0.6,
+            evidence_ids=[],
+            source=source,
+            status="active",
+        ))
+        added += 1
+    db.commit()
+    # 自主判断：短资料其实更适合走"导入→丰富档案"，给个提示但仍按资料入库
+    hint = ""
+    if len(text) < 400 and detect_import_type(file.filename, text) == "profile_document":
+        hint = "这份资料较短、像人物简介——若想直接丰富档案，可改用「导入」功能。"
+    return {
+        "ok": True, "source": source, "chunks_added": added, "chars": len(text),
+        "embedded": embedding_enabled(), "truncated": truncated, "hint": hint,
+    }
+
+
+@router.get("/{character_id}/knowledge")
+def list_knowledge(character_id: int, db: Session = Depends(get_db)):
+    """列出该角色的参考资料（按来源文件聚合块数）。"""
+    rows = db.query(MemoryItem).filter(
+        MemoryItem.character_id == character_id,
+        MemoryItem.memory_type == "reference",
+        MemoryItem.status == "active",
+    ).all()
+    by_source: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        src = row.source or "资料"
+        item = by_source.setdefault(src, {"source": src, "chunks": 0, "embedded": 0})
+        item["chunks"] += 1
+        if row.embedding:
+            item["embedded"] += 1
+    return {"character_id": character_id, "files": list(by_source.values()), "total_chunks": len(rows)}
+
+
+@router.delete("/{character_id}/knowledge")
+def delete_knowledge(character_id: int, source: str = "", db: Session = Depends(get_db)):
+    """删除该角色的参考资料：指定 source 删该文件，否则删全部 reference 块。"""
+    q = db.query(MemoryItem).filter(
+        MemoryItem.character_id == character_id,
+        MemoryItem.memory_type == "reference",
+    )
+    if source:
+        q = q.filter(MemoryItem.source == source)
+    deleted = q.delete(synchronize_session=False)
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
+# ── 直接 JSON 档案导入（所见即所存，不走 AI 分析）─────────────────────────
+# 一份完整模板：可下载、填写后直接上传落库。覆盖基础字段 + 大五人格 + 立体档案八维度 + 事件 + 关系。
+PROFILE_JSON_TEMPLATE: dict[str, Any] = {
+    "version": "profile-json/v1",
+    "_说明": "characters 必填；同名（或别名命中）则更新已有角色，否则新建。提供的字段直接覆盖保存，未提供的字段保持原样。relationships/events 可选。",
+    "characters": [
+        {
+            "name": "张三",
+            "aliases": ["张总", "老张"],
+            "role": "项目经理",
+            "age": 35,
+            "avatar_color": "#00d4ff",
+            "background": "白手起家的创业者，经历过一次失败后转做管理，做事雷厉风行。",
+            "personality_tags": ["强势", "完美主义", "外冷内热"],
+            "core_traits": {
+                "openness": 0.6, "conscientiousness": 0.85,
+                "extraversion": 0.7, "agreeableness": 0.4, "neuroticism": 0.5
+            },
+            "motivation": "证明自己的判断是对的，重新赢得话语权。",
+            "weakness": "怕失控，被否定时容易上头。",
+            "speaking_style": "短促命令式，爱用反问，少寒暄。",
+            "profile_json": {
+                "values": ["重视效率与结果", "认为承诺必须兑现"],
+                "desires": [{"surface": "想拿下这个项目", "deep": "渴望被团队真正认可"}],
+                "fears": [{"content": "怕局面失控、被人看穿不自信"}],
+                "interpersonal_patterns": [{"context": "面对下属", "pattern": "先施压立威，再私下安抚"}],
+                "key_experiences": [{"event": "第一次创业失败", "impact": "从此凡事留后手、不轻易信人"}],
+                "speech_fingerprint": {
+                    "catchphrases": ["这事得抓紧", "你觉得呢？"],
+                    "sentence_style": "短句、命令式、爱反问",
+                    "avoided_topics": ["家庭", "那次失败"]
+                },
+                "contradictions": [{"side_a": "嘴上说不在乎别人评价", "side_b": "却频频打听别人怎么说他", "interpretation": "极度在意但要面子"}],
+                "self_image_vs_public": {"self": "果断可靠的领导者", "public": "难搞、强势的老板"}
+            },
+            "events": [
+                {"title": "晋升为项目经理", "description": "临危受命接手烂摊子项目。", "event_date": "2022-03", "emotion_label": "振奋", "importance": 4, "arc_marker": True}
+            ]
+        },
+        {
+            "name": "李四",
+            "role": "技术骨干",
+            "personality_tags": ["内敛", "较真"],
+            "motivation": "把事情做对，不愿被外行指挥。",
+            "weakness": "不善表达，容易憋着。",
+            "profile_json": {
+                "values": ["重视专业与逻辑"],
+                "fears": [{"content": "怕努力被无视"}]
+            }
+        }
+    ],
+    "relationships": [
+        {"source": "张三", "target": "李四", "rel_type": "rival", "strength": 0.6, "sentiment": -0.3, "description": "表面合作、暗自较劲的上下级。"}
+    ]
+}
+
+_DIRECT_SCALAR_FIELDS = ("role", "background", "motivation", "weakness", "speaking_style")
+
+
+def _clamp01(value: Any) -> float | None:
+    try:
+        return round(max(0.0, min(1.0, float(value))), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_direct_character(db: Session, item: dict) -> tuple[Character | None, bool]:
+    """把一条 JSON 角色直接落库（同名/别名命中则更新，否则新建）。返回 (char, created)。"""
+    name = (item.get("name") or "").strip()
+    if not name:
+        return None, False
+    char = find_character_by_name(db, name)
+    created = char is None
+    if created:
+        char = Character(name=name)
+        db.add(char)
+    for field in _DIRECT_SCALAR_FIELDS:
+        if item.get(field) is not None:
+            setattr(char, field, str(item[field]))
+    if isinstance(item.get("age"), int):
+        char.age = item["age"]
+    if (item.get("avatar_color") or "").strip():
+        char.avatar_color = str(item["avatar_color"]).strip()[:20]
+    for alias in item.get("aliases") or []:
+        add_alias(char, str(alias))
+    if isinstance(item.get("personality_tags"), list):
+        char.personality_tags = merge_tags([], item["personality_tags"])
+    if isinstance(item.get("core_traits"), dict):
+        traits = dict(char.core_traits or {})
+        for key, value in item["core_traits"].items():
+            if key in BIG_FIVE_KEYS:
+                clamped = _clamp01(value)
+                if clamped is not None:
+                    traits[key] = clamped
+        char.core_traits = traits
+    # 立体档案：只写入合法维度，顶层合并（不动未提供的维度），所见即所存
+    if isinstance(item.get("profile_json"), dict):
+        profile = dict(char.profile_json or {})
+        for key, value in item["profile_json"].items():
+            if key in EXTENDED_DIMENSIONS:
+                profile[key] = value
+        char.profile_json = profile
+    char.version = (char.version or 1) + (0 if created else 1)
+    char.updated_at = datetime.utcnow()
+    return char, created
+
+
+def _apply_direct_events(db: Session, char: Character, events: Any) -> int:
+    if not isinstance(events, list):
+        return 0
+    existing = {
+        ((e.title or ""), (e.event_date or ""))
+        for e in db.query(CharacterEvent).filter_by(character_id=char.id).all()
+    }
+    added = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        title = (event.get("title") or "").strip()
+        if not title:
+            continue
+        date = (event.get("event_date") or "").strip()
+        if (title, date) in existing:
+            continue
+        existing.add((title, date))
+        importance = event.get("importance")
+        db.add(CharacterEvent(
+            character_id=char.id,
+            title=title[:200],
+            description=(event.get("description") or "").strip(),
+            event_date=date[:50],
+            emotion_label=(event.get("emotion_label") or "").strip()[:50],
+            importance=importance if isinstance(importance, int) and 1 <= importance <= 5 else 3,
+            psychological_impact=(event.get("psychological_impact") or "").strip(),
+            arc_marker=bool(event.get("arc_marker")),
+        ))
+        added += 1
+    return added
+
+
+def _apply_direct_relationship(db: Session, rel: dict, name_to_char: dict) -> bool:
+    def _resolve(key: str) -> Character | None:
+        nm = (rel.get(key) or "").strip()
+        return name_to_char.get(nm) or find_character_by_name(db, nm)
+    source, target = _resolve("source"), _resolve("target")
+    if not source or not target or source.id == target.id:
+        return False
+    pair = find_pair_relationship(db, source.id, target.id)
+    if not pair:
+        pair = Relationship(source_id=source.id, target_id=target.id)
+        db.add(pair)
+    if (rel.get("rel_type") or "").strip():
+        pair.rel_type = rel["rel_type"].strip()[:50]
+    strength = _clamp01(rel.get("strength"))
+    if strength is not None:
+        pair.strength = strength
+    try:
+        pair.sentiment = max(-1.0, min(1.0, float(rel.get("sentiment"))))
+    except (TypeError, ValueError):
+        pass
+    if (rel.get("description") or "").strip():
+        pair.description = rel["description"].strip()
+    pair.updated_at = datetime.utcnow()
+    return True
+
+
+@router.get("/import-profile-json/template")
+def get_import_profile_json_template():
+    """下载直接导入用的完整 JSON 模板（填好后上传到 /import-profile-json）。"""
+    return PROFILE_JSON_TEMPLATE
+
+
+@router.post("/import-profile-json")
+async def import_profile_json(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """按 JSON 直接导入人物档案：所见即所存，不走 AI 分析。
+    支持 {characters:[...], relationships:[...]} / 角色数组 / 单个角色对象三种形态。
+    同名（或别名命中）更新已有角色，否则新建；提供的字段覆盖，未提供的保持原样。"""
+    raw = await file.read()
+    try:
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        raise HTTPException(400, f"JSON 解析失败：{exc}")
+
+    if isinstance(data, dict) and isinstance(data.get("characters"), list):
+        char_items, rel_items = data["characters"], (data.get("relationships") or [])
+    elif isinstance(data, list):
+        char_items, rel_items = data, []
+    elif isinstance(data, dict) and (data.get("name") or "").strip():
+        char_items, rel_items = [data], []
+    else:
+        raise HTTPException(400, "JSON 结构不对：应为 {characters:[...], relationships:[...]}、角色数组、或单个角色对象")
+
+    created = updated = events_added = 0
+    name_to_char: dict[str, Character] = {}
+    details = []
+    for item in char_items:
+        if not isinstance(item, dict):
+            continue
+        char, is_new = _apply_direct_character(db, item)
+        if not char:
+            continue
+        db.flush()  # 拿到 char.id 供事件/关系引用
+        name_to_char[char.name] = char
+        if is_new:
+            created += 1
+        else:
+            updated += 1
+        ev_added = _apply_direct_events(db, char, item.get("events"))
+        events_added += ev_added
+        try:
+            graph_store.sync_character(char)
+        except Exception:
+            pass
+        details.append({"name": char.name, "id": char.id, "action": "created" if is_new else "updated", "events_added": ev_added})
+
+    rel_added = sum(
+        1 for rel in rel_items
+        if isinstance(rel, dict) and _apply_direct_relationship(db, rel, name_to_char)
+    )
+    db.commit()
+    if not details:
+        raise HTTPException(400, "未解析到任何有效角色（每个角色至少需要 name 字段）")
+    return {
+        "ok": True,
+        "characters_created": created,
+        "characters_updated": updated,
+        "events_added": events_added,
+        "relationships_added": rel_added,
+        "details": details,
+    }
 
 
 def _build_snapshot_payload(char: Character) -> dict[str, Any]:
@@ -1126,6 +1450,66 @@ def _coerce_observation_value(field: str, value: str) -> Any:
 
 def _split_speaking_style_tags(value: str) -> list[str]:
     return [item.strip() for item in (value or "").replace("/", "、").replace(",", "、").split("、") if item.strip()]
+
+
+# ── 方向2：行为模式派生（从人际模式 + 互动 strategy 聚合，只读展示，不落库、不计完整度）──
+_DERIVED_MAX_PER_CATEGORY = 6
+
+
+def _norm_label(text: str) -> str:
+    return "".join((text or "").split())[:60]
+
+
+def _character_interaction_units(db: Session, char: Character, limit: int = 300) -> list:
+    """取该角色（含别名）作为发言者的交互单元——行为模式的 strategy 原料。"""
+    names = [char.name] + list(char.aliases or [])
+    return db.query(InteractionUnit).filter(InteractionUnit.speaker.in_(names)).limit(limit).all()
+
+
+def _derive_behavior_patterns(profile_json: dict, strategy_units: list[dict]) -> dict[str, list]:
+    """从「人际模式」立体维度 + 互动 strategy 聚合出行为模式分组。每条标 derived=True、注明来源。"""
+    groups: dict[str, list] = {"攻击型行为": [], "防御型行为": [], "互动策略": []}
+    seen: set[str] = set()
+
+    def _add(label: str, category: str, source: str, evidence: str, confidence: float, example: str = "") -> None:
+        key = _norm_label(label)
+        if not key or len(key) < 2 or key in seen:
+            return
+        seen.add(key)
+        groups.setdefault(category, [])
+        groups[category].append({
+            "label": label[:60],
+            "source": source,
+            "evidence": (evidence or "")[:200] or None,
+            "confidence": round(float(confidence), 2),
+            "trigger": None,
+            "example": (example or "")[:80] or None,
+            "derived": True,
+        })
+
+    # 1) 人际模式 → 行为模式（兼容裸串 / {context,pattern} / 规范 {content}）
+    for item in (profile_json or {}).get("interpersonal_patterns") or []:
+        text = fact_content(item)
+        if not text:
+            continue
+        _add(text, classify_behavior_pattern_category(text), "派生·人际模式", text, fact_confidence(item) or 0.6)
+
+    # 2) 互动 strategy 聚合 → 重复出现即一种稳定行为模式
+    counter: dict[str, int] = {}
+    sample: dict[str, str] = {}
+    for unit in strategy_units:
+        strategy = (unit.get("strategy") or "").strip()
+        if not strategy:
+            continue
+        counter[strategy] = counter.get(strategy, 0) + 1
+        sample.setdefault(strategy, (unit.get("content") or "").strip())
+    for strategy, count in sorted(counter.items(), key=lambda kv: kv[1], reverse=True):
+        category = classify_behavior_pattern_category(f"{strategy} {sample.get(strategy, '')}")
+        _add(strategy, category, "派生·互动策略", f"对话中出现 {count} 次", min(0.95, 0.5 + count * 0.1), sample.get(strategy, ""))
+
+    for key in groups:
+        groups[key] = groups[key][:_DERIVED_MAX_PER_CATEGORY]
+    return groups
 
 
 def _build_profile_view(
@@ -2574,6 +2958,7 @@ def get_character_profile_view(char_id: int, db: Session = Depends(get_db)):
         CharacterObservation.created_at.desc()
     ).all()
     result = _build_profile_view(char, relationships, events, observations)
+    # 完整度只算真实观察（手填/导入落库的），派生项不计入，避免虚高
     behavior_count = sum(len(items) for items in (result.get("behavior_patterns") or {}).values())
     result["completeness"] = profile_completeness(
         char,
@@ -2581,6 +2966,20 @@ def get_character_profile_view(char_id: int, db: Session = Depends(get_db)):
         relationship_count=len(relationships),
         event_count=len(events),
     )
+    # 方向2：行为模式从人际模式 + 互动 strategy 派生补充（只读展示），让各种来源的角色都不再空白
+    strategy_units = [{"strategy": u.strategy, "content": u.content} for u in _character_interaction_units(db, char)]
+    derived_groups = _derive_behavior_patterns(char.profile_json or {}, strategy_units)
+    existing_labels = {
+        _norm_label(item.get("label"))
+        for items in (result.get("behavior_patterns") or {}).values()
+        for item in items
+    }
+    for category, items in derived_groups.items():
+        bucket = result["behavior_patterns"].setdefault(category, [])
+        for item in items:
+            if _norm_label(item.get("label")) not in existing_labels:
+                bucket.append(item)
+                existing_labels.add(_norm_label(item.get("label")))
     # 扩展人物模型（八维度）与进行中的特质假设
     result["extended_profile"] = char.profile_json or {}
     active_hypotheses = db.query(TraitHypothesis).filter(

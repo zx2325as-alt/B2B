@@ -39,15 +39,12 @@ def _promote_to_profile(db: Session, char: Character, hypothesis: TraitHypothesi
     """假设转正：写入扩展档案对应维度；非档案维度沉淀为诊断记忆"""
     dimension = (hypothesis.dimension or "").strip()
     if dimension in _PROMOTABLE_DIMENSIONS:
-        entry: Any = hypothesis.hypothesis
-        if dimension == "fears":
-            entry = {"content": hypothesis.hypothesis}
-        elif dimension == "desires":
-            entry = {"surface": "", "deep": hypothesis.hypothesis}
-        elif dimension == "interpersonal_patterns":
-            entry = {"context": "", "pattern": hypothesis.hypothesis}
-        elif dimension == "contradictions":
-            entry = {"side_a": "", "side_b": "", "interpretation": hypothesis.hypothesis}
+        # 直接写规范形态：内容 + 假设的置信 + 支撑证据 + 时间（merge 会保留这些）
+        entry: Any = {
+            "content": hypothesis.hypothesis,
+            "confidence": round(float(hypothesis.confidence or 0.8), 2),
+            "evidence_ids": list(hypothesis.supporting_evidence_ids or []),
+        }
         merged, added = merge_extended_profile(char.profile_json, {dimension: [entry]})
         if added:
             char.profile_json = merged

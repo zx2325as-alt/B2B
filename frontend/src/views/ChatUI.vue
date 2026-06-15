@@ -128,6 +128,12 @@
                         <div v-if="cpEvidence(msg)" class="duo-evidence">依据：“{{ cpEvidence(msg) }}”</div>
                         <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
                         <span v-if="cpConfidence(msg) !== null" class="tag" :class="confClass(cpConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(cpConfidence(msg)) }}</span>
+                        <!-- 阶段5：LLM 复核员结论 -->
+                        <div v-if="cpCritic(msg)" class="critic-box">
+                          <span class="tag" :class="criticClass(cpCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(cpCritic(msg).verdict) }}</span>
+                          <div v-for="(iss, i) in cpCritic(msg).issues" :key="`cri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
+                          <div v-if="cpCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ cpCritic(msg).revised_subtext }}</div>
+                        </div>
                       </div>
                       <div class="duo-col action">
                         <div class="duo-head">行动 · 我该怎么接</div>
@@ -188,13 +194,24 @@
                     <button class="btn btn-ghost reply-use-btn" @click="useSuggestedReply(curUserPersp(msg))" title="以该角色身份采用这句回答">采用</button>
                   </div>
                   </template>
-                  <button
-                    class="btn btn-ghost"
-                    style="align-self:flex-start;font-size:11px;padding:4px 10px;margin-top:4px"
-                    @click="reanalyzeUserMessage(msg)"
-                  >
-                    重新分析
-                  </button>
+                  <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+                    <button
+                      class="btn btn-ghost"
+                      style="font-size:11px;padding:4px 10px"
+                      @click="reanalyzeUserMessage(msg)"
+                    >
+                      重新分析
+                    </button>
+                    <button
+                      class="btn btn-ghost"
+                      style="font-size:11px;padding:4px 10px"
+                      :disabled="critiquingIds.has(msg.id)"
+                      title="让 AI 复核员逐视角审查是否过度推断，把脑补的判断下调为推测"
+                      @click="critiqueUserMessage(msg)"
+                    >
+                      {{ critiquingIds.has(msg.id) ? '复核中…' : '🔍 核验' }}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -353,6 +370,11 @@
             <option value="">未指定</option>
             <option v-for="role in activeRoles" :key="`self-${role.name}`" :value="role.name">{{ role.name }}</option>
           </select>
+          <template v-if="isSelfMode">
+            <span class="label" style="margin:0 0 0 8px" title="设定你跟对方想达成的目标，应对策略会围绕它排序">目标：</span>
+            <input class="input receiver-select" style="max-width:180px" :value="currentConversation?.goal || ''"
+              @change="setGoal($event.target.value)" placeholder="如：争取合作/缓和/婉拒…" title="我跟对方想达成的目标" />
+          </template>
           <template v-if="receiverOptions.length > 1">
             <span class="label" style="margin:0 0 0 8px">对谁说：</span>
             <select class="input receiver-select" v-model="currentReceiver" title="为空时由 AI 自动判定主要接收方">
@@ -850,6 +872,32 @@ async function reanalyzeUserMessage(msg) {
     toast.success('已重新分析')
   } catch { /* 错误已由拦截器提示 */ }
 }
+// 阶段5：LLM 复核员（critic-revise）——对这条已存分析逐视角审过度推断，下调置信、标推测
+const critiquingIds = ref(new Set())
+async function critiqueUserMessage(msg) {
+  if (critiquingIds.value.has(msg.id)) return
+  critiquingIds.value = new Set(critiquingIds.value).add(msg.id)
+  try {
+    const res = await chatApi.critiqueAnalysis(msg.id)
+    await chat.loadMessages(chat.activeConvId)
+    const flagged = res.data?.flagged_count || 0
+    toast[flagged ? 'info' : 'success'](
+      flagged ? `复核完成：${flagged} 处判断过度推断，已下调置信` : '复核完成：各视角判断均有原文支撑'
+    )
+  } catch (e) {
+    toast.error('复核失败：' + (e?.response?.data?.detail || e?.message || ''))
+  } finally {
+    const next = new Set(critiquingIds.value); next.delete(msg.id); critiquingIds.value = next
+  }
+}
+// 读取某视角的 critic 复核结果（无则 null）
+function perspCritic(persp) {
+  const c = persp?.analysis_json?.critic
+  return (c && (c.issues?.length || c.verdict)) ? c : null
+}
+function cpCritic(msg) { return perspCritic(cpPersp(msg)) }
+function criticClass(v) { return ({ approved: 'green', softened: 'amber', downgraded: 'red' })[v] || '' }
+function criticLabel(v) { return ({ approved: '已复核 · 站得住', softened: '已复核 · 已收敛措辞', downgraded: '已复核 · 过度推断已下调' })[v] || '已复核' }
 // 采用某视角的建议回答：切到该角色身份，并把建议回答填进输入框（用户可改后发送）
 function useSuggestedReply(persp) {
   if (!persp?.suggested_reply) return
@@ -918,6 +966,16 @@ async function setSelfName(name) {
     toast.success(name ? `已设定「${name}」为我；对方发言将给出我的应对建议` : '已取消「我」的指定')
   } catch { /* 拦截器已提示 */ }
 }
+// 设定「我的目标」——应对策略 moves 会围绕它排序，预演也按它评估达成率
+async function setGoal(val) {
+  if (!chat.activeConvId) return
+  try {
+    const res = await chatApi.updateConversation(chat.activeConvId, { goal: val || '' })
+    const conv = chat.conversations.find(c => c.id === chat.activeConvId)
+    if (conv) Object.assign(conv, res.data)
+    if ((val || '').trim()) toast.info('目标已设定，后续应对会围绕它排序')
+  } catch { /* 拦截器已提示 */ }
+}
 // 为导入/历史会话里「对方」的每句发言批量生成洞察‖行动（分批续跑直到完成）
 const advising = ref(false)
 const adviceRemaining = ref(0)
@@ -953,9 +1011,13 @@ const counterpartChar = computed(() => chars.characters.find(c => c.name === cou
 function cpDimText(key) {
   const arr = counterpartChar.value?.profile_json?.[key]
   if (!Array.isArray(arr) || !arr.length) return ''
+  const META = ['content', 'confidence', 'evidence_ids', 'updated_at']
   return arr.slice(0, 3).map(it => {
     if (typeof it === 'string') return it
-    if (it && typeof it === 'object') return Object.values(it).filter(Boolean).join('：')
+    if (it && typeof it === 'object') {
+      if (it.content) return it.content   // 新规范形态
+      return Object.entries(it).filter(([k, v]) => v && !META.includes(k)).map(([, v]) => v).join('：')
+    }
     return String(it)
   }).filter(Boolean).join('；')
 }
@@ -1709,6 +1771,11 @@ function scrollToMessage(messageId) {
 .move-label { flex:1; font-size:11px; font-family:var(--font-mono); color:var(--cyan); }
 .move-reply { font-size:13px; color:var(--text-primary); line-height:1.6; }
 .move-conseq { font-size:11px; color:var(--text-muted); line-height:1.5; }
+
+/* 阶段5：LLM 复核员（critic-revise） */
+.critic-box { display:flex; flex-direction:column; gap:4px; margin-top:6px; padding:6px 8px; border-radius:4px; border-left:2px solid var(--amber, #f59e0b); background:rgba(245,158,11,.06); }
+.critic-issue { font-size:11px; color:var(--text-secondary); line-height:1.5; }
+.critic-revised { font-size:11px; color:var(--text-primary); line-height:1.5; font-style:italic; }
 
 /* 阶段3：实时军师快捷输入 */
 .advisor-box { margin-bottom:10px; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--cyan-dim); }

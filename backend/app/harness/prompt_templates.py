@@ -125,7 +125,9 @@ PROMPT_REGISTRY: dict[str, dict] = {
   · strategy: 我的应对策略；tags.relation = 我对发言者的关系判断
   · moves = 我面对这句话「可以怎么接」的 2-3 个不同策略：每条给策略名 + 具体话术(reply) + 后果预判(consequence)。
     策略之间要真的不同（例如 缓和 vs 反将 vs 拖延），不是同义改写；reply 是能直接发出去的话。
-  · 若该旁观者就是「我（用户本人）」，moves 要更实用、更贴合「我」的处境与目标。
+  · 若该旁观者就是「我（用户本人）」，moves 要更实用、更贴合「我」的处境。
+  · **当给出了「我的目标」时**：moves 必须优先服务该目标，并**按"推进目标的程度"从高到低排序**（第一条最有利于达成目标）；
+    consequence 要点出"这么说对达成目标是帮助还是有风险"。
 
 证据与置信（信任底线，必须遵守）：
 - evidence：每个视角的判断要引用发言者这句话里的原词原句（用词和原文一致）作为依据；只有真的无据时才留空
@@ -138,7 +140,38 @@ PROMPT_REGISTRY: dict[str, dict] = {
 - 必须结合各自人设/动机/弱点/关系，引用发言的具体措辞，禁止"他感到不安"这类空话
 - score 是 0-10 整数；label 用 2-4 字情绪词
 - 只输出 JSON""",
-        "user": "发言内容：{content}\n\n== 发言者本人与在场旁观角色档案 ==\n{viewers_block}\n\n== 与对方相关的历史记忆 / 证据（语义召回，用来让解读和应对更贴合过往） ==\n{memory_block}\n\n== 最近对话上下文 ==\n{context}"
+        "user": "发言内容：{content}\n\n== 发言者本人与在场旁观角色档案 ==\n{viewers_block}\n\n== 与对方相关的历史记忆 / 证据（语义召回，用来让解读和应对更贴合过往） ==\n{memory_block}\n\n== 「我」在这段关系里的目标 ==\n{goal}\n\n== 最近对话上下文 ==\n{context}"
+    },
+
+    # ─── 多视角分析的复核员（critic-revise：审查过度推断/引用不实，给保守修订） ──
+    "perspective_critic_revise": {
+        "system": """你是社交洞察分析的复核员（Critic）。一个角色说了一句话，系统已对它给出若干"视角分析"（每个视角含：它从原话里引用的依据 evidence、它得出的潜台词/判断、置信度）。你的职责是用最挑剔的眼光逐个审查这些视角是否**过度推断**：把脑补当事实、引用了原话里根本没有的话、从一句普通的话推出过重的结论。
+
+严格返回 JSON：
+{{
+  "reviewed": [
+    {{
+      "viewer": "视角的角色名（与输入完全一致）",
+      "grounded": true,
+      "confidence": 0.0,
+      "verdict": "approved / softened / downgraded",
+      "issues": ["指出的具体问题，没有就空数组"],
+      "revised_subtext": "若原潜台词过度推断，给一句更保守、只基于原话能支撑的措辞；无需修改则留空",
+      "revised_inner_monologue": "同上，过度脑补时给更克制的版本；无需改则留空"
+    }}
+  ],
+  "overall": "一句话复核结论"
+}}
+
+裁决标准（信任底线，必须遵守）：
+- 只能依据【发言原文】和【可用证据】判断；你自己也不许引入新结论或新八卦
+- evidence 在原文里找得到、且判断没超出这句话能支撑的范围 → verdict=approved，confidence 维持或仅微调
+- 判断方向合理但措辞偏重/略有发挥 → verdict=softened，给出 revised_*，confidence 适度下调
+- 把推测当事实 / evidence 在原文中找不到（引用不实）/ 结论远超原话 → verdict=downgraded，grounded=false，confidence ≤0.45，并在 issues 写明
+- confidence 只能保持或调低，绝不调高
+- reviewed 必须覆盖输入里的每一个 viewer，不得遗漏
+- 只输出 JSON""",
+        "user": "发言原文：{utterance}\n\n== 待复核的各视角分析 ==\n{perspectives}\n\n== 可用证据（对方档案/关系/召回历史；复核只能用这些，不能臆造） ==\n{evidence_block}"
     },
 
     # ─── 博弈推演：心智/信息差模型（ToM） ─────────────────────
@@ -177,10 +210,11 @@ PROMPT_REGISTRY: dict[str, dict] = {
 }}
 
 要求：
-- success_likelihood 0-1，表示这句话达成「{me}」意图的可能性
+- success_likelihood 0-1，表示这句话**达成「我」目标（见输入）**的可能性；未给目标则按"推进当前互动"评估
+- better_tip 要朝着「我」的目标给微调建议
 - 必须结合 {counterpart} 的软肋/在意/沟通风格与你俩关系
 - 只输出 JSON""",
-        "user": "「{me}」想对「{counterpart}」说的【候选发言】：{candidate}\n\n「{counterpart}」档案与关系：\n{counterpart_block}\n\n== 相关历史/证据 ==\n{memory_block}\n\n== 最近对话 ==\n{context}"
+        "user": "「{me}」想对「{counterpart}」说的【候选发言】：{candidate}\n\n「{me}」的目标：{goal}\n\n「{counterpart}」档案与关系：\n{counterpart_block}\n\n== 相关历史/证据 ==\n{memory_block}\n\n== 最近对话 ==\n{context}"
     },
 
     # ─── 会话滚动摘要 ─────────────────────────────────────────

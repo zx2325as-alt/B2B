@@ -286,6 +286,7 @@ class ConversationUpdate(BaseModel):
     scenario: Optional[str] = None
     scene_brief: Optional[str] = None
     self_name: Optional[str] = None
+    goal: Optional[str] = None
     participants: Optional[list[ActiveCharacter]] = None
 
 class MessageOut(BaseModel):
