@@ -97,14 +97,14 @@ ai:
         medium: "deepseek-chat"
         complex: "deepseek-chat"
 
-# 可选向量检索（默认关闭）：配置任意 OpenAI 兼容 embedding 服务后开启，
-# 记忆写入时计算向量、检索时按余弦相似度参与打分（DeepSeek 无 embedding API，
-# 可用 SiliconFlow bge-m3 等免费服务）
+# 向量语义检索：记忆写入时算向量、检索时按余弦相似度参与打分。
+# DeepSeek 无 embedding API，这里用任意 OpenAI 兼容 embedding 服务（默认 SiliconFlow bge-m3）。
+# api_key 放在 config.local.yaml（不入库）；留空时自动静默回退到字面检索，零影响。
 embedding:
-  enabled: false
-  base_url: ""
+  enabled: true
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   api_key: ""
-  model: "BAAI/bge-m3"
+  model: "text-embedding-v4"
 
 graph:
   # Neo4j 图谱层（start.bat 会随项目启动 Neo4j；如不需要可改为 false，系统自动降级为纯 SQLite）

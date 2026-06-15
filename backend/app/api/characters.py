@@ -545,6 +545,35 @@ def _create_memory_item(
     return memory
 
 
+@router.post("/maintenance/backfill-embeddings")
+def backfill_embeddings(limit: int = 500, db: Session = Depends(get_db)):
+    """给历史上没有向量的记忆补算 embedding（开启向量检索后运行一次即可）。
+    分批处理，返回本批补了多少、还剩多少，可重复调用直到 remaining=0。"""
+    from ..harness.embeddings import embed_text, embedding_enabled
+    if not embedding_enabled():
+        return {
+            "ok": False,
+            "reason": "embedding 未启用：检查 config 的 embedding.enabled / base_url / api_key / model",
+            "updated": 0,
+            "remaining": db.query(MemoryItem).filter(MemoryItem.embedding.is_(None)).count(),
+        }
+    rows = (
+        db.query(MemoryItem)
+        .filter(MemoryItem.embedding.is_(None), MemoryItem.status == "active")
+        .limit(max(1, min(limit, 2000)))
+        .all()
+    )
+    updated = 0
+    for memory in rows:
+        vector = embed_text((memory.content or "")[:2000])
+        if vector:
+            memory.embedding = vector
+            updated += 1
+    db.commit()
+    remaining = db.query(MemoryItem).filter(MemoryItem.embedding.is_(None), MemoryItem.status == "active").count()
+    return {"ok": True, "updated": updated, "remaining": remaining}
+
+
 def _build_snapshot_payload(char: Character) -> dict[str, Any]:
     return {
         "basic_info": {
@@ -2113,6 +2142,7 @@ async def _process_import_commit_inner(import_file_id: int, payload: dict[str, A
             conversation = Conversation(
                 title=f"只读导入 · {body.filename}",
                 scenario=body.scenario,
+                self_name=(body.self_name or "").strip()[:100],
                 is_readonly=True,
                 source_import_file_id=import_file.id,
             )

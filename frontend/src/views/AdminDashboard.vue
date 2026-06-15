@@ -743,6 +743,22 @@
                 </div>
               </div>
 
+              <!-- 真实聊天导入：标记「我是谁」（决定后续分析为谁服务） -->
+              <div v-if="(importPreview.speakers || []).length >= 2" class="card" style="padding:14px 16px;margin-bottom:12px">
+                <div class="obs-field">这段聊天里，哪个是「我」（你本人）？</div>
+                <div class="obs-reason" style="margin:4px 0 10px">选中后，另一方会被建模为你要洞察的「对方」，分析将围绕“他什么意思 / 我该怎么接”展开。</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button v-for="sp in importPreview.speakers" :key="sp.name" type="button"
+                    class="btn" :class="importOptions.self_name === sp.name ? 'btn-primary' : 'btn-ghost'"
+                    style="font-size:12px;padding:6px 14px"
+                    @click="importOptions.self_name = sp.name">
+                    {{ sp.name }} · {{ sp.count }}条
+                  </button>
+                  <button type="button" class="btn" :class="!importOptions.self_name ? 'btn-primary' : 'btn-ghost'"
+                    style="font-size:12px;padding:6px 14px" @click="importOptions.self_name = ''">都不是 / 暂不指定</button>
+                </div>
+              </div>
+
               <!-- 写入选项 + 提交 -->
               <div class="card" style="padding:14px 16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
                 <label class="check-row"><input type="checkbox" v-model="importOptions.create_readonly_conversation"/> 生成只读会话</label>
@@ -858,6 +874,7 @@ const importOptions = ref({
   scenario: 'general',
   create_readonly_conversation: true,
   auto_archive: true,
+  self_name: '',   // 真实聊天导入时标记哪一方是「我」
 })
 const importFailureCount = computed(() => {
   const failures = importResult.value?.failures || {}
@@ -1425,6 +1442,7 @@ async function previewImport() {
     formData.append('file', selectedImportFile.value)
     const res = await characterApi.previewImport(formData)
     importPreview.value = res.data
+    importOptions.value.self_name = ''   // 新预览：重置「我是谁」，由用户重新指定
     importResult.value = null
     importNotice.value = res.data?.warning_message || ''
     importPreviewPending.value = res.data?.preview_status === 'preview_processing'
@@ -1457,6 +1475,7 @@ async function commitImport() {
       file_type: importPreview.value.detected_type || 'dialogue',
       import_file_id: importPreview.value.import_file_id,
       scenario: importOptions.value.scenario,
+      self_name: importOptions.value.self_name || '',
       create_readonly_conversation: importOptions.value.create_readonly_conversation,
       auto_archive: importOptions.value.auto_archive,
       preview_payload: importPreview.value,

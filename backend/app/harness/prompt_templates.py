@@ -93,7 +93,13 @@ PROMPT_REGISTRY: dict[str, dict] = {
     {{
       "viewer": "角色名（与输入给出的名字完全一致）",
       "stance": "speaker 或 observer",
-      "reply": "仅当 stance=observer 时填：我（旁观者）听完这句话后会怎么回应（一句自然的话，符合我的人设）。stance=speaker 时留空",
+      "evidence": "引用发言者原话里的关键片段（要和原文用词一致），作为本视角判断的依据；确实无据可引则留空",
+      "confidence": 0.0,
+      "grounded": true,
+      "reply": "仅当 stance=observer 时填：我听完这句话后最推荐的一句回应（= moves 里你最推荐的那条话术）。stance=speaker 时留空",
+      "moves": [
+        {{"label": "策略名（如：正面回应/缓和情绪/反将一军/先拖延）", "reply": "采取该策略时我会说的具体话术", "consequence": "我这么说，对方大概会有什么反应"}}
+      ],
       "inner_monologue": {{"first_reaction": "...", "defense": "...", "tendency": "..."}},
       "emotions": {{
         "intended":   {{"label": "情绪", "score": 0}},
@@ -117,6 +123,14 @@ PROMPT_REGISTRY: dict[str, dict] = {
   · inner_monologue = 我（旁观者）的第一反应 / 防御 / 打算
   · emotions: intended=发言者想在我身上激发的, surface/deep/suppressed=我的各层情绪
   · strategy: 我的应对策略；tags.relation = 我对发言者的关系判断
+  · moves = 我面对这句话「可以怎么接」的 2-3 个不同策略：每条给策略名 + 具体话术(reply) + 后果预判(consequence)。
+    策略之间要真的不同（例如 缓和 vs 反将 vs 拖延），不是同义改写；reply 是能直接发出去的话。
+  · 若该旁观者就是「我（用户本人）」，moves 要更实用、更贴合「我」的处境与目标。
+
+证据与置信（信任底线，必须遵守）：
+- evidence：每个视角的判断要引用发言者这句话里的原词原句（用词和原文一致）作为依据；只有真的无据时才留空
+- grounded：true/false。你的解读若有发言原文的直接支撑就 true；属于合理推断但无直接原文支撑则 false
+- confidence：0-1，表示你对该判断的把握。grounded=false 时 confidence 必须 ≤0.5；不要把脑补硬编成高分
 
 硬性要求：
 - perspectives 第一个必须是发言者本人(stance=speaker)，其后是输入"在场旁观角色"里的每一个(stance=observer)，全部覆盖
@@ -124,7 +138,49 @@ PROMPT_REGISTRY: dict[str, dict] = {
 - 必须结合各自人设/动机/弱点/关系，引用发言的具体措辞，禁止"他感到不安"这类空话
 - score 是 0-10 整数；label 用 2-4 字情绪词
 - 只输出 JSON""",
-        "user": "发言内容：{content}\n\n== 发言者本人与在场旁观角色档案 ==\n{viewers_block}\n\n== 最近对话上下文 ==\n{context}"
+        "user": "发言内容：{content}\n\n== 发言者本人与在场旁观角色档案 ==\n{viewers_block}\n\n== 与对方相关的历史记忆 / 证据（语义召回，用来让解读和应对更贴合过往） ==\n{memory_block}\n\n== 最近对话上下文 ==\n{context}"
+    },
+
+    # ─── 博弈推演：心智/信息差模型（ToM） ─────────────────────
+    "theory_of_mind": {
+        "system": """你在帮「{me}」做社交博弈推演。基于下面这段真实对话和「{counterpart}」的档案，推断 {counterpart} 此刻的"心智状态"——他知道什么、不知道什么、可能在隐瞒什么、对「{me}」抱有哪些假设。
+
+严格返回 JSON：
+{{
+  "knows": ["他（基于对话）已经知道的关键事实/信息，每条简短"],
+  "unaware": ["他还不知道、或可能误以为的事"],
+  "hiding": ["他可能在回避或隐瞒的真实想法/意图"],
+  "assumes": ["他对「{me}」抱有的假设或预期"],
+  "info_edge": "「{me}」在这段关系里的信息优势或劣势（一句话）"
+}}
+
+要求：
+- 每条都要能从对话里找到依据，禁止空泛套话
+- knows/unaware/hiding/assumes 各 1-4 条，没有就给空数组
+- 只输出 JSON""",
+        "user": "「{counterpart}」档案：\n{counterpart_block}\n\n== 对话记录 ==\n{dialogue}"
+    },
+
+    # ─── 博弈推演：反事实预测（发出前预演） ───────────────────
+    "counterfactual_predict": {
+        "system": """你在帮「{me}」做"发出前预演"：如果「{me}」对「{counterpart}」说出下面这句【候选发言】，预测 {counterpart} 大概会怎么反应。基于 {counterpart} 的人设/心理/关系/历史，给贴合其人设的真实预测，不要泛泛而谈。
+
+严格返回 JSON：
+{{
+  "predicted_reply": "{counterpart} 很可能会怎么回（一句符合其人设的话）",
+  "reaction_type": "暖化 | 激化 | 回避 | 试探 | 无感 | 妥协 之一",
+  "inner_read": "他听到这句时心里大概在想什么",
+  "emotion": "他会被激起的主要情绪（2-4字）",
+  "success_likelihood": 0.0,
+  "risk": "这么说的主要风险（一句，没有则留空）",
+  "better_tip": "想更稳的话可以怎么微调（一句，可留空）"
+}}
+
+要求：
+- success_likelihood 0-1，表示这句话达成「{me}」意图的可能性
+- 必须结合 {counterpart} 的软肋/在意/沟通风格与你俩关系
+- 只输出 JSON""",
+        "user": "「{me}」想对「{counterpart}」说的【候选发言】：{candidate}\n\n「{counterpart}」档案与关系：\n{counterpart_block}\n\n== 相关历史/证据 ==\n{memory_block}\n\n== 最近对话 ==\n{context}"
     },
 
     # ─── 会话滚动摘要 ─────────────────────────────────────────

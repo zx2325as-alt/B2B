@@ -293,6 +293,8 @@ class Conversation(Base):
     scenario = Column(String(100), default="general")
     # 用户手写的场景背景说明（会注入分析上下文，聊天中可随时编辑）
     scene_brief = Column(Text, default="")
+    # 「我」在本对话中的称呼（导入真实聊天时标记哪一方是用户本人；为空表示未指定）
+    self_name = Column(String(100), default="")
     is_readonly = Column(Boolean, default=False)
     source_import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=True)
     active_branch_id = Column(String(80), nullable=True)

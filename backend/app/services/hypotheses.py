@@ -61,10 +61,12 @@ def _promote_to_profile(db: Session, char: Character, hypothesis: TraitHypothesi
         MemoryItem.status == "active",
     ).first()
     if not existing:
+        from ..harness.embeddings import embed_text
         db.add(MemoryItem(
             character_id=char.id,
             memory_type="diagnosis",
             content=hypothesis.hypothesis,
+            embedding=embed_text((hypothesis.hypothesis or "")[:2000]),
             confidence=hypothesis.confidence,
             evidence_ids=list(hypothesis.supporting_evidence_ids or []),
             source="假设转正",

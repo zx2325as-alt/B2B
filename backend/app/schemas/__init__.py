@@ -285,6 +285,7 @@ class ConversationUpdate(BaseModel):
     title: Optional[str] = None
     scenario: Optional[str] = None
     scene_brief: Optional[str] = None
+    self_name: Optional[str] = None
     participants: Optional[list[ActiveCharacter]] = None
 
 class MessageOut(BaseModel):
@@ -361,6 +362,8 @@ class ImportCommitRequest(BaseModel):
     file_type: str
     import_file_id: Optional[int] = None
     scenario: str = "general"
+    # 真实聊天导入时，标记哪一方是「我」（用户本人）；为空表示未指定
+    self_name: str = ""
     create_readonly_conversation: bool = False
     auto_archive: bool = True
     preview_payload: dict[str, Any]

@@ -473,9 +473,10 @@ def _render_character_block(char: Character | None, name: str, header: str, spea
     return "\n".join(parts)
 
 
-def _build_viewers_context(db: Session, speaker: str, listeners: list, primary_name: str) -> tuple[str, list[dict]]:
+def _build_viewers_context(db: Session, speaker: str, listeners: list, primary_name: str, self_name: str = "") -> tuple[str, list[dict]]:
     """
     构建多视角上下文：发言者本人（用于自述分析）+ 在场每个旁观角色（用于解读分析）。
+    self_name 给定时，把「我」本人这一旁观视角重点标出，让模型给出"我该怎么接"的多策略。
     返回 (viewers_block 文本, [{name, id} ...] 仅旁观者，用于 primary 判断)。
     """
     speaker_char = db.query(Character).filter(Character.name == speaker).first()
@@ -489,7 +490,12 @@ def _build_viewers_context(db: Session, speaker: str, listeners: list, primary_n
             continue
         char = db.get(Character, listener.id) if getattr(listener, "id", None) else db.query(Character).filter(Character.name == name).first()
         viewers.append({"name": name, "id": char.id if char else None})
-        header = "（主要接收方——会回应）" if name == primary_name else "（旁观者）"
+        if self_name and name == self_name:
+            header = "（这是「我」本人——请重点给出我该如何回应对方这句话的 2-3 个不同策略 moves）"
+        elif name == primary_name:
+            header = "（主要接收方——会回应）"
+        else:
+            header = "（旁观者）"
         blocks.append(_render_character_block(char, name, header, speaker_char, speaker, db))
     return "\n\n".join(blocks), viewers
 
@@ -507,10 +513,40 @@ def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: st
         is_primary = (stance == "observer" and viewer == primary_name)
         viewer_char = db.query(Character).filter(Character.name == viewer).first()
         emotions = persp.get("emotions") or {}
-        # 旁观者的建议回答：主要接收方用流式自然回复，其余用该视角自带的 reply
+        # 多策略应对：清洗成 [{label, reply, consequence}]
+        moves = []
+        for move in (persp.get("moves") or []):
+            if not isinstance(move, dict):
+                continue
+            reply_text = (move.get("reply") or "").strip()
+            if not reply_text:
+                continue
+            moves.append({
+                "label": (move.get("label") or "").strip()[:40],
+                "reply": reply_text[:500],
+                "consequence": (move.get("consequence") or "").strip()[:300],
+            })
+        # 旁观者的建议回答：主要接收方用流式自然回复；否则用该视角自带 reply，再退到首个策略话术
         suggested = ""
         if stance == "observer":
-            suggested = (primary_reply if is_primary and primary_reply else (persp.get("reply") or "")).strip()
+            suggested = (
+                primary_reply if is_primary and primary_reply
+                else (persp.get("reply") or (moves[0]["reply"] if moves else ""))
+            ).strip()
+        # ── 自评-修订：确定性接地核查（信任底线）──
+        # 证据必须真出现在发言原文里，否则判为「推测」、置信封顶 0.45，不靠模型自觉
+        evidence = (persp.get("evidence") or "").strip()
+        raw_conf = persp.get("confidence")
+        confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) else None
+        _drop = " \t\r\n，。！？、；：…·（）()—-~～!?,.:;\"'“”‘’"
+        _strip = lambda s: "".join(c for c in (s or "") if c not in _drop)
+        utter_norm = _strip(user_msg.content)
+        ev_norm = _strip(evidence)
+        grounded = bool(ev_norm) and len(ev_norm) >= 2 and ev_norm in utter_norm
+        if persp.get("grounded") is False:
+            grounded = False
+        if not grounded and confidence is not None:
+            confidence = min(confidence, 0.45)
         db.add(MessagePerspective(
             conversation_id=conv_id,
             message_id=user_msg.id,
@@ -530,6 +566,10 @@ def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: st
                 "strategy": persp.get("strategy"),
                 "tags": persp.get("tags"),
                 "inner_monologue": persp.get("inner_monologue"),
+                "moves": moves,
+                "evidence": evidence[:300],
+                "confidence": confidence,
+                "grounded": grounded,
             },
         ))
         saved += 1
@@ -806,6 +846,7 @@ def _conversation_payload(c: Conversation) -> dict:
         "title": c.title,
         "scenario": c.scenario,
         "scene_brief": getattr(c, "scene_brief", "") or "",
+        "self_name": getattr(c, "self_name", "") or "",
         "updated_at": c.updated_at,
         "is_readonly": bool(getattr(c, "is_readonly", False)),
         "source_import_file_id": getattr(c, "source_import_file_id", None),
@@ -841,6 +882,8 @@ def update_conversation(conv_id: int, body: ConversationUpdate, db: Session = De
         conv.scenario = body.scenario.strip()[:100]
     if body.scene_brief is not None:
         conv.scene_brief = body.scene_brief.strip()[:2000]
+    if body.self_name is not None:
+        conv.self_name = body.self_name.strip()[:100]
     if body.participants is not None:
         conv.participants = [
             {"id": item.id, "name": item.name.strip()}
@@ -1106,7 +1149,7 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
     speaker_char = db.query(Character).filter(Character.name == body.speaker).first()
     listener_char = db.get(Character, primary_listener.id) if primary_listener and getattr(primary_listener, "id", None) else None
     primary_name = getattr(primary_listener, "name", "") if primary_listener else ""
-    viewers_block, _viewers = _build_viewers_context(db, body.speaker, listeners, primary_name)
+    viewers_block, _viewers = _build_viewers_context(db, body.speaker, listeners, primary_name, getattr(conv, "self_name", "") or "")
     evidence_pack = build_evidence_pack(
         db,
         query_text=body.content,
@@ -1217,10 +1260,17 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
         Message.character_name.isnot(None),
     ).distinct().all()
     active_characters = []
+    seen_names = set()
     for row in participant_rows:
         char_name = row[0]
         char = db.query(Character).filter(Character.name == char_name).first()
         active_characters.append(type("ActiveCharacter", (), {"id": char.id if char else None, "name": char_name}))
+        seen_names.add(char_name)
+    # 「我」即便此前还没发过言，也必须作为旁观者在场，否则对方发言拿不到「我该怎么接」
+    self_nm = (getattr(conv, "self_name", "") or "").strip()
+    if self_nm and self_nm not in seen_names and self_nm != (message.character_name or ""):
+        self_char = db.query(Character).filter(Character.name == self_nm).first()
+        active_characters.append(type("ActiveCharacter", (), {"id": self_char.id if self_char else None, "name": self_nm}))
 
     listeners, primary_listener = _select_primary_listener(
         db,
@@ -1238,7 +1288,7 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
     speaker_char = db.query(Character).filter(Character.name == (message.character_name or "")).first()
     listener_char = db.get(Character, primary_listener.id) if primary_listener and getattr(primary_listener, "id", None) else None
     primary_name = getattr(primary_listener, "name", "") if primary_listener else ""
-    viewers_block, _viewers = _build_viewers_context(db, message.character_name or "", listeners, primary_name)
+    viewers_block, _viewers = _build_viewers_context(db, message.character_name or "", listeners, primary_name, getattr(conv, "self_name", "") or "")
     evidence_pack = build_evidence_pack(
         db,
         query_text=message.content,
@@ -1310,6 +1360,39 @@ async def reanalyze_message(message_id: int, db: Session = Depends(get_db)):
     if not message or message.role != "user":
         raise HTTPException(404, "消息不存在")
     return await _reanalyze_user_message(db, message)
+
+
+@router.post("/conversations/{conv_id}/generate-advice")
+async def generate_conversation_advice(conv_id: int, limit: int = 8, db: Session = Depends(get_db)):
+    """为「对方」的每句发言批量生成「洞察(他) ‖ 行动(我)」多视角分析（导入的真实聊天用）。
+    需先指定 self_name；分批处理、可重复调用直到 remaining=0。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    self_name = (getattr(conv, "self_name", "") or "").strip()
+    if not self_name:
+        raise HTTPException(400, "请先指定「我」是谁，才能生成应对建议")
+
+    done_ids = {
+        row[0] for row in db.query(MessagePerspective.message_id)
+        .filter(MessagePerspective.conversation_id == conv_id).distinct().all()
+    }
+    pending = [
+        m for m in _visible_messages_query(db, conv)
+        .filter(Message.role == "user")
+        .order_by(Message.message_index, Message.created_at, Message.id).all()
+        if (m.character_name or "").strip() and m.character_name != self_name and m.id not in done_ids
+    ]
+    batch = pending[:max(1, min(limit, 30))]
+    generated = 0
+    for message in batch:
+        try:
+            await _reanalyze_user_message(db, message)
+            generated += 1
+        except Exception:
+            db.rollback()
+    remaining = max(0, len(pending) - generated)
+    return {"ok": True, "generated": generated, "remaining": remaining, "self_name": self_name}
 
 
 @router.put("/messages/{message_id}", response_model=MessageOut)
@@ -1442,6 +1525,162 @@ async def get_emotion_curve(conv_id: int, character_name: str, db: Session = Dep
     msg_texts = [m.content for m in messages]
     result = await orchestrator.analyze_emotion_curve(character_name, msg_texts)
     return result
+
+
+# 关系维度推导用的情绪/策略词典（确定性映射，透明可查）
+_REL_WARM = {"信任","亲近","安心","依恋","喜悦","放松","温暖","感激","亲密","信赖","欣慰","期待","开心","愉快","亲昵","关心","眷恋"}
+_REL_GUARD = {"警惕","怀疑","防御","不安","焦虑","恐惧","愤怒","失望","冷漠","戒备","敌意","委屈","尴尬","不满","紧张","烦躁","抗拒","厌烦","疏离"}
+_REL_PUSH = ("施压","主导","质问","逼问","逼迫","命令","挑衅","试探","反将","掌控","压制","要求","催促","质疑","追问","摊牌")
+_REL_YIELD = ("退让","讨好","迎合","妥协","回避","拖延","顺从","示弱","安抚","解释","赔笑","转移")
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+@router.get("/conversations/{conv_id}/relationship-trajectory")
+def get_relationship_trajectory(conv_id: int, source: str, target: str, db: Session = Depends(get_db)):
+    """关系多维走势（信任/亲密/主动权/张力随对话推进）+ 转折点。
+    不调用 LLM——从已存的逐句结构化分析里确定性推导，透明可复核。
+    主动权(dominance) 取 source 相对 target 的主动权（0.5=对等）。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    analysis_messages = _visible_messages_query(db, conv).filter(
+        Message.role == "assistant",
+        Message.parent_id.isnot(None),
+    ).order_by(Message.message_index, Message.created_at, Message.id).all()
+
+    pair = {source, target}
+    trust, intimacy, tension, dominance = 0.5, 0.45, 0.3, 0.5
+    points, turning = [], []
+    prev = None
+    for analysis in analysis_messages:
+        parent = db.get(Message, analysis.parent_id)
+        if not parent:
+            continue
+        speaker = (parent.character_name or "").strip()
+        receiver = (parent.receiver_name or "").strip()
+        # 只取这一对人之间的来回
+        if speaker not in pair or (receiver and receiver not in pair):
+            continue
+        emo = _emotion_struct_for(analysis)
+        strat = _strategy_struct_for(analysis)
+        labels = {(emo.get(k) or {}).get("label", "") for k in ("surface", "deep", "suppressed")}
+        labels.discard("")
+        if not labels and not (emo.get("intended") or {}).get("label"):
+            continue
+        warm = sum(1 for w in labels if any(t in w for t in _REL_WARM))
+        guard = sum(1 for w in labels if any(t in w for t in _REL_GUARD))
+        net_warm = warm - guard
+        strat_text = (strat.get("short_term", "") + strat.get("long_term", "") + (emo.get("intended") or {}).get("label", ""))
+        push = any(k in strat_text for k in _REL_PUSH)
+        yield_ = any(k in strat_text for k in _REL_YIELD)
+        intended_score = float((emo.get("intended") or {}).get("score", 0)) / 10.0
+
+        # 维度演化（逐步累积 + 边界裁剪 + EMA 平滑）
+        trust = _clamp01(trust + net_warm * 0.10 - (0.06 if guard else 0))
+        intimacy = _clamp01(intimacy + (warm * 0.09) - (guard * 0.05))
+        tension = _clamp01(tension * 0.6 + intended_score * 0.4 + (0.05 if guard else 0))
+        dom_delta = 0.0
+        if push: dom_delta += 0.12 if speaker == source else -0.12
+        if yield_: dom_delta += -0.10 if speaker == source else 0.10
+        dominance = _clamp01(dominance + dom_delta)
+
+        point = {
+            "message_id": parent.id, "index": len(points) + 1, "speaker": speaker,
+            "snippet": (parent.content or "")[:40],
+            "trust": round(trust, 2), "intimacy": round(intimacy, 2),
+            "dominance": round(dominance, 2), "tension": round(tension, 2),
+        }
+        # 转折点：任一维度相邻变化 > 0.18
+        if prev:
+            for dim, cn in (("trust", "信任"), ("intimacy", "亲密"), ("dominance", "主动权"), ("tension", "张力")):
+                delta = point[dim] - prev[dim]
+                if abs(delta) >= 0.18:
+                    turning.append({
+                        "message_id": parent.id, "dim": cn,
+                        "direction": "上升" if delta > 0 else "下降",
+                        "snippet": point["snippet"],
+                    })
+        points.append(point)
+        prev = point
+
+    current = points[-1] if points else {"trust": 0.5, "intimacy": 0.45, "dominance": 0.5, "tension": 0.3}
+    return {
+        "source": source, "target": target,
+        "points": points,
+        "turning_points": turning[-8:],
+        "current": {k: current[k] for k in ("trust", "intimacy", "dominance", "tension")},
+        "dims": [
+            {"key": "trust", "label": "信任"},
+            {"key": "intimacy", "label": "亲密"},
+            {"key": "dominance", "label": f"主动权·{source}"},
+            {"key": "tension", "label": "张力"},
+        ],
+    }
+
+
+def _resolve_pair_for_advice(conv: Conversation, db: Session, payload: dict) -> tuple[str, str]:
+    """确定「我」与「对方」：me 优先取 payload，再取会话 self_name；对方优先 payload，否则取对话里非我的发言者。"""
+    self_name = (payload.get("me") or getattr(conv, "self_name", "") or "").strip()
+    counterpart = (payload.get("counterpart") or "").strip()
+    if not counterpart:
+        names = [r[0] for r in db.query(Message.character_name).filter(
+            _visible_message_filter(conv), Message.role == "user", Message.character_name.isnot(None),
+        ).distinct().all()]
+        others = [n for n in names if n and n != self_name]
+        counterpart = others[0] if others else ""
+    return self_name, counterpart
+
+
+def _recent_dialogue_text(db: Session, conv: Conversation, limit: int = 14) -> str:
+    rows = _visible_messages_query(db, conv).filter(Message.role == "user").order_by(
+        Message.message_index.desc(), Message.created_at.desc(), Message.id.desc()).limit(limit).all()
+    rows = list(reversed(rows))
+    return "\n".join(f"{(r.character_name or '?')}：{(r.content or '')[:120]}" for r in rows)
+
+
+@router.post("/conversations/{conv_id}/theory-of-mind")
+async def conversation_theory_of_mind(conv_id: int, payload: dict, db: Session = Depends(get_db)):
+    """信息差/心智模型：对方知道什么、不知道什么、在隐瞒什么、对我抱有哪些假设。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    me, counterpart = _resolve_pair_for_advice(conv, db, payload)
+    if not counterpart:
+        raise HTTPException(400, "无法确定「对方」是谁，请先指定「我」并确保对话里有对方发言")
+    cp_char = db.query(Character).filter(Character.name == counterpart).first()
+    me_char = db.query(Character).filter(Character.name == me).first() if me else None
+    block = _render_character_block(cp_char, counterpart, "", me_char, me, db)
+    dialogue = _recent_dialogue_text(db, conv)
+    result = await orchestrator.analyze_theory_of_mind(me, counterpart, block, dialogue)
+    return {"me": me, "counterpart": counterpart, **(result or {})}
+
+
+@router.post("/conversations/{conv_id}/predict")
+async def conversation_predict(conv_id: int, payload: dict, db: Session = Depends(get_db)):
+    """反事实预演：如果「我」对「对方」说出 candidate，预测他的反应/情绪/达成意图的可能性。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    candidate = (payload.get("candidate") or "").strip()
+    if not candidate:
+        raise HTTPException(400, "请先填写你想说的话")
+    me, counterpart = _resolve_pair_for_advice(conv, db, payload)
+    if not counterpart:
+        raise HTTPException(400, "无法确定「对方」是谁，请先指定「我」并确保对话里有对方发言")
+    cp_char = db.query(Character).filter(Character.name == counterpart).first()
+    me_char = db.query(Character).filter(Character.name == me).first() if me else None
+    block = _render_character_block(cp_char, counterpart, "", me_char, me, db)
+    try:
+        pack = build_evidence_pack(db, query_text=candidate, speaker=me_char, listener=cp_char, conversation=conv)
+        memory_block = render_evidence_pack(pack)
+    except Exception:
+        memory_block = ""
+    context = _recent_dialogue_text(db, conv)
+    result = await orchestrator.predict_counterfactual(me, counterpart, candidate, block, memory_block, context)
+    return {"me": me, "counterpart": counterpart, "candidate": candidate, **(result or {})}
 
 
 @router.get("/conversations/{conv_id}/emotion-tension")

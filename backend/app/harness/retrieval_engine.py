@@ -139,12 +139,16 @@ def _recent_events(db: Session, character_ids: list[int]) -> list[dict[str, Any]
 def _memory_candidates(db: Session, query: str, character_ids: list[int]) -> list[dict[str, Any]]:
     if not character_ids:
         return []
+    # 启用向量检索时放宽候选池：语义召回要能够到更久远的记忆（跨会话"他上次也这样"），
+    # 不能被"最近 120 条"按时间先砍掉；纯字面检索时维持原来的近度优先窗口。
+    semantic_on = embedding_enabled()
+    candidate_cap = 1000 if semantic_on else 120
     memories = db.query(MemoryItem).filter(
         MemoryItem.character_id.in_(character_ids),
         MemoryItem.status == "active",
-    ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(120).all()
+    ).order_by(MemoryItem.updated_at.desc(), MemoryItem.created_at.desc()).limit(candidate_cap).all()
     # 可选语义检索：embedding 启用时，查询向量与记忆向量的余弦相似度参与打分
-    query_vector = embed_text(query) if embedding_enabled() else None
+    query_vector = embed_text(query) if semantic_on else None
     scored = []
     for memory in memories:
         score = (

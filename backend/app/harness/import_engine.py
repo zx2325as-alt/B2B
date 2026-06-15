@@ -63,6 +63,87 @@ def chunk_text(content_text: str, chunk_size: int = 2400, overlap: int = 240) ->
     return chunks
 
 
+# ── 真实聊天记录归一化 ────────────────────────────────────────────────
+# 把常见聊天记录格式（带时间戳 / "名字+时间"头行+内容块）归一为「名字: 内容」逐行，
+# 从而复用现有 dialogue 解析管线。保守策略：不像聊天记录就原样返回，不影响其它导入。
+_CHATLOG_TS = r"(?:\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*)?(?:周[一二三四五六日]\s*)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?"
+_CHATLOG_DATE = r"\d{4}[./-]\d{1,2}[./-]\d{1,2}"
+_TS_TOKEN = rf"(?:{_CHATLOG_TS}|{_CHATLOG_DATE})"
+_LEADING_TS_RE = re.compile(rf"^[\[\(（]?\s*{_TS_TOKEN}\s*[\]\)）]?[\s,，:：\-]*")
+_CHATLOG_NAME = r"[一-龥A-Za-z0-9_·\-\s]{1,30}"
+_CANONICAL_RE = re.compile(rf"^\s*({_CHATLOG_NAME})[:：]\s*(.+?)\s*$")
+_HEADER_NAME_TS_RE = re.compile(rf"^\s*([一-龥A-Za-z0-9_·\-]{{1,24}})\s+(?:{_TS_TOKEN}[\s,，]*)+$")
+_HEADER_TS_NAME_RE = re.compile(rf"^\s*(?:{_TS_TOKEN}[\s,，]*)+\s*([一-龥A-Za-z0-9_·\-]{{1,24}})$")
+
+
+def _strip_leading_timestamp(line: str) -> str:
+    return _LEADING_TS_RE.sub("", line, count=1)
+
+
+def normalize_chat_log_text(content_text: str) -> str:
+    if not content_text:
+        return content_text
+    raw_lines = content_text.splitlines()
+    # 先嗅探是否像聊天记录：统计"头行"与"行内前导时间戳+名字冒号"的命中数
+    header_hits = inline_ts_hits = 0
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        if _HEADER_NAME_TS_RE.match(s) or _HEADER_TS_NAME_RE.match(s):
+            header_hits += 1
+        stripped = _strip_leading_timestamp(s)
+        if stripped != s and _CANONICAL_RE.match(stripped):
+            inline_ts_hits += 1
+    if header_hits < 3 and inline_ts_hits < 3:
+        return content_text  # 不像聊天记录，原样返回
+
+    out: list[str] = []
+    current_speaker = ""
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        # 1) 行内前导时间戳 + 「名字: 内容」（如 `[10:30] 张三: 在吗`）
+        stripped = _strip_leading_timestamp(s)
+        if stripped != s and (m := _CANONICAL_RE.match(stripped)):
+            out.append(stripped)
+            current_speaker = m.group(1).strip()
+            continue
+        # 2) 头行（名字+时间 / 时间+名字）：只切换当前发言人，不产出内容
+        #    必须排在 canonical 之前——否则时间戳里的冒号会被误当作「名字:内容」的分隔符
+        mh = _HEADER_NAME_TS_RE.match(s) or _HEADER_TS_NAME_RE.match(s)
+        if mh:
+            name = mh.group(1).strip()
+            if name and not re.fullmatch(r"[\d:：.\-/\s]+", name):
+                current_speaker = name
+                continue
+        # 3) 已是规范「名字: 内容」
+        if (m := _CANONICAL_RE.match(s)):
+            out.append(s)
+            current_speaker = m.group(1).strip()
+            continue
+        # 4) 普通内容行：归到当前发言人
+        out.append(f"{current_speaker}: {s}" if current_speaker else s)
+    return "\n".join(out)
+
+
+def summarize_speakers(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """统计在场说话人及其发言条数（供前端做「哪个是我」识别）。"""
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for unit in units:
+        name = (unit.get("speaker") or "").strip()
+        if not name:
+            continue
+        if name not in counts:
+            order.append(name)
+        counts[name] = counts.get(name, 0) + 1
+    speakers = [{"name": name, "count": counts[name]} for name in order]
+    speakers.sort(key=lambda item: item["count"], reverse=True)
+    return speakers
+
+
 def detect_import_type(filename: str, content_text: str) -> str:
     """
     四种类型：
@@ -1098,6 +1179,8 @@ def finalize_import_preview(parsed: dict[str, Any], existing_characters: list[di
     parsed["character_profiles"] = build_character_profiles(parsed)
     role_mappings = build_role_mappings(parsed.get("characters", []), existing_characters)
     parsed["role_mappings"] = role_mappings
+    # 在场说话人（供前端「哪个是我 / 谁是对方」选择）；两人对话即典型的真实聊天场景
+    parsed["speakers"] = summarize_speakers(parsed.get("interaction_units", []))
     parsed["detected_type"] = detected_type
     parsed["source_text_snippet"] = content_text[:500]
     parsed["warning_message"] = warning_message
@@ -1112,6 +1195,9 @@ def finalize_import_preview(parsed: dict[str, Any], existing_characters: list[di
 
 
 async def build_import_preview(filename: str, content_text: str, existing_characters: list[dict], enable_ai: bool = True) -> dict[str, Any]:
+    # 文本类文件先做聊天记录归一（带时间戳/头行块 → 「名字: 内容」），再走类型检测
+    if Path(filename).suffix.lower() in {".txt", ".md", ""}:
+        content_text = normalize_chat_log_text(content_text)
     detected_type = detect_import_type(filename, content_text)
     warning_message = ""
     if detected_type == "structured":

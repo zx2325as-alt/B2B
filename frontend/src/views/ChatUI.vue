@@ -31,6 +31,10 @@
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M9 4v16"/><path d="M4 9h16"/></svg>
             场景设定
           </button>
+          <button v-if="isSelfMode" class="btn btn-primary" style="font-size:12px;padding:6px 12px" :disabled="advising" @click="generateAdvice">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+            {{ advising ? `生成中… 剩${adviceRemaining}` : '生成应对建议' }}
+          </button>
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="handleArchiveConversation">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
             一键归档
@@ -113,6 +117,40 @@
                   <span class="tag" style="font-size:10px;padding:1px 7px">{{ userPerspectives(msg).length }} 个视角</span>
                 </button>
                 <div v-if="expandedIds.has(msg.id)" class="analysis-content fade-up">
+                  <!-- 阶段2：指定了「我」且这句是对方说的 → 洞察(对方) ‖ 行动(我) 双栏 -->
+                  <template v-if="selfTwoCol(msg)">
+                    <div class="duo">
+                      <div class="duo-col insight">
+                        <div class="duo-head">洞察 · {{ msg.character_name }} 这句什么意思</div>
+                        <div v-if="cpIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpIntent(msg) }}</span></div>
+                        <div v-if="cpEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpEmotion(msg) }}</span></div>
+                        <div v-if="cpSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpSubtext(msg) }}</span></div>
+                        <div v-if="cpEvidence(msg)" class="duo-evidence">依据：“{{ cpEvidence(msg) }}”</div>
+                        <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
+                        <span v-if="cpConfidence(msg) !== null" class="tag" :class="confClass(cpConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(cpConfidence(msg)) }}</span>
+                      </div>
+                      <div class="duo-col action">
+                        <div class="duo-head">行动 · 我该怎么接</div>
+                        <div v-if="selfMoves(msg).length" class="move-list">
+                          <div v-for="(mv, i) in selfMoves(msg)" :key="`mv-${msg.id}-${i}`" class="move-card">
+                            <div class="move-top">
+                              <span class="move-label">{{ mv.label || ('策略' + (i + 1)) }}</span>
+                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv.reply)">采用</button>
+                            </div>
+                            <div class="move-reply">{{ mv.reply }}</div>
+                            <div v-if="mv.consequence" class="move-conseq">→ {{ mv.consequence }}</div>
+                          </div>
+                        </div>
+                        <div v-else-if="selfReply(msg)" class="persp-reply" style="margin-top:0">
+                          <span class="reply-text">{{ selfReply(msg) }}</span>
+                          <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, selfReply(msg))">采用</button>
+                        </div>
+                        <div v-else class="empty-hint" style="padding:8px 0;text-align:left">暂无应对建议，可点「重新分析」</div>
+                      </div>
+                    </div>
+                  </template>
+                  <!-- 通用多视角（未指定我 / 这句是我自己说的） -->
+                  <template v-else>
                   <div class="persp-tabs">
                     <button
                       v-for="p in userPerspectives(msg)"
@@ -149,6 +187,7 @@
                     <span class="reply-text">{{ curUserPersp(msg).suggested_reply }}</span>
                     <button class="btn btn-ghost reply-use-btn" @click="useSuggestedReply(curUserPersp(msg))" title="以该角色身份采用这句回答">采用</button>
                   </div>
+                  </template>
                   <button
                     class="btn btn-ghost"
                     style="align-self:flex-start;font-size:11px;padding:4px 10px;margin-top:4px"
@@ -257,6 +296,46 @@
 
       <!-- Input Area -->
       <div class="input-area">
+        <!-- 阶段3/6：指定了「我」时出现的军师 + 预演面板 -->
+        <div v-if="isSelfMode && counterpartName" class="advisor-box">
+          <!-- 实时军师：粘贴对方的话即时分析（会发消息，仅非只读会话） -->
+          <template v-if="!currentConversation?.is_readonly">
+            <div class="advisor-head">
+              <span class="advisor-title">实时军师</span>
+              <span class="advisor-sub">粘贴「{{ counterpartName }}」刚说的话，看他什么意思、我该怎么接</span>
+            </div>
+            <div class="advisor-row" style="margin-bottom:8px">
+              <textarea v-model="adviceInput" class="chat-input" rows="1"
+                :placeholder="`「${counterpartName}」说了什么…  Enter 分析`"
+                @keydown.enter.exact.prevent="askCounterpart"></textarea>
+              <button class="btn btn-primary" :disabled="chat.streaming || !adviceInput.trim()" @click="askCounterpart">分析</button>
+            </div>
+          </template>
+
+          <!-- 阶段6：反事实预演——发出前看对方会怎么反应（不发消息，只读会话也可用） -->
+          <div class="advisor-head">
+            <span class="advisor-title">发出前预演</span>
+            <span class="advisor-sub">想好一句话，先看「{{ counterpartName }}」会怎么反应</span>
+          </div>
+          <div class="advisor-row">
+            <textarea v-model="predictInput" class="chat-input" rows="1"
+              :placeholder="`我想说…  预演「${counterpartName}」的反应`"
+              @keydown.enter.exact.prevent="runPredict"></textarea>
+            <button class="btn btn-ghost" :disabled="predicting || !predictInput.trim()" @click="runPredict">{{ predicting ? '预演中…' : '预演' }}</button>
+          </div>
+          <div v-if="prediction" class="predict-card">
+            <div class="predict-top">
+              <span class="tag" :class="reactionClass(prediction.reaction_type)" style="font-size:10px">{{ prediction.reaction_type }}</span>
+              <span v-if="prediction.emotion" class="predict-emo">情绪：{{ prediction.emotion }}</span>
+              <span class="predict-succ">达成意图 {{ Math.round((prediction.success_likelihood||0)*100) }}%</span>
+            </div>
+            <div class="predict-reply">「{{ counterpartName }}」很可能回：{{ prediction.predicted_reply }}</div>
+            <div v-if="prediction.inner_read" class="predict-sub">他心里：{{ prediction.inner_read }}</div>
+            <div v-if="prediction.risk" class="predict-sub" style="color:var(--red)">风险：{{ prediction.risk }}</div>
+            <div v-if="prediction.better_tip" class="predict-sub" style="color:var(--green)">更稳：{{ prediction.better_tip }}</div>
+          </div>
+        </div>
+
         <!-- Role selector bar -->
         <div class="role-bar">
           <span class="label" style="margin:0">以…身份发言：</span>
@@ -269,6 +348,11 @@
             </button>
             <button class="role-pill add-role" @click="showRoleModal = true">＋</button>
           </div>
+          <span class="label" style="margin:0 0 0 8px" title="指定哪一方是「我」后，对方发言会给出「他什么意思 / 我该怎么接」的应对建议">我是：</span>
+          <select class="input receiver-select" :value="selfName" @change="setSelfName($event.target.value)" title="指定「我」是谁">
+            <option value="">未指定</option>
+            <option v-for="role in activeRoles" :key="`self-${role.name}`" :value="role.name">{{ role.name }}</option>
+          </select>
           <template v-if="receiverOptions.length > 1">
             <span class="label" style="margin:0 0 0 8px">对谁说：</span>
             <select class="input receiver-select" v-model="currentReceiver" title="为空时由 AI 自动判定主要接收方">
@@ -311,6 +395,41 @@
       </div>
 
       <div class="epanel-scroll">
+        <!-- 对方画像：跨会话沉淀的持久档案（指定了「我」时显示） -->
+        <div v-if="isSelfMode && counterpartChar" class="epanel-block">
+          <div class="block-title">对方画像 · {{ counterpartChar.name }}</div>
+          <div class="cp-card">
+            <div v-if="counterpartChar.role" class="sc-row"><span class="sc-k">身份</span><span class="sc-v">{{ counterpartChar.role }}</span></div>
+            <div v-if="counterpartChar.motivation" class="sc-row"><span class="sc-k">动机</span><span class="sc-v">{{ counterpartChar.motivation }}</span></div>
+            <div v-if="counterpartChar.weakness" class="sc-row"><span class="sc-k">软肋</span><span class="sc-v">{{ counterpartChar.weakness }}</span></div>
+            <div v-if="counterpartChar.speaking_style" class="sc-row"><span class="sc-k">说话</span><span class="sc-v">{{ counterpartChar.speaking_style }}</span></div>
+            <div v-if="cpDimText('desires')" class="sc-row"><span class="sc-k">在意</span><span class="sc-v">{{ cpDimText('desires') }}</span></div>
+            <div v-if="cpDimText('fears')" class="sc-row"><span class="sc-k">雷区</span><span class="sc-v">{{ cpDimText('fears') }}</span></div>
+            <div v-if="(counterpartChar.personality_tags || []).length" class="sc-beliefs">
+              <span v-for="t in counterpartChar.personality_tags.slice(0, 8)" :key="`cpt-${t}`" class="tag" style="font-size:10px;padding:1px 8px">{{ t }}</span>
+            </div>
+            <div v-if="!counterpartChar.motivation && !counterpartChar.weakness && !(counterpartChar.personality_tags||[]).length && !cpDimText('desires') && !cpDimText('fears')" class="empty-hint" style="padding:6px 0;text-align:left">
+              档案还很薄——多导入几段与 TA 的聊天，画像会越来越准。
+            </div>
+          </div>
+        </div>
+
+        <!-- 信息差 / 心智模型(ToM)：对方知道什么、在隐瞒什么（按需推演） -->
+        <div v-if="isSelfMode && counterpartName" class="epanel-block">
+          <div class="block-title" style="display:flex;justify-content:space-between;align-items:center">
+            <span>信息差 · {{ counterpartName }}</span>
+            <button class="btn btn-ghost" style="font-size:10px;padding:2px 9px" :disabled="tomLoading" @click="runToM">{{ tomLoading ? '推演中…' : (tom ? '重新推演' : '推演') }}</button>
+          </div>
+          <template v-if="tom">
+            <div v-if="tom.info_edge" class="tom-edge">{{ tom.info_edge }}</div>
+            <div v-for="grp in tomGroups" :key="grp.key" class="tom-grp">
+              <div class="tom-grp-label">{{ grp.label }}</div>
+              <div v-for="(it, i) in grp.items" :key="`${grp.key}-${i}`" class="tom-item">· {{ it }}</div>
+            </div>
+          </template>
+          <div v-else class="empty-hint" style="padding:8px 0;text-align:left">点「推演」：看对方知道什么 / 不知道什么 / 在隐瞒什么。</div>
+        </div>
+
         <!-- 上半：在场各角色此刻被推断出的心理状态 -->
         <div class="epanel-block">
           <div class="block-title">在场角色状态</div>
@@ -336,12 +455,33 @@
           <div v-else class="empty-hint" style="padding:14px 0">对话几轮后，这里会显示各角色被推断出的实时心理状态（情绪 / 目标 / 防御 / 意图）。</div>
         </div>
 
-        <!-- 下半：某一对角色之间的关系张力走势 -->
+        <!-- 下半：某一对角色之间的关系仪表盘 + 张力走势 -->
         <div class="epanel-block">
-          <div class="block-title">关系张力走势</div>
+          <div class="block-title">关系仪表盘</div>
           <select v-if="rolePairs.length" class="input" v-model="trackingPair" @change="refreshEmotionCurve" style="margin-bottom:12px">
             <option v-for="pair in rolePairs" :key="pair.value" :value="pair.value">{{ pair.label }}</option>
           </select>
+
+          <!-- 多维走势：信任 / 亲密 / 主动权 / 张力 -->
+          <template v-if="relTrajectory.points && relTrajectory.points.length">
+            <div v-for="dim in relTrajectory.dims" :key="dim.key" class="rel-dim">
+              <span class="rel-dim-label">{{ dim.label }}</span>
+              <svg class="rel-spark" viewBox="0 0 100 24" preserveAspectRatio="none">
+                <polyline :points="relSparkPoints(dim.key)" fill="none" :stroke="relColor(dim.key)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
+              </svg>
+              <span class="rel-dim-val" :style="{ color: relColor(dim.key) }">{{ Math.round((relTrajectory.current[dim.key]||0)*100) }}{{ relTrend(dim.key) }}</span>
+            </div>
+            <div v-if="relTrajectory.turning_points && relTrajectory.turning_points.length" style="margin-top:10px">
+              <div class="label">关键转折</div>
+              <button v-for="(tp, i) in relTrajectory.turning_points" :key="`rtp-${i}`" class="rel-turn" @click="scrollToMessage(tp.message_id)">
+                <span class="tag" :class="tp.direction==='上升'?'green':'red'" style="font-size:10px">{{ tp.dim }}{{ tp.direction }}</span>
+                <span class="rel-turn-txt">{{ tp.snippet }}</span>
+              </button>
+            </div>
+          </template>
+          <div v-else class="empty-hint" style="padding:10px 0">对话几轮后，这里会显示你俩关系的信任 / 亲密 / 主动权 / 张力走势与转折。</div>
+
+          <div class="label" style="margin-top:14px">逐句张力 / 情绪</div>
           <template v-if="emotionData.emotions?.length">
             <div class="emotion-trend">趋势：<span class="tag" :class="trendClass(emotionData.trend)">{{ trendLabel(emotionData.trend) }}</span></div>
             <div v-if="emotionData.turning_point" class="turning-point">⚡ 转折：{{ emotionData.turning_point }}</div>
@@ -510,6 +650,7 @@ const customRoleName = ref('')
 const trackingPair = ref('')
 const emotionData = ref({ emotions: [], trend: 'stable', turning_point: null })
 const stateCards = ref([])                 // 各在场角色当前心理状态卡
+const relTrajectory = ref({ points: [], turning_points: [], current: {}, dims: [] })  // 关系多维走势
 const activeRoles = ref([])
 const currentReceiver = ref('')            // '' = 后端自动判定主要接收方
 const branches = ref([])
@@ -718,6 +859,164 @@ function useSuggestedReply(persp) {
   inputText.value = persp.suggested_reply
   nextTick(() => { inputEl.value?.focus(); autoResize() })
   toast.info(`已切换为「${persp.viewer_name}」并填入建议回答`)
+}
+
+// ── 阶段2：「洞察(对方) ‖ 行动(我)」双栏（指定了「我」时启用） ──────────
+const selfName = computed(() => currentConversation.value?.self_name || '')
+const isSelfMode = computed(() => !!selfName.value)
+function selfTwoCol(msg) {
+  // 指定了「我」、且这句是「对方」说的 → 用双栏（他什么意思 / 我怎么接）
+  return isSelfMode.value && msg.character_name && msg.character_name !== selfName.value && userPerspectives(msg).length > 0
+}
+function cpPersp(msg) {
+  // 对方（发言者）自述视角 = 他的真实意图
+  const list = userPerspectives(msg)
+  return list.find(p => p.stance === 'speaker') || list.find(p => p.viewer_name === msg.character_name) || list[0] || null
+}
+function selfPersp(msg) {
+  // 「我」的旁观视角 = 我的应对
+  const list = userPerspectives(msg)
+  return list.find(p => p.viewer_name === selfName.value && p.stance === 'observer')
+    || list.find(p => p.viewer_name === selfName.value) || null
+}
+function cpIntent(msg) {
+  const p = cpPersp(msg)
+  const aj = p?.analysis_json || {}
+  return (aj.tags?.primary || '').trim() || (aj.inner_monologue?.first_reaction || '').trim()
+}
+function cpEmotion(msg) { return cpPersp(msg)?.emotion_label || '' }
+function cpSubtext(msg) { return cpPersp(msg)?.subtext || '' }
+function cpEvidence(msg) { return (cpPersp(msg)?.analysis_json?.evidence || '').trim() }
+function cpConfidence(msg) {
+  const c = cpPersp(msg)?.analysis_json?.confidence
+  return (typeof c === 'number') ? c : null
+}
+function selfMoves(msg) {
+  const moves = selfPersp(msg)?.analysis_json?.moves
+  return Array.isArray(moves) ? moves.filter(m => m && m.reply) : []
+}
+function selfReply(msg) { return selfPersp(msg)?.suggested_reply || '' }
+function confLabel(c) { return c >= 0.7 ? `把握高 ${Math.round(c*100)}%` : (c >= 0.5 ? `中等 ${Math.round(c*100)}%` : `推测 ${Math.round(c*100)}%`) }
+function confClass(c) { return c >= 0.7 ? 'green' : (c >= 0.5 ? 'amber' : 'red') }
+// 采用某条应对话术：切到「我」身份、对着「对方」、填入话术
+function useMove(msg, reply) {
+  if (!reply) return
+  const role = activeRoles.value.find(r => r.name === selfName.value)
+  if (role) handleSelectSpeaker(role)
+  currentReceiver.value = msg.character_name || ''
+  inputText.value = reply
+  nextTick(() => { inputEl.value?.focus(); autoResize() })
+  toast.info('已填入该应对话术，可直接发送或修改')
+}
+// 在聊天里指定「我」是谁（写入会话 self_name，立即驱动双栏与定向分析）
+async function setSelfName(name) {
+  if (!chat.activeConvId) return
+  try {
+    const res = await chatApi.updateConversation(chat.activeConvId, { self_name: name || '' })
+    const conv = chat.conversations.find(c => c.id === chat.activeConvId)
+    if (conv) Object.assign(conv, res.data)
+    toast.success(name ? `已设定「${name}」为我；对方发言将给出我的应对建议` : '已取消「我」的指定')
+  } catch { /* 拦截器已提示 */ }
+}
+// 为导入/历史会话里「对方」的每句发言批量生成洞察‖行动（分批续跑直到完成）
+const advising = ref(false)
+const adviceRemaining = ref(0)
+async function generateAdvice() {
+  if (!chat.activeConvId || advising.value) return
+  if (!selfName.value) { toast.error('请先在「我是」里指定我是谁'); return }
+  advising.value = true
+  try {
+    let guard = 0
+    do {
+      const res = await chatApi.generateAdvice(chat.activeConvId, 8)
+      adviceRemaining.value = res.data.remaining || 0
+    } while (adviceRemaining.value > 0 && guard++ < 80)
+    await chat.loadMessages(chat.activeConvId)
+    toast.success('应对建议已生成，展开对方发言即可看「洞察 ‖ 行动」')
+  } catch (e) {
+    toast.error('生成失败：' + (e?.response?.data?.detail || e?.message || ''))
+  } finally {
+    advising.value = false
+    adviceRemaining.value = 0
+  }
+}
+
+// ── 阶段3：实时「军师」——粘贴对方刚说的话，即时出洞察+应对 ──────────
+const adviceInput = ref('')
+const counterpartName = computed(() => {
+  if (!selfName.value) return ''
+  const others = activeRoles.value.filter(r => r.name !== selfName.value)
+  return others.length ? others[0].name : ''
+})
+const counterpartChar = computed(() => chars.characters.find(c => c.name === counterpartName.value) || null)
+// 从对方立体档案里取某一维(在意=desires/雷区=fears 等)的前几条，兼容字符串或对象元素
+function cpDimText(key) {
+  const arr = counterpartChar.value?.profile_json?.[key]
+  if (!Array.isArray(arr) || !arr.length) return ''
+  return arr.slice(0, 3).map(it => {
+    if (typeof it === 'string') return it
+    if (it && typeof it === 'object') return Object.values(it).filter(Boolean).join('：')
+    return String(it)
+  }).filter(Boolean).join('；')
+}
+
+// ── 阶段6：反事实预演（发出前看对方反应） ────────────────────
+const predictInput = ref('')
+const prediction = ref(null)
+const predicting = ref(false)
+async function runPredict() {
+  const text = predictInput.value.trim()
+  if (!text || !counterpartName.value || !chat.activeConvId || predicting.value) return
+  predicting.value = true; prediction.value = null
+  try {
+    const res = await chatApi.predictReaction(chat.activeConvId, text, selfName.value, counterpartName.value)
+    prediction.value = res.data
+  } catch (e) { toast.error('预演失败：' + (e?.response?.data?.detail || e?.message || '')) }
+  finally { predicting.value = false }
+}
+function reactionClass(t) { return ({ '暖化':'green','妥协':'green','激化':'red','回避':'amber','试探':'amber','无感':'' })[t] || '' }
+
+// ── 阶段5：信息差 / 心智模型(ToM) ────────────────────────────
+const tom = ref(null)
+const tomLoading = ref(false)
+async function runToM() {
+  if (!counterpartName.value || !chat.activeConvId || tomLoading.value) return
+  tomLoading.value = true
+  try {
+    const res = await chatApi.theoryOfMind(chat.activeConvId, selfName.value, counterpartName.value)
+    tom.value = res.data
+  } catch (e) { toast.error('推演失败：' + (e?.response?.data?.detail || e?.message || '')) }
+  finally { tomLoading.value = false }
+}
+const tomGroups = computed(() => {
+  if (!tom.value) return []
+  return [
+    { key: 'knows', label: '他知道' }, { key: 'unaware', label: '他不知道/误以为' },
+    { key: 'hiding', label: '在隐瞒/回避' }, { key: 'assumes', label: '对我的假设' },
+  ].map(g => ({ ...g, items: tom.value[g.key] || [] })).filter(g => g.items.length)
+})
+// 切换会话时清空推演结果，避免串台
+watch(() => chat.activeConvId, () => { tom.value = null; prediction.value = null; predictInput.value = '' })
+async function askCounterpart() {
+  const text = adviceInput.value.trim()
+  if (!text) return
+  if (!counterpartName.value) { toast.error('请先在「管理」里加入对方角色'); return }
+  if (chat.streaming) return
+  adviceInput.value = ''
+  await nextTick()
+  const role = activeRoles.value.find(r => r.name === counterpartName.value)
+  // 以「对方」身份把这句话发给「我」——后端即产出他的意图 + 我的多策略应对
+  await chat.sendMessage({
+    speaker: counterpartName.value,
+    content: text,
+    characterId: role?.id || null,
+    receiverName: selfName.value,
+    activeCharacters: activeRoles.value.map(r => ({ id: r.id, name: r.name })),
+  })
+  // 自动展开这句对方发言的「洞察 ‖ 行动」
+  await nextTick()
+  const last = [...chat.messages].reverse().find(m => m.role === 'user' && m.character_name === counterpartName.value)
+  if (last) { const s = new Set(expandedIds.value); s.add(last.id); expandedIds.value = s }
 }
 function focusAnalysis(id, field) {
   analysisFocus.value = { id, field }
@@ -947,14 +1246,35 @@ async function loadStates() {
 async function refreshEmotionCurve() {
   await loadStates()
   if (!chat.activeConvId || !trackingPair.value) return
+  const [source, target] = trackingPair.value.split('→')
   try {
-    const [source, target] = trackingPair.value.split('→')
     const res = await chatApi.getEmotionTension(chat.activeConvId, source, target)
     emotionData.value = res.data
   } catch {
     emotionData.value = { emotions: [], trend: 'stable', turning_point: null }
   }
+  try {
+    const res = await chatApi.getRelationshipTrajectory(chat.activeConvId, source, target)
+    relTrajectory.value = res.data
+  } catch {
+    relTrajectory.value = { points: [], turning_points: [], current: {}, dims: [] }
+  }
 }
+// 关系维度 sparkline：把 points 映射成 SVG polyline 坐标串
+const REL_DIM_COLORS = { trust: 'var(--green)', intimacy: 'var(--violet)', dominance: 'var(--amber)', tension: 'var(--red)' }
+function relSparkPoints(dimKey) {
+  const pts = relTrajectory.value.points || []
+  if (pts.length < 2) return ''
+  const W = 100, H = 24
+  return pts.map((p, i) => `${((i / (pts.length - 1)) * W).toFixed(1)},${(H - (p[dimKey] || 0) * H).toFixed(1)}`).join(' ')
+}
+function relTrend(dimKey) {
+  const pts = relTrajectory.value.points || []
+  if (pts.length < 2) return ''
+  const d = (pts[pts.length - 1][dimKey] || 0) - (pts[0][dimKey] || 0)
+  return d > 0.08 ? '↑' : (d < -0.08 ? '↓' : '→')
+}
+function relColor(dimKey) { return REL_DIM_COLORS[dimKey] || 'var(--cyan)' }
 async function reanalyzeMessage(msg) {
   const res = await chatApi.reanalyzeMessage(msg.parent_id)
   const index = chat.messages.findIndex(item => item.id === msg.id)
@@ -1280,6 +1600,30 @@ function scrollToMessage(messageId) {
 .sc-k { font-size:10px; font-family:var(--font-mono); color:var(--text-muted); min-width:44px; flex-shrink:0; padding-top:1px; }
 .sc-v { font-size:12px; color:var(--text-secondary); line-height:1.5; flex:1; }
 .sc-beliefs { display:flex; flex-wrap:wrap; gap:5px; margin-top:1px; }
+.cp-card { display:flex; flex-direction:column; gap:6px; padding:10px 12px; border:1px solid var(--border); border-left:3px solid var(--cyan); border-radius:var(--radius-sm); background:var(--bg-elevated); }
+
+/* 关系仪表盘 */
+.rel-dim { display:flex; align-items:center; gap:8px; margin-bottom:7px; }
+.rel-dim-label { font-size:11px; color:var(--text-secondary); min-width:48px; }
+.rel-spark { flex:1; height:24px; background:var(--bg-base); border-radius:4px; }
+.rel-dim-val { font-size:11px; font-family:var(--font-mono); min-width:42px; text-align:right; }
+.rel-turn { display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:none; cursor:pointer; padding:4px 2px; }
+.rel-turn:hover { background:var(--bg-hover); border-radius:6px; }
+.rel-turn-txt { font-size:11px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
+
+/* 阶段6 反事实预演卡 */
+.predict-card { margin-top:8px; padding:9px 11px; border-radius:8px; background:var(--bg-elevated); border:1px solid var(--border); display:flex; flex-direction:column; gap:5px; }
+.predict-top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.predict-emo { font-size:11px; color:var(--text-secondary); }
+.predict-succ { font-size:11px; font-family:var(--font-mono); color:var(--cyan); margin-left:auto; }
+.predict-reply { font-size:13px; color:var(--text-primary); line-height:1.6; }
+.predict-sub { font-size:11px; color:var(--text-muted); line-height:1.5; }
+
+/* 阶段5 信息差/ToM */
+.tom-edge { font-size:12px; color:var(--amber); line-height:1.6; padding:6px 8px; background:rgba(245,158,11,.08); border-radius:6px; margin-bottom:8px; }
+.tom-grp { margin-bottom:8px; }
+.tom-grp-label { font-size:11px; font-family:var(--font-mono); color:var(--text-muted); margin-bottom:3px; }
+.tom-item { font-size:12px; color:var(--text-secondary); line-height:1.55; }
 
 .emotion-trend { font-size:12px; color:var(--text-muted); margin-bottom:8px; display:flex; align-items:center; gap:6px; }
 .turning-point { font-size:11px; color:var(--amber); margin-bottom:12px; line-height:1.5; }
@@ -1349,6 +1693,30 @@ function scrollToMessage(messageId) {
 }
 .persp-reply .reply-text { flex:1; font-size:13px; color:var(--text-primary); line-height:1.6; }
 .reply-use-btn { font-size:11px; padding:3px 10px; flex-shrink:0; }
+
+/* 阶段2：洞察(对方) ‖ 行动(我) 双栏 */
+.duo { display:flex; gap:12px; align-items:stretch; flex-wrap:wrap; }
+.duo-col { flex:1; min-width:240px; display:flex; flex-direction:column; gap:7px; padding:12px; border-radius:var(--radius-sm); border:1px solid var(--border); }
+.duo-col.insight { background:rgba(124,58,237,.06); border-color:rgba(124,58,237,.22); }
+.duo-col.action  { background:rgba(0,212,255,.05);  border-color:rgba(0,212,255,.2); }
+.duo-head { font-size:12px; font-weight:600; color:var(--text-primary); margin-bottom:2px; }
+.duo-col.insight .duo-head { color:#a78bfa; }
+.duo-col.action  .duo-head { color:var(--cyan); }
+.duo-evidence { font-size:12px; color:var(--text-secondary); line-height:1.6; padding:6px 8px; border-left:2px solid var(--border-strong); background:rgba(255,255,255,.02); border-radius:4px; }
+.move-list { display:flex; flex-direction:column; gap:8px; }
+.move-card { padding:9px 11px; border-radius:8px; background:var(--bg-elevated); border:1px solid var(--border); display:flex; flex-direction:column; gap:5px; }
+.move-top { display:flex; align-items:center; gap:8px; }
+.move-label { flex:1; font-size:11px; font-family:var(--font-mono); color:var(--cyan); }
+.move-reply { font-size:13px; color:var(--text-primary); line-height:1.6; }
+.move-conseq { font-size:11px; color:var(--text-muted); line-height:1.5; }
+
+/* 阶段3：实时军师快捷输入 */
+.advisor-box { margin-bottom:10px; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--cyan-dim); }
+.advisor-head { display:flex; align-items:baseline; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+.advisor-title { font-size:12px; font-weight:600; color:var(--cyan); }
+.advisor-sub { font-size:11px; color:var(--text-muted); }
+.advisor-row { display:flex; gap:8px; align-items:flex-end; }
+.advisor-row .chat-input { min-height:38px; }
 
 /* Diagnosis */
 .diagnosis-section { display:flex; flex-direction:column; gap:6px; margin-top:4px; }

@@ -299,6 +299,7 @@ class AIOrchestrator:
                     perspectives = await self.analyze_multi_perspective(
                         scenario=scenario, speaker=speaker, content=content,
                         viewers_block=viewers_block, context=ctx.to_text(8),
+                        memory_block=character_memory,
                     )
                     result["perspectives"] = perspectives
                 except Exception as exc:
@@ -315,13 +316,16 @@ class AIOrchestrator:
 
     async def analyze_multi_perspective(
         self, scenario: str, speaker: str, content: str, viewers_block: str, context: str,
+        memory_block: str = "",
     ) -> list[dict]:
-        """多视角分析：在场每个旁观角色对这句话的独立分析。返回 normalize 后的 perspective 列表。"""
+        """多视角分析：在场每个旁观角色对这句话的独立分析。返回 normalize 后的 perspective 列表。
+        memory_block 注入向量语义召回的相关历史/证据，让"他什么意思 / 我怎么接"更贴合过往。"""
         result = await self.call(
             "multi_perspective_analysis",
             {
                 "scenario": scenario, "speaker": speaker, "content": content,
                 "viewers_block": viewers_block, "context": context or "（对话开始）",
+                "memory_block": memory_block or "（暂无相关历史记忆）",
             },
             retries=1,
         )
@@ -341,6 +345,29 @@ class AIOrchestrator:
             normalized["stance"] = "speaker" if stance == "speaker" else "observer"
             out.append(normalized)
         return out
+
+    async def analyze_theory_of_mind(self, me: str, counterpart: str, counterpart_block: str, dialogue: str) -> dict:
+        """信息差/心智模型：推断对方知道什么、不知道什么、在隐瞒什么、对我抱有哪些假设。"""
+        result = await self.call(
+            "theory_of_mind",
+            {"me": me, "counterpart": counterpart, "counterpart_block": counterpart_block or "（档案有限）", "dialogue": dialogue or "（暂无对话）"},
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def predict_counterfactual(self, me: str, counterpart: str, candidate: str, counterpart_block: str, memory_block: str, context: str) -> dict:
+        """反事实预测：如果我对对方说出 candidate，预测他的反应/情绪/达成意图的可能性。"""
+        result = await self.call(
+            "counterfactual_predict",
+            {
+                "me": me, "counterpart": counterpart, "candidate": candidate,
+                "counterpart_block": counterpart_block or "（档案有限）",
+                "memory_block": memory_block or "（无相关历史）",
+                "context": context or "（对话开始）",
+            },
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
 
     async def generate_character_profile(self, name: str, role: str, background: str) -> dict:
         return await self.call(

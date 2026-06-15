@@ -69,6 +69,7 @@ def _ensure_sqlite_columns():
             "context_summary": "ALTER TABLE conversations ADD COLUMN context_summary TEXT DEFAULT ''",
             "summary_until_index": "ALTER TABLE conversations ADD COLUMN summary_until_index INTEGER DEFAULT 0",
             "scene_brief": "ALTER TABLE conversations ADD COLUMN scene_brief TEXT DEFAULT ''",
+            "self_name": "ALTER TABLE conversations ADD COLUMN self_name VARCHAR(100) DEFAULT ''",
         },
         "messages": {
             "message_index": "ALTER TABLE messages ADD COLUMN message_index INTEGER DEFAULT 0",
