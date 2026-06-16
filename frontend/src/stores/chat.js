@@ -53,7 +53,7 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function sendMessage({ speaker, content, characterId, receiverName, activeCharacters, predictionId = null }) {
+  async function sendMessage({ speaker, content, characterId, receiverName, activeCharacters, predictionId = null, adoptedConsequence = null, adoptedLabel = null }) {
     if (streaming.value && streamController.value) {
       streamController.value.abort()
       streaming.value = false
@@ -89,6 +89,8 @@ export const useChatStore = defineStore('chat', () => {
         receiver_name: receiverName || null,
         active_characters: activeCharacters,
         prediction_id: predictionId || null,
+        adopted_consequence: adoptedConsequence || null,
+        adopted_label: adoptedLabel || null,
       },
       {
         signal: streamController.value.signal,

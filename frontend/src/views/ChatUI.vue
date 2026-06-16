@@ -65,6 +65,27 @@
 
       <!-- Messages -->
       <div class="messages-area" ref="messagesEl">
+        <!-- Q4 越用越准：关于对方，系统已经累积的认知 -->
+        <div v-if="cpMem && (cpMem.count || (cpMem.prediction && cpMem.prediction.resolved))" class="cpmem-bar">
+          <button class="cpmem-head" @click="cpMemOpen = !cpMemOpen">
+            <span class="cpmem-brain">🧠</span>
+            关于「{{ cpMem.name }}」，我已经知道
+            <span class="tag" style="font-size:10px;padding:1px 7px">{{ cpMem.count }} 条</span>
+            <span v-if="cpMem.prediction && cpMem.prediction.hit_rate !== null" class="tag green" style="font-size:10px;padding:1px 7px">
+              预演命中 {{ Math.round(cpMem.prediction.hit_rate * 100) }}%（{{ cpMem.prediction.resolved }} 次）
+            </span>
+            <span class="cpmem-caret">{{ cpMemOpen ? '▾' : '▸' }}</span>
+          </button>
+          <div v-if="cpMemOpen" class="cpmem-body">
+            <div v-for="(l, i) in cpMem.learnings" :key="`cpm-${i}`" class="cpmem-item">
+              <span class="tag" :class="cpMemSourceClass(l.source)" style="font-size:10px">{{ l.source }}</span>
+              <span class="cpmem-text">{{ l.content }}</span>
+              <span v-if="l.confidence !== null && l.confidence !== undefined" class="cpmem-conf">{{ Math.round(l.confidence * 100) }}%</span>
+            </div>
+            <div v-if="!cpMem.learnings.length" class="cpmem-empty">还在积累中——多聊几轮、归档或做几次预演，这里会逐渐长出对他的认知。</div>
+          </div>
+        </div>
+
         <div v-if="!chat.messages.length" class="welcome-screen">
           <div class="welcome-icon">◈</div>
           <div class="welcome-title">深度对话分析引擎</div>
@@ -147,6 +168,12 @@
                           <div v-for="(iss, i) in cpCritic(msg).issues" :key="`cri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
                           <div v-if="cpCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ cpCritic(msg).revised_subtext }}</div>
                         </div>
+                        <!-- Q1 多轮对抗：另一种可能 + 调和（防一条道走到黑） -->
+                        <div v-if="cpDebate(msg)" class="debate-box">
+                          <span class="tag" :class="debateClass(cpDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(cpDebate(msg).stronger) }}</span>
+                          <div v-if="cpDebate(msg).alternative && cpDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ cpDebate(msg).alternative.subtext }}</div>
+                          <div v-if="cpDebate(msg).reconciled && cpDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ cpDebate(msg).reconciled.subtext }}</div>
+                        </div>
                       </div>
                       <div class="duo-col action">
                         <!-- 我怎么想：我（旁观）对这句话的内心解读 -->
@@ -161,7 +188,7 @@
                           <div v-for="(mv, i) in selfMoves(msg)" :key="`mv-${msg.id}-${i}`" class="move-card">
                             <div class="move-top">
                               <span class="move-label">{{ mv.label || ('策略' + (i + 1)) }}</span>
-                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv.reply)">采用</button>
+                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv)">采用</button>
                             </div>
                             <div class="move-reply">{{ mv.reply }}</div>
                             <div v-if="mv.consequence" class="move-conseq">→ {{ mv.consequence }}</div>
@@ -222,6 +249,11 @@
                       <span class="tag" :class="criticClass(upCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(upCritic(msg).verdict) }}</span>
                       <div v-for="(iss, i) in upCritic(msg).issues" :key="`ucri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
                       <div v-if="upCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ upCritic(msg).revised_subtext }}</div>
+                    </div>
+                    <div v-if="upDebate(msg)" class="debate-box">
+                      <span class="tag" :class="debateClass(upDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(upDebate(msg).stronger) }}</span>
+                      <div v-if="upDebate(msg).alternative && upDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ upDebate(msg).alternative.subtext }}</div>
+                      <div v-if="upDebate(msg).reconciled && upDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ upDebate(msg).reconciled.subtext }}</div>
                     </div>
                   </div>
                   </template>
@@ -305,7 +337,7 @@
                           <div v-for="(mv, i) in selfMoves(msg)" :key="`amv-${msg.id}-${i}`" class="move-card">
                             <div class="move-top">
                               <span class="move-label">{{ mv.label || ('策略' + (i + 1)) }}</span>
-                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv.reply)">采用</button>
+                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv)">采用</button>
                             </div>
                             <div class="move-reply">{{ mv.reply }}</div>
                             <div v-if="mv.consequence" class="move-conseq">→ {{ mv.consequence }}</div>
@@ -938,7 +970,10 @@ watch(() => chat.activeConvId, async (id) => {
   diagnosisMap.value = {}
   if (id) {
     await refreshBranches()
+    loadDiagnoses(id)   // 载入已有/后台自动生成的深度诊断
+    loadCounterpartMemory(id)   // 载入"关于对方我已经知道"
   } else {
+    cpMem.value = null
     branches.value = []
     activeBranchModel.value = ''
   }
@@ -1139,6 +1174,14 @@ function perspCritic(persp) {
 function cpCritic(msg) { return perspCritic(cpPersp(msg)) }
 function criticClass(v) { return ({ approved: 'green', softened: 'amber', downgraded: 'red' })[v] || '' }
 function criticLabel(v) { return ({ approved: '已复核 · 站得住', softened: '已复核 · 已收敛措辞', downgraded: '已复核 · 过度推断已下调' })[v] || '已复核' }
+// Q1 多轮对抗：读某视角的 debate（另一种可能 + 调和）
+function perspDebate(persp) {
+  const d = persp?.analysis_json?.debate
+  return (d && ((d.alternative && d.alternative.subtext) || (d.reconciled && d.reconciled.subtext))) ? d : null
+}
+function cpDebate(msg) { return perspDebate(cpPersp(msg)) }
+function debateClass(s) { return ({ original: 'green', alternative: 'red', both: 'amber' })[s] || '' }
+function debateLabel(s) { return ({ original: '已对抗 · 原判成立', alternative: '已对抗 · 改判', both: '已对抗 · 两种皆可能' })[s] || '已对抗' }
 // 采用某视角的建议回答：切到该角色身份，并把建议回答填进输入框（用户可改后发送）
 function useSuggestedReply(persp) {
   if (!persp?.suggested_reply) return
@@ -1188,6 +1231,7 @@ function upConfidence(msg) {
 }
 function upGrounded(msg) { return curUserPersp(msg)?.analysis_json?.grounded !== false }
 function upCritic(msg) { return perspCritic(curUserPersp(msg)) }
+function upDebate(msg) { return perspDebate(curUserPersp(msg)) }
 function selfMoves(msg) {
   const moves = selfPersp(msg)?.analysis_json?.moves
   return Array.isArray(moves) ? moves.filter(m => m && m.reply) : []
@@ -1207,12 +1251,18 @@ function hasSelfRead(msg) { const r = selfRead(msg); return !!(r && (r.inner || 
 function confLabel(c) { return c >= 0.7 ? `把握高 ${Math.round(c*100)}%` : (c >= 0.5 ? `中等 ${Math.round(c*100)}%` : `推测 ${Math.round(c*100)}%`) }
 function confClass(c) { return c >= 0.7 ? 'green' : (c >= 0.5 ? 'amber' : 'red') }
 // 采用某条应对话术：切到「我」身份、对着「对方」、填入话术
-function useMove(msg, reply) {
+// 采用某条建议后，发送时回流为"这招对他有没有用"（Q5 结果反馈闭环）
+const pendingAdoptedMove = ref(null)
+function useMove(msg, move) {
+  const reply = typeof move === 'string' ? move : (move && move.reply)
   if (!reply) return
   const role = activeRoles.value.find(r => r.name === selfName.value)
   if (role) handleSelectSpeaker(role)
   currentReceiver.value = msg.character_name || ''
   inputText.value = reply
+  // 带后果的 move（非纯字符串）→ 记下来，发出后与对方实际回复对账
+  pendingAdoptedMove.value = (move && typeof move === 'object' && move.consequence)
+    ? { label: move.label || '', consequence: move.consequence } : null
   nextTick(() => { inputEl.value?.focus(); autoResize() })
   toast.info('已填入该应对话术，可直接发送或修改')
 }
@@ -1548,7 +1598,10 @@ async function qiCommit() {
 function qiPollAnalysis(times) {
   if (times <= 0) return
   setTimeout(async () => {
-    if (chat.activeConvId) await chat.loadMessages(chat.activeConvId)
+    if (chat.activeConvId) {
+      await chat.loadMessages(chat.activeConvId)
+      loadDiagnoses(chat.activeConvId)   // 整段录入后台诊断也逐步浮现
+    }
     qiPollAnalysis(times - 1)
   }, 8000)
 }
@@ -1561,6 +1614,7 @@ async function handleArchiveConversation() {
     role_names: activeRoles.value.map(role => role.name),
   })
   toast.success(`归档完成：${res.data.archived_roles.join('、')}${res.data.observations_created ? `，并生成 ${res.data.observations_created} 条待审核建议` : ''}`)
+  loadCounterpartMemory(chat.activeConvId)   // 归档后"我已经知道"可能新增，刷新
 }
 
 async function handleSend() {
@@ -1588,6 +1642,8 @@ async function handleSend() {
 
   const predictionId = pendingPredictionId.value
   pendingPredictionId.value = null  // 一次性消费，避免误关联到后续消息
+  const adopted = pendingAdoptedMove.value
+  pendingAdoptedMove.value = null   // 同样一次性消费
   await chat.sendMessage({
     speaker: currentSpeaker.value,
     content: text,
@@ -1595,11 +1651,38 @@ async function handleSend() {
     receiverName: currentReceiver.value || null,
     activeCharacters: activeRoles.value.map(r => ({ id: r.id, name: r.name })),
     predictionId,
+    adoptedConsequence: adopted ? adopted.consequence : null,
+    adoptedLabel: adopted ? adopted.label : null,
   })
-  if (predictionId) loadPredictionStats()  // 发完后刷新命中率（对账在后台进行）
+  if (predictionId || adopted) loadPredictionStats()  // 发完后刷新命中率（对账在后台进行）
 }
 
-// ── 深度诊断（按需触发） ──────────────────────────────────────
+// Q4 越用越准：关于对方系统已累积的认知（核心档案+假设+观察+预演教训+命中率）
+const cpMem = ref(null)
+const cpMemOpen = ref(false)
+async function loadCounterpartMemory(cid) {
+  if (!cid) { cpMem.value = null; return }
+  try {
+    const res = await chatApi.counterpartMemory(cid)
+    cpMem.value = (res.data && res.data.name) ? res.data : null
+  } catch { cpMem.value = null }
+}
+function cpMemSourceClass(s) { return s === '推测' ? 'amber' : 'green' }
+
+// 载入会话已有的深度诊断（含后台自动生成的），按 message_id 取最新一条 → diagnosisMap
+async function loadDiagnoses(cid) {
+  if (!cid) return
+  try {
+    const res = await chatApi.listDiagnoses(cid, 80)
+    const map = {}
+    for (const d of (res.data || [])) {
+      if (d.message_id && !map[d.message_id]) map[d.message_id] = d   // 列表按时间倒序，首条即最新
+    }
+    diagnosisMap.value = map
+  } catch { /* 忽略诊断加载失败 */ }
+}
+
+// ── 深度诊断（按需触发 / 后台自动） ──────────────────────────────────────
 async function runDiagnosis(msg) {
   if (diagnosingIds.value.has(msg.id)) return
   diagnosingIds.value = new Set([...diagnosingIds.value, msg.id])
@@ -2167,6 +2250,22 @@ function scrollToMessage(messageId) {
 .critic-box { display:flex; flex-direction:column; gap:4px; margin-top:6px; padding:6px 8px; border-radius:4px; border-left:2px solid var(--amber, #f59e0b); background:rgba(245,158,11,.06); }
 .critic-issue { font-size:11px; color:var(--text-secondary); line-height:1.5; }
 .critic-revised { font-size:11px; color:var(--text-primary); line-height:1.5; font-style:italic; }
+/* Q1 多轮对抗：另一种可能 + 调和 */
+.debate-box { display:flex; flex-direction:column; gap:4px; margin-top:6px; padding:6px 8px; border-radius:4px; border-left:2px solid var(--violet, #a78bfa); background:rgba(167,139,250,.07); }
+.debate-alt { font-size:11px; color:var(--text-secondary); line-height:1.5; }
+.debate-recon { font-size:11px; color:var(--text-primary); line-height:1.5; font-weight:500; }
+
+/* Q4 越用越准：关于对方我已经知道 */
+.cpmem-bar { margin:0 0 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg-1, rgba(255,255,255,.02)); overflow:hidden; }
+.cpmem-head { width:100%; display:flex; align-items:center; gap:8px; padding:8px 12px; background:none; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; text-align:left; }
+.cpmem-head:hover { color:var(--text-primary); }
+.cpmem-brain { font-size:14px; }
+.cpmem-caret { margin-left:auto; color:var(--text-muted); }
+.cpmem-body { padding:4px 12px 12px; display:flex; flex-direction:column; gap:6px; }
+.cpmem-item { display:flex; align-items:flex-start; gap:8px; font-size:12px; line-height:1.5; }
+.cpmem-text { color:var(--text-primary); flex:1; }
+.cpmem-conf { color:var(--text-muted); font-size:10px; flex:0 0 auto; }
+.cpmem-empty { font-size:11px; color:var(--text-muted); line-height:1.6; }
 
 /* 阶段3：实时军师快捷输入 */
 .advisor-box { margin-bottom:10px; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--cyan-dim); }

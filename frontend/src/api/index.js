@@ -93,6 +93,7 @@ export const chatApi = {
   generateAdvice: (cid, limit = 8) => api.post(`/chat/conversations/${cid}/generate-advice`, null, { params: { limit } }),
   predictReaction: (cid, candidate, me, counterpart) => api.post(`/chat/conversations/${cid}/predict`, { candidate, me, counterpart }),
   getPredictionStats: (cid, counterpart = '') => api.get(`/chat/conversations/${cid}/prediction-stats`, { params: counterpart ? { counterpart } : {} }),
+  counterpartMemory: (cid, name = '') => api.get(`/chat/conversations/${cid}/counterpart-memory`, { params: name ? { name } : {} }),
   getGoalProgress: (cid)       => api.get(`/chat/conversations/${cid}/goal-progress`),
   refreshGoalProgress: (cid)   => api.post(`/chat/conversations/${cid}/goal-progress/refresh`),
   theoryOfMind: (cid, me, counterpart) => api.post(`/chat/conversations/${cid}/theory-of-mind`, { me, counterpart }),

@@ -141,8 +141,8 @@ _DURABLE_TYPES = {"reference", "diagnosis"}
 _RRF_K = 60  # 倒数排名融合常数：越大越平滑，淡化头部排名的绝对差距
 _MMR_LAMBDA = 0.7  # MMR 权衡：0.7 偏相关、0.3 罚冗余
 _DUP_THRESHOLD = 0.85  # 与已选项相似度超过此值视为近重复，硬性降级（除非别无可选）
-_MEMORY_TOP_N = 12
-_REFERENCE_QUOTA = 3  # 命中资料时至少保留这么多块，保证上传资料能进上下文
+_MEMORY_TOP_N = 20  # 不计成本/时间：召回更多长期记忆，让"他上次也这样"够得到更远
+_REFERENCE_QUOTA = 4  # 命中资料时至少保留这么多块，保证上传资料能进上下文
 
 
 def _pair_similarity(item_a: dict[str, Any], item_b: dict[str, Any]) -> float:
@@ -285,7 +285,7 @@ def _evidence_candidates(
         filters.append(EvidenceSpan.conversation_id == conversation_id)
     if not filters:
         return [], []
-    query_obj = db.query(EvidenceSpan).filter(*filters).order_by(EvidenceSpan.created_at.desc()).limit(180)
+    query_obj = db.query(EvidenceSpan).filter(*filters).order_by(EvidenceSpan.created_at.desc()).limit(320)
     scored_supporting = []
     scored_conflicting = []
     for evidence in query_obj.all():
@@ -312,7 +312,26 @@ def _evidence_candidates(
             scored_supporting.append(item)
     scored_supporting.sort(key=lambda item: item["score"], reverse=True)
     scored_conflicting.sort(key=lambda item: item["score"], reverse=True)
-    return scored_supporting[:10], scored_conflicting[:5]
+    return scored_supporting[:18], scored_conflicting[:10]
+
+
+def _multihop_facts(speaker: Character | None, listener: Character | None) -> dict[str, Any]:
+    """会话两人之间的多跳关系事实（牵线人 + 最短关系链）。图谱不可用/未连通时安全返回空。"""
+    if not speaker or not listener:
+        return {}
+    try:
+        if not graph_store.is_available():
+            return {}
+        intermediaries = graph_store.find_intermediaries(speaker.id, listener.id, limit=6) or []
+        path = graph_store.shortest_path(speaker.id, listener.id, max_hops=5) or {}
+        # 直接相连（1 跳）就不必展示路径，留给已有的关系链字段
+        if path.get("hops", 0) and path["hops"] <= 1:
+            path = {}
+        if not intermediaries and not path:
+            return {}
+        return {"intermediaries": intermediaries, "path": path}
+    except Exception:
+        return {}
 
 
 def build_evidence_pack(
@@ -332,13 +351,15 @@ def build_evidence_pack(
     )
     memory_hits = _memory_candidates(db, query_text, character_ids)
     # 上传资料单独拎出，便于在 prompt 里明确标注为"外部依据"供模型引用
-    reference_hits = [hit for hit in memory_hits if hit.get("memory_type") == "reference"][:4]
+    reference_hits = [hit for hit in memory_hits if hit.get("memory_type") == "reference"][:8]
     recent_events = _recent_events(db, character_ids)
     relationship_context = _relationship_context(db, speaker, listener)
     graph_context = graph_store.get_graph_context(
         speaker.id if speaker else None,
         listener.id if listener else None,
     )
+    # 多跳关系：会话两人之间的牵线人 + 最短关系链（"对方↔我"怎么连上的，谁能引荐）
+    multihop = _multihop_facts(speaker, listener)
     keyword_hits = [
         item for item in supporting_evidence[:5]
         if item["score"] >= 0.35
@@ -374,6 +395,7 @@ def build_evidence_pack(
         },
         "relationship_context": relationship_context,
         "graph_context": graph_context,
+        "multihop": multihop,
         "recent_events": recent_events,
         "memory_hits": memory_hits,
         "reference_hits": reference_hits,
@@ -383,7 +405,7 @@ def build_evidence_pack(
                 "strategy": "rrf_mmr_rerank_keyword_vector_graph",
             "vector_hits": [],
             "keyword_hits": keyword_hits,
-                "graph_hits": graph_hits[:8],
+                "graph_hits": graph_hits[:16],
             "time_hits": time_hits,
             "candidate_counts": {
                 "memories": len(memory_hits),
@@ -437,31 +459,43 @@ def render_evidence_pack(evidence_pack: dict[str, Any]) -> str:
     pair_rel = rel.get("pair") or rel.get("speaker_to_listener") or {}
     if pair_rel:
         lines.append(f"- 关系链：{pair_rel.get('target_name', '')}｜类型={pair_rel.get('rel_type')}｜强度={pair_rel.get('strength')}｜极性={pair_rel.get('sentiment')}｜说明={pair_rel.get('description') or '暂无'}")
+    # 多跳关系：牵线人 + 最短关系链（让"对方↔我"的间接连接进入每次分析）
+    multihop = evidence_pack.get("multihop") or {}
+    intermediaries = multihop.get("intermediaries") or []
+    if intermediaries:
+        lines.append("- 多跳·牵线人（同时认识双方、可引荐/施压的中间人）：")
+        for it in intermediaries[:6]:
+            person = it.get("person") or {}
+            lines.append(f"  - {person.get('name') or person.get('id')}：与发言方[{it.get('my_rel') or '?'}/{it.get('my_sentiment')}]、与对方[{it.get('target_rel') or '?'}/{it.get('target_sentiment')}]")
+    path = multihop.get("path") or {}
+    if path.get("nodes"):
+        chain = " → ".join((n.get("name") or str(n.get("id"))) for n in path["nodes"])
+        lines.append(f"- 多跳·关系链（{path.get('hops')} 跳）：{chain}")
     graph_people = (evidence_pack.get("graph_context") or {}).get("people", [])
     if graph_people:
         lines.append("- Neo4j 图谱上下文：")
-        for group in graph_people[:3]:
+        for group in graph_people[:6]:
             person = group.get("person") or {}
             rel_count = len([item for item in (group.get("relationships") or []) if item.get("target_id")])
             memory_count = len([item for item in (group.get("memories") or []) if item.get("id")])
             evidence_count = len([item for item in (group.get("evidence") or []) if item.get("id")])
             lines.append(f"  - {person.get('name') or person.get('id')}：关系 {rel_count}，记忆 {memory_count}，证据 {evidence_count}")
-    references = evidence_pack.get("reference_hits", [])[:4]
+    references = evidence_pack.get("reference_hits", [])[:8]
     if references:
         lines.append("- 参考资料命中（用户上传的外部依据，可直接引用作答）：")
         for item in references:
             lines.append(f"  - {item.get('content')}（来源：{item.get('source') or '上传资料'}）")
-    memories = [item for item in evidence_pack.get("memory_hits", []) if item.get("memory_type") != "reference"][:6]
+    memories = [item for item in evidence_pack.get("memory_hits", []) if item.get("memory_type") != "reference"][:12]
     if memories:
         lines.append("- 长期记忆命中：")
         for item in memories:
             lines.append(f"  - [{item.get('memory_type')}] {item.get('content')}（置信度 {round(float(item.get('confidence') or 0), 2)}，证据 {item.get('evidence_ids') or []}）")
-    evidence = evidence_pack.get("supporting_evidence", [])[:6]
+    evidence = evidence_pack.get("supporting_evidence", [])[:12]
     if evidence:
         lines.append("- 支撑证据：")
         for item in evidence:
             lines.append(f"  - #{item.get('id')} {item.get('quote')} => {item.get('interpretation')}")
-    conflicts = evidence_pack.get("conflicting_evidence", [])[:3]
+    conflicts = evidence_pack.get("conflicting_evidence", [])[:6]
     if conflicts:
         lines.append("- 反证/冲突证据：")
         for item in conflicts:

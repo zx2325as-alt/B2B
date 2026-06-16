@@ -448,6 +448,21 @@ class AIOrchestrator:
         )
         return result if isinstance(result, dict) else {}
 
+    async def debate_perspective(self, speaker: str, utterance: str, current_read: str, evidence_block: str = "") -> dict:
+        """多轮对抗：对某句话的主流解读跑"魔鬼代言人 + 调和"，产出最强反面解读 + 调和后终版。
+        返回 {alternative_read, stronger, reconciled}。失败/无效时返回空 dict。"""
+        result = await self.call(
+            "perspective_debate",
+            {
+                "speaker": speaker or "对方",
+                "utterance": utterance,
+                "current_read": current_read or "（暂无主流解读）",
+                "evidence_block": evidence_block or "（无额外证据，仅凭原话）",
+            },
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def infer_quick_profile(self, name: str, dialogue: str, scenario: str = "") -> list[dict]:
         """冷启动破局：档案为空时，仅据本会话对话推断某人的临时侧写（不落主档案）。
         返回 [{category, content, evidence}, ...]，每条都要有对话原话支撑。"""

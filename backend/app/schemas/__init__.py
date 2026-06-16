@@ -277,6 +277,10 @@ class ChatMessage(BaseModel):
     active_characters: Optional[list[ActiveCharacter]] = None
     # 预演闭环：若这条是"采用预演并发送"，带上预演 id，发出后与实际回复对账
     prediction_id: Optional[int] = None
+    # 结果反馈闭环（Q5）：若这条是"采用某条应对建议并发送"，带上建议的预期后果/标签，
+    # 发出后与对方实际回复对账成"这招对他有没有用"，回流学习
+    adopted_consequence: Optional[str] = None
+    adopted_label: Optional[str] = None
 
 class ConversationCreate(BaseModel):
     title: str = "新对话"

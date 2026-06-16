@@ -145,9 +145,9 @@ graph:
   bundled_home: "backend/app/models/neo4j-community-5.18.1"
 
 context:
-  # 对话上下文 token 预算（deepseek-chat 支持 64K，24K 留足余量）
-  token_limit: 24000
-  reserve_for_output: 1500
-  # 超过该条数的旧消息进入滚动摘要
-  summary_trigger_messages: 40
-  summary_keep_recent: 20
+  # 对话上下文 token 预算（不计成本/时间：claude-opus 支持长上下文，喂足历史）
+  token_limit: 40000
+  reserve_for_output: 2000
+  # 超过该条数的旧消息进入滚动摘要（拉高 → 更多原始对话保留为上下文，不急着压成摘要）
+  summary_trigger_messages: 60
+  summary_keep_recent: 30

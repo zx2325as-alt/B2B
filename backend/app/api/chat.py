@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models.sql_models import (
     Conversation, ConversationState, Message, MessagePerspective, Character, Relationship, CharacterEvent, CharacterObservation,
-    EvidenceSpan, InteractionUnit, MemoryItem, RetrievalTrace, StructuredDiagnosis, AgentRun, Prediction,
+    EvidenceSpan, InteractionUnit, MemoryItem, RetrievalTrace, StructuredDiagnosis, AgentRun, Prediction, TraitHypothesis,
 )
 from ..schemas import ChatMessage, ConversationCreate, ConversationUpdate, MessageOut, MessagePerspectiveOut, StructuredDiagnosisOut
 from ..harness.orchestrator import orchestrator
@@ -1230,18 +1230,17 @@ def list_message_diagnoses(message_id: int, db: Session = Depends(get_db)):
     ).order_by(StructuredDiagnosis.created_at.desc()).all()
 
 
-@router.post("/messages/{message_id}/diagnose", response_model=StructuredDiagnosisOut)
-async def diagnose_message(message_id: int, db: Session = Depends(get_db)):
-    message = db.get(Message, message_id)
+async def _run_diagnosis_for_message(db: Session, message: Message):
+    """对一条 user 消息跑结构化深度诊断（潜台词/人格信号/关系影响，带证据+复核）。
+    供诊断端点手动触发 + 主分析流后台自动触发复用。无视角/对话时返回 None。"""
     if not message or message.role != "user":
-        raise HTTPException(404, "消息不存在")
+        return None
     conv = db.get(Conversation, message.conversation_id)
     if not conv:
-        raise HTTPException(404, "对话不存在")
-    # 分析挂在用户消息的多视角上（停止 AI 模拟后不再有 assistant 分析消息）
+        return None
     persps = db.query(MessagePerspective).filter(MessagePerspective.message_id == message.id).all()
     if not persps:
-        raise HTTPException(400, "该消息尚无分析结果，请先发送或重新分析")
+        return None
     speaker = (message.character_name or "").strip()
     receiver = (message.receiver_name or "").strip()
     observers = [p for p in persps if not (p.stance == "speaker" or p.viewer_name == speaker)]
@@ -1251,12 +1250,7 @@ async def diagnose_message(message_id: int, db: Session = Depends(get_db)):
     speaker_char = db.query(Character).filter(Character.name == speaker).first()
     listener_char = db.get(Character, message.receiver_id) if message.receiver_id else None
     evidence_pack = build_evidence_pack(
-        db,
-        query_text=message.content,
-        speaker=speaker_char,
-        listener=listener_char,
-        conversation=conv,
-    )
+        db, query_text=message.content, speaker=speaker_char, listener=listener_char, conversation=conv)
     analysis_result = {
         "reply": obs.suggested_reply or "",
         "inner_monologue": obs.inner_monologue or "",
@@ -1265,19 +1259,78 @@ async def diagnose_message(message_id: int, db: Session = Depends(get_db)):
         "subtext": obs.subtext or "",
         "psychological_tag": obs.psychological_tag or "",
     }
-    report = await _run_structured_diagnosis(
-        db,
-        conv=conv,
-        user_msg=message,
-        ai_msg=None,
-        speaker_char=speaker_char,
-        listener_char=listener_char,
-        analysis_result=analysis_result,
-        evidence_pack=evidence_pack,
-    )
+    return await _run_structured_diagnosis(
+        db, conv=conv, user_msg=message, ai_msg=None,
+        speaker_char=speaker_char, listener_char=listener_char,
+        analysis_result=analysis_result, evidence_pack=evidence_pack)
+
+
+async def _maybe_auto_diagnose(db: Session, message: Message):
+    """不计成本：对方发言且尚无诊断时，自动跑结构化深度诊断（理解对方是诊断主战场）。"""
+    conv = db.get(Conversation, message.conversation_id)
+    self_nm = (getattr(conv, "self_name", "") or "").strip()
+    speaker = (message.character_name or "").strip()
+    if self_nm and speaker == self_nm:   # 我自己的话不自动深度诊断
+        return None
+    if db.query(StructuredDiagnosis).filter(StructuredDiagnosis.message_id == message.id).first():
+        return None                       # 已有诊断，不重复
+    try:
+        return await _run_diagnosis_for_message(db, message)
+    except Exception as exc:
+        logger.warning("自动深度诊断失败 msg=%s error=%s", message.id, exc)
+        return None
+
+
+_bg_diag_tasks: set = set()
+
+
+def _spawn_auto_diagnosis(message_id: int):
+    """后台自动深度诊断（独立 session，不拖慢调用方）。"""
+    async def _run():
+        db2 = SessionLocal()
+        try:
+            m = db2.get(Message, message_id)
+            if m:
+                await _maybe_auto_diagnose(db2, m)
+        finally:
+            db2.close()
+    task = asyncio.create_task(_run())
+    _bg_diag_tasks.add(task)
+    task.add_done_callback(_bg_diag_tasks.discard)
+
+
+@router.post("/messages/{message_id}/diagnose", response_model=StructuredDiagnosisOut)
+async def diagnose_message(message_id: int, db: Session = Depends(get_db)):
+    message = db.get(Message, message_id)
+    if not message or message.role != "user":
+        raise HTTPException(404, "消息不存在")
+    if not db.query(MessagePerspective).filter(MessagePerspective.message_id == message.id).first():
+        raise HTTPException(400, "该消息尚无分析结果，请先发送或重新分析")
+    report = await _run_diagnosis_for_message(db, message)
     if not report:
         raise HTTPException(502, "结构化诊断失败")
     return report
+
+
+def _record_adopted_move(db: Session, conv: Conversation, user_msg: Message,
+                         self_nm: str, consequence: str, label: str = "") -> Prediction:
+    """Q5：把「采用某条建议并发出」记成一条 sent 预测（建议的预期后果=预测），
+    复用预演对账——对方下条回复到达时自动判定"这招对他有没有用"并回流学习。返回该 Prediction。"""
+    cp = (user_msg.receiver_name or "").strip() or next(
+        (r[0] for r in db.query(Message.character_name).filter(
+            _visible_message_filter(conv), Message.role == "user",
+            Message.character_name.isnot(None)).distinct().all()
+         if (r[0] or "").strip() and r[0] != self_nm), "")
+    cp_char = db.query(Character).filter(Character.name == cp).first() if cp else None
+    pred = Prediction(
+        conversation_id=conv.id, me_name=self_nm, counterpart_name=cp,
+        counterpart_id=cp_char.id if cp_char else None, candidate=user_msg.content,
+        predicted_reply=(consequence or "").strip()[:500],
+        reaction_type="采纳建议", inner_read=(label or "").strip()[:120],
+        status="sent", sent_message_id=user_msg.id,
+    )
+    db.add(pred); db.commit(); db.refresh(pred)
+    return pred
 
 
 # ─── Stream Chat ──────────────────────────────────────────────────────────────
@@ -1390,9 +1443,9 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
                 logger.warning("状态演化失败 conv=%s error=%s", conv.id, exc)
         conv.updated_at = datetime.utcnow()
         db.commit()
-        # 不计成本：每条分析后自动跑 LLM 复核（后台，不拖慢发送）——每条洞察都被 vetted
+        # 不计成本：每条分析后自动跑「复核 + 对抗分析」（后台，不拖慢发送）——每条洞察都被 vetted 且被反驳过
         if perspectives:
-            _spawn_auto_critic(user_msg.id)
+            _spawn_post_analysis(user_msg.id)
         yield f"data: {json.dumps({'type': 'saved', 'user_message_id': user_msg.id}, ensure_ascii=False)}\n\n"
 
         # 预演闭环（手动模式）：采用预演发出的是「我」的话(标记 sent)；轮到对方真实回复时再对账
@@ -1402,6 +1455,11 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
                 pred.status = "sent"
                 pred.sent_message_id = user_msg.id
                 db.commit()
+        elif self_nm and body.speaker == self_nm and (getattr(body, "adopted_consequence", "") or "").strip():
+            # Q5 结果反馈闭环：采用某条应对建议发出 → 记一条"预测"(建议的预期后果)，
+            # 复用预演对账机制：对方下一条回复到达时自动判定"这招对他有没有用"并回流学习。
+            _record_adopted_move(db, conv, user_msg, self_nm,
+                                 body.adopted_consequence, getattr(body, "adopted_label", "") or "")
         elif self_nm and body.speaker != self_nm:
             # 只给"我紧挨这次对方回复发出的那条预测"对账，避免错配：
             # 取我在这次回复之前的最后一条发言，只有它正是预演发出的那条才对账
@@ -1522,9 +1580,11 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
     _save_perspectives(db, conv.id, message, message.character_name or "", perspectives, primary_name, "")
     conv.updated_at = datetime.utcnow()
     db.commit()
-    # 不计成本：重分析后立即自动复核（这是显式动作，内联等待可接受）
+    # 不计成本：重分析后立即「复核 + 对抗」（显式动作，内联等待可接受）；深度诊断走后台
     if perspectives:
         await _auto_critic_message(db, message)
+        await _auto_debate_message(db, message)
+        _spawn_auto_diagnosis(message.id)
     db.refresh(message)
     return message
 
@@ -1561,9 +1621,11 @@ async def _generate_counterpart_advice(db: Session, conv: Conversation, msg: Mes
     )
     saved = _save_perspectives(db, conv.id, msg, speaker, perspectives, self_nm, "")
     db.commit()
-    # 不计成本：对方发言的应对建议生成后立即自动复核
+    # 不计成本：对方发言的应对建议生成后立即「复核 + 对抗」；深度诊断走后台
     if perspectives:
         await _auto_critic_message(db, msg)
+        await _auto_debate_message(db, msg)
+        _spawn_auto_diagnosis(msg.id)
     return saved
 
 
@@ -1815,19 +1877,84 @@ async def _auto_critic_message(db: Session, message: Message) -> dict:
     return {"overall": (review.get("overall") or "").strip(), "corrections": corrections}
 
 
+async def _auto_debate_message(db: Session, message: Message) -> dict:
+    """对「发言者自述视角」(他这句话的真实意图——驱动一切的那条)跑一轮对抗分析(正方→魔鬼代言人→调和)，
+    把 debate 并入该视角 analysis_json。只跑这一个最关键视角，不是全部。返回 debate dict 或空。"""
+    speaker = (message.character_name or "").strip()
+    persp = (db.query(MessagePerspective).filter(
+                MessagePerspective.message_id == message.id, MessagePerspective.stance == "speaker").first()
+             or db.query(MessagePerspective).filter(
+                MessagePerspective.message_id == message.id, MessagePerspective.viewer_name == speaker).first())
+    if not persp:
+        return {}
+    aj = persp.analysis_json or {}
+    emo = (aj.get("emotions") or {}).get("deep") or {}
+    current_read = "\n".join(p for p in [
+        f"真实意图/第一反应：{(aj.get('inner_monologue') or {}).get('first_reaction', '')}",
+        f"潜台词：{persp.subtext or ''}",
+        f"深层情绪：{emo.get('label', '')}({emo.get('score', '')})",
+    ] if not p.endswith("：") and not p.endswith("：()"))
+    conv = db.get(Conversation, message.conversation_id)
+    evidence_block = ""
+    try:
+        speaker_char = db.query(Character).filter(Character.name == speaker).first()
+        pack = build_evidence_pack(db, query_text=message.content, speaker=speaker_char, listener=None, conversation=conv)
+        evidence_block = render_evidence_pack(pack)
+    except Exception:
+        evidence_block = ""
+    try:
+        debate = await orchestrator.debate_perspective(speaker, message.content, current_read, evidence_block)
+    except Exception as exc:
+        logger.warning("对抗分析失败 msg=%s error=%s", message.id, exc)
+        return {}
+    reconciled = debate.get("reconciled") if isinstance(debate, dict) else None
+    if not isinstance(reconciled, dict):
+        return {}
+    alt = debate.get("alternative_read") or {}
+    stronger = (debate.get("stronger") or "original").strip().lower()
+    if stronger not in ("original", "alternative", "both"):
+        stronger = "original"
+    new_aj = dict(aj)
+    new_aj["debate"] = {
+        "alternative": {
+            "intent": (alt.get("intent") or "").strip()[:200],
+            "subtext": (alt.get("subtext") or "").strip()[:200],
+            "deep_emotion": alt.get("deep_emotion") or {},
+        },
+        "stronger": stronger,
+        "reconciled": {
+            "subtext": (reconciled.get("subtext") or "").strip()[:300],
+            "deep_emotion": reconciled.get("deep_emotion") or {},
+            "confidence": reconciled.get("confidence"),
+            "why": (reconciled.get("why") or "").strip()[:300],
+        },
+    }
+    # 主流解读被对抗推翻时，置信只降不升（保守）
+    if stronger == "alternative":
+        rc, cur = reconciled.get("confidence"), new_aj.get("confidence")
+        if isinstance(rc, (int, float)):
+            new_aj["confidence"] = round(min(cur, rc) if isinstance(cur, (int, float)) else rc, 2)
+    persp.analysis_json = new_aj
+    db.commit()
+    return new_aj["debate"]
+
+
 _bg_critic_tasks: set = set()
 
 
-def _spawn_auto_critic(message_id: int):
-    """发消息后异步复核：不拖慢发送（opus 分析本就慢），用独立 session 后台精修，前端下次加载即见。"""
+def _spawn_post_analysis(message_id: int):
+    """发消息后异步精修：不拖慢发送（opus 分析本就慢），用独立 session 顺序跑「复核→对抗」，前端下次加载即见。
+    复核与对抗都改 analysis_json，必须同一 session 顺序执行，避免并发写互相覆盖。"""
     async def _run():
         db2 = SessionLocal()
         try:
             m = db2.get(Message, message_id)
             if m:
                 await _auto_critic_message(db2, m)
+                await _auto_debate_message(db2, m)
+                await _maybe_auto_diagnose(db2, m)
         except Exception as exc:
-            logger.warning("后台自动复核失败 msg=%s error=%s", message_id, exc)
+            logger.warning("后台精修失败 msg=%s error=%s", message_id, exc)
         finally:
             db2.close()
     task = asyncio.create_task(_run())
@@ -2240,6 +2367,61 @@ def conversation_prediction_stats(conv_id: int, counterpart: str = "", db: Sessi
         "hit_rate": round(hits / len(resolved), 2) if resolved else None,
         "recent": recent,
     }
+
+
+@router.get("/conversations/{conv_id}/counterpart-memory")
+def counterpart_memory(conv_id: int, name: str = "", db: Session = Depends(get_db)):
+    """越用越准·把长期学习摆上台面：聚合关于「对方」系统已累积的认知
+    （核心档案 + 确认假设 + 已批准观察 + 预演教训）+ 预演命中率。name 为空时取本会话的非「我」一方。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    self_nm = (getattr(conv, "self_name", "") or "").strip()
+    cp = (name or "").strip()
+    if not cp:
+        rows = db.query(Message.character_name).filter(
+            _visible_message_filter(conv), Message.role == "user",
+            Message.character_name.isnot(None)).distinct().all()
+        cp = next((r[0] for r in rows if (r[0] or "").strip() and r[0] != self_nm), "")
+    char = db.query(Character).filter(Character.name == cp).first() if cp else None
+    if not char:
+        return {"name": cp, "character_id": None, "profile": {}, "learnings": [], "count": 0, "prediction": None}
+    profile = {
+        "role": char.role or "", "motivation": char.motivation or "",
+        "weakness": char.weakness or "", "speaking_style": char.speaking_style or "",
+        "tags": char.personality_tags or [],
+    }
+    learnings: list[dict] = []
+    for h in (db.query(TraitHypothesis).filter(
+            TraitHypothesis.character_id == char.id, TraitHypothesis.status != "rejected")
+            .order_by(TraitHypothesis.confidence.desc()).limit(8).all()):
+        learnings.append({"source": "已确认" if h.status == "confirmed" else "推测",
+                          "dimension": h.dimension or "", "content": (h.hypothesis or "")[:160],
+                          "confidence": round(float(h.confidence or 0), 2)})
+    for o in (db.query(CharacterObservation).filter(
+            CharacterObservation.character_id == char.id, CharacterObservation.status == "approved")
+            .order_by(CharacterObservation.created_at.desc()).limit(6).all()):
+        content = (o.new_value or o.reason or "").strip()
+        if content:
+            learnings.append({"source": "已入档", "dimension": o.field or "",
+                              "content": content[:160], "confidence": None})
+    for m in (db.query(MemoryItem).filter(
+            MemoryItem.character_id == char.id, MemoryItem.status == "active",
+            MemoryItem.memory_type == "diagnosis")
+            .order_by(MemoryItem.confidence.desc(), MemoryItem.updated_at.desc()).limit(6).all()):
+        learnings.append({"source": "教训", "dimension": "预演复盘",
+                          "content": (m.content or "")[:160], "confidence": round(float(m.confidence or 0), 2)})
+    # 预演命中率（跨会话，按对方名汇总——"对他准不准"是越用越准的硬指标）
+    preds = db.query(Prediction).filter(Prediction.counterpart_name == cp).all()
+    resolved = [p for p in preds if p.status == "resolved"]
+    hits = sum(1 for p in resolved if p.verdict == "hit")
+    partial = sum(1 for p in resolved if p.verdict == "partial")
+    prediction = {
+        "resolved": len(resolved), "hits": hits, "partial": partial,
+        "hit_rate": round(hits / len(resolved), 2) if resolved else None,
+    }
+    return {"name": cp, "character_id": char.id, "profile": profile,
+            "learnings": learnings, "count": len(learnings), "prediction": prediction}
 
 
 _GP_DIRECTIONS = {"advance", "stall", "regress"}

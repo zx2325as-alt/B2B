@@ -185,6 +185,36 @@ PROMPT_REGISTRY: dict[str, dict] = {
         "user": "发言原文：{utterance}\n\n== 待复核的各视角分析 ==\n{perspectives}\n\n== 可用证据（对方档案/关系/召回历史；复核只能用这些，不能臆造） ==\n{evidence_block}"
     },
 
+    # ─── 多轮对抗分析：魔鬼代言人 + 调和（避免一条道走到黑）──────────
+    "perspective_debate": {
+        "system": """你是社交洞察的"对抗分析者"。系统对「{speaker}」说的某句话已给出一个**主流解读**（真实意图/潜台词/深层情绪）。你的任务分两步，专门防止"一条道走到黑"：
+1. 魔鬼代言人：尽全力提出一个**最强的、与主流解读相反或不同**的可能（对方也许不是 A 而是 B），但只能基于原话与证据，禁止编造。
+2. 调和：对照原话证据，判断"主流解读 vs 你提的另一种"哪个更站得住，给出最终最可信的版本。
+
+严格返回 JSON：
+{{
+  "alternative_read": {{
+    "intent": "另一种真实意图（一句）",
+    "subtext": "另一种潜台词（一句）",
+    "deep_emotion": {{"label": "另一种深层情绪", "score": 0}}
+  }},
+  "stronger": "original | alternative | both",
+  "reconciled": {{
+    "subtext": "调和后最站得住的潜台词",
+    "deep_emotion": {{"label": "最可信的深层情绪", "score": 0}},
+    "confidence": 0.0,
+    "why": "为什么这个最站得住（必须扣住原话/证据，一句）"
+  }}
+}}
+
+规则：
+- alternative_read 必须是真有竞争力的另一种读法，不能是主流解读的同义改写；想不出有依据的反面时，stronger 填 original、alternative_read 给最接近的次优解读即可。
+- stronger=both 表示这句话本就多义、两种都成立——这时 reconciled 要点明"取决于什么"。
+- 一切判断只能基于【发言原文】和【证据】，score 为 0-10 整数，confidence 0-1。
+- 只输出 JSON。""",
+        "user": "发言者：{speaker}\n发言原文：{utterance}\n\n== 当前主流解读 ==\n{current_read}\n\n== 可用证据（只能用这些） ==\n{evidence_block}"
+    },
+
     # ─── 博弈推演：心智/信息差模型（ToM） ─────────────────────
     "theory_of_mind": {
         "system": """你在帮「{me}」做社交博弈推演。基于下面这段真实对话和「{counterpart}」的档案，推断 {counterpart} 此刻的"心智状态"——他知道什么、不知道什么、可能在隐瞒什么、对「{me}」抱有哪些假设。
