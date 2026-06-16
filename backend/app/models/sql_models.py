@@ -297,6 +297,9 @@ class Conversation(Base):
     self_name = Column(String(100), default="")
     # 「我」跟对方在这段关系里想达成的目标（注入分析，让应对策略围绕它排序）
     goal = Column(Text, default="")
+    # 目标进度追踪：连续分段评估对话有没有朝目标推进（增量缓存）
+    # {score, trend, blocker, next_lever, segments:[...], assessed_until_index, updated_at}
+    goal_progress_json = Column(JSON, default=dict)
     is_readonly = Column(Boolean, default=False)
     source_import_file_id = Column(Integer, ForeignKey("import_files.id"), nullable=True)
     active_branch_id = Column(String(80), nullable=True)
@@ -397,3 +400,31 @@ class Message(Base):
     @property
     def timestamp(self):
         return self.created_at
+
+
+class Prediction(Base):
+    """发出前预演记录：预测对方反应 → 真发出后与实际对账 → 回流学习（预演闭环）。"""
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    me_name = Column(String(100), default="")
+    counterpart_name = Column(String(100), default="", index=True)
+    counterpart_id = Column(Integer, ForeignKey("characters.id"), nullable=True)
+    candidate = Column(Text, default="")              # 我预演要说的话
+    # 预测内容
+    predicted_reply = Column(Text, default="")
+    reaction_type = Column(String(40), default="")
+    success_likelihood = Column(Float, nullable=True)
+    inner_read = Column(Text, default="")
+    emotion = Column(String(40), default="")
+    # 对账
+    status = Column(String(20), default="open")       # open / sent / resolved
+    sent_message_id = Column(Integer, nullable=True)   # 真正发出的那条 user 消息
+    actual_reply = Column(Text, default="")            # 对方实际回复
+    verdict = Column(String(20), default="")           # hit / partial / miss
+    reaction_match = Column(Boolean, nullable=True)
+    verdict_note = Column(Text, default="")
+    lesson = Column(Text, default="")                  # 这次落差教会我们关于这个人的什么
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)

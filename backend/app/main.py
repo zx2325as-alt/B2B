@@ -71,6 +71,7 @@ def _ensure_sqlite_columns():
             "scene_brief": "ALTER TABLE conversations ADD COLUMN scene_brief TEXT DEFAULT ''",
             "self_name": "ALTER TABLE conversations ADD COLUMN self_name VARCHAR(100) DEFAULT ''",
             "goal": "ALTER TABLE conversations ADD COLUMN goal TEXT DEFAULT ''",
+            "goal_progress_json": "ALTER TABLE conversations ADD COLUMN goal_progress_json JSON",
         },
         "messages": {
             "message_index": "ALTER TABLE messages ADD COLUMN message_index INTEGER DEFAULT 0",

@@ -77,12 +77,42 @@ class AIOrchestrator:
     - 任务级超时（config.yaml ai.task_timeouts）
     """
 
-    async def _create_completion(self, task_name: str, client, request_kwargs: dict[str, Any]):
+    def _resolve_model_for_provider(self, task_name: str, provider_name: str) -> str | None:
+        """为「兜底供应商」算出该任务应使用的模型（按任务复杂度取该 provider 的模型分级）。"""
+        ai_config = get_ai_config()
+        pconf = (ai_config.get("providers", {}) or {}).get(provider_name) or {}
+        if not pconf:
+            return None
+        complexity = model_router.TASK_MAP.get(task_name)
+        complexity_val = complexity.value if complexity else "medium"
+        models = pconf.get("models", {}) or {}
+        return (ai_config.get("task_models", {}) or {}).get(task_name) or models.get(complexity_val)
+
+    async def _create_completion(self, task_name: str, client, request_kwargs: dict[str, Any], provider_name: str = ""):
         timeout = get_task_timeout(task_name)
-        return await asyncio.wait_for(
-            client.chat.completions.create(**request_kwargs),
-            timeout=timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                client.chat.completions.create(**request_kwargs),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, openai.APIConnectionError, openai.APITimeoutError,
+                openai.InternalServerError, openai.RateLimitError) as exc:
+            # 主供应商连接/超时/限流/5xx → 自动切到 config 的 fallback_provider 重试一次
+            fb = (get_ai_config().get("fallback_provider") or "").strip()
+            providers_config = get_ai_config().get("providers", {}) or {}
+            if not fb or fb == provider_name or fb not in providers_config:
+                raise
+            fb_model = self._resolve_model_for_provider(task_name, fb)
+            if not fb_model:
+                raise
+            logger.warning("主供应商失败，切兜底 provider=%s→%s model=%s task=%s err=%s",
+                           provider_name or "?", fb, fb_model, task_name, exc)
+            fb_client = get_openai_client(fb)
+            fb_kwargs = {**request_kwargs, "model": fb_model}
+            return await asyncio.wait_for(
+                fb_client.chat.completions.create(**fb_kwargs),
+                timeout=timeout,
+            )
 
     async def call(
         self,
@@ -128,7 +158,7 @@ class AIOrchestrator:
                     request_kwargs["response_format"] = {"type": "json_object"}
                 if request_overrides:
                     request_kwargs.update(request_overrides)
-                response = await self._create_completion(task_name, client, request_kwargs)
+                response = await self._create_completion(task_name, client, request_kwargs, model_cfg.provider)
                 raw = response.choices[0].message.content or ""
                 finish_reason = response.choices[0].finish_reason if response.choices else None
                 result = guardrails.process(task_name, raw)
@@ -212,6 +242,7 @@ class AIOrchestrator:
                         "temperature": model_cfg.temperature,
                         "messages": openai_messages,
                     },
+                    model_cfg.provider,
                 )
                 return (response.choices[0].message.content or "").strip()
             except Exception:
@@ -317,10 +348,11 @@ class AIOrchestrator:
 
     async def analyze_multi_perspective(
         self, scenario: str, speaker: str, content: str, viewers_block: str, context: str,
-        memory_block: str = "", goal: str = "",
+        memory_block: str = "", goal: str = "", dynamics: str = "",
     ) -> list[dict]:
         """多视角分析：在场每个旁观角色对这句话的独立分析。返回 normalize 后的 perspective 列表。
-        memory_block 注入向量语义召回的相关历史/证据；goal 给定时让「我」的 moves 围绕目标排序。"""
+        memory_block 注入向量语义召回的相关历史/证据；goal 给定时让「我」的 moves 围绕目标排序；
+        dynamics 是确定性算出的对话动态硬提示（重复/连发未回应/反常），强制分析随对话变化。"""
         result = await self.call(
             "multi_perspective_analysis",
             {
@@ -328,6 +360,7 @@ class AIOrchestrator:
                 "viewers_block": viewers_block, "context": context or "（对话开始）",
                 "memory_block": memory_block or "（暂无相关历史记忆）",
                 "goal": goal or "（未指定具体目标，给出通用而稳妥的应对即可）",
+                "dynamics": dynamics or "（无特殊动态，按正常对话分析）",
             },
             retries=1,
         )
@@ -385,6 +418,56 @@ class AIOrchestrator:
             retries=1,
         )
         return result if isinstance(result, dict) else {}
+
+    async def assess_goal_progress(self, me: str, goal: str, prev_state: str, new_dialogue: str) -> dict:
+        """目标进度：只评估新发生的对话相对目标推进/停滞/倒退，并在此前进度上更新总分。"""
+        result = await self.call(
+            "goal_progress_review",
+            {
+                "me": me or "我", "goal": goal,
+                "prev_state": prev_state or "（尚无，刚开始追踪，进度从 0 起步）",
+                "new_dialogue": new_dialogue or "（暂无新对话）",
+            },
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def review_prediction(self, me: str, counterpart: str, candidate: str,
+                                pred_reaction: str, pred_reply: str, pred_success, actual_reply: str) -> dict:
+        """预演闭环：对照"当时的预测"与"对方实际回复"，判定准不准 + 提炼对这个人的教训。"""
+        result = await self.call(
+            "prediction_review",
+            {
+                "me": me, "counterpart": counterpart, "candidate": candidate,
+                "pred_reaction": pred_reaction or "（未知）",
+                "pred_reply": pred_reply or "（无）",
+                "pred_success": pred_success if pred_success is not None else "（未知）",
+                "actual_reply": actual_reply or "（对方未回复）",
+            },
+            retries=1,
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def infer_quick_profile(self, name: str, dialogue: str, scenario: str = "") -> list[dict]:
+        """冷启动破局：档案为空时，仅据本会话对话推断某人的临时侧写（不落主档案）。
+        返回 [{category, content, evidence}, ...]，每条都要有对话原话支撑。"""
+        result = await self.call(
+            "quick_profile_infer",
+            {"name": name, "scenario": scenario or "日常对话", "dialogue": dialogue or "（暂无对话）"},
+            retries=1,
+        )
+        facts = result.get("facts") if isinstance(result, dict) else None
+        if not isinstance(facts, list):
+            return []
+        out = []
+        for f in facts:
+            if isinstance(f, dict) and (f.get("content") or "").strip():
+                out.append({
+                    "category": (f.get("category") or "").strip(),
+                    "content": (f.get("content") or "").strip(),
+                    "evidence": (f.get("evidence") or "").strip(),
+                })
+        return out
 
     async def generate_character_profile(self, name: str, role: str, background: str) -> dict:
         return await self.call(

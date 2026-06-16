@@ -275,6 +275,8 @@ class ChatMessage(BaseModel):
     receiver_id: Optional[int] = None
     scenario: str = "general"
     active_characters: Optional[list[ActiveCharacter]] = None
+    # 预演闭环：若这条是"采用预演并发送"，带上预演 id，发出后与实际回复对账
+    prediction_id: Optional[int] = None
 
 class ConversationCreate(BaseModel):
     title: str = "新对话"

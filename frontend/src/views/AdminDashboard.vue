@@ -358,13 +358,18 @@
         <div v-if="activeTab === 'knowledge'" class="tab-content">
           <div class="rel-header">
             <div class="section-title" style="margin:0">参考资料库</div>
-            <label class="btn btn-primary" style="font-size:12px;padding:6px 12px;cursor:pointer">
-              {{ knowledgeUploading ? '上传中…' : '＋ 上传资料' }}
-              <input type="file" accept=".txt,.md,.pdf,.docx" style="display:none" :disabled="knowledgeUploading" @change="handleUploadKnowledge" />
-            </label>
+            <div style="display:flex;align-items:center;gap:10px">
+              <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-secondary);cursor:pointer" title="除入向量库供检索外，再把资料抽取成立体档案融合进角色">
+                <input type="checkbox" v-model="enrichOnUpload"/> 同时充实档案
+              </label>
+              <label class="btn btn-primary" style="font-size:12px;padding:6px 12px;cursor:pointer">
+                {{ knowledgeUploading ? '处理中…' : '＋ 上传资料' }}
+                <input type="file" accept=".txt,.md,.pdf,.docx" style="display:none" :disabled="knowledgeUploading" @change="handleUploadKnowledge" />
+              </label>
+            </div>
           </div>
           <div class="obs-reason" style="margin:-4px 0 12px;opacity:.8">
-            上传与 TA 相关的资料（文章 / 笔记 / 长文档）。系统切块入向量库，分析对话时会按语义召回相关片段作为依据，并标注来源。
+            上传与 TA 相关的资料（文章 / 笔记 / 长文档）。系统切块入向量库按语义召回作为依据；勾选「同时充实档案」会把资料抽取成立体档案（价值观/恐惧/人际模式等）融合进角色，画像卡与应对建议随之受益。
           </div>
           <div v-if="knowledgeFiles.length" class="rel-list">
             <div v-for="f in knowledgeFiles" :key="f.source" class="card" style="padding:12px 14px;display:flex;align-items:center;gap:12px">
@@ -390,6 +395,78 @@
       <div v-if="!chars.characters.length" class="graph-empty">
         <div style="font-size:32px;color:var(--border-strong)">◈</div>
         <div style="font-size:12px;color:var(--text-muted);margin-top:8px">创建角色后显示图谱</div>
+      </div>
+
+      <!-- 多跳推理：关系之上再走几步（Neo4j 图谱真正的强项） -->
+      <div class="multihop card">
+        <button class="multihop-toggle" @click="mhOpen = !mhOpen">
+          <span style="color:var(--cyan)">{{ mhOpen ? '▾' : '▸' }}</span> 多跳推理
+          <span class="mh-sub">牵线人 · 共同路径 · 立场传染 · 枢纽 · 溯源</span>
+        </button>
+        <div v-show="mhOpen" class="multihop-body">
+          <div class="mh-row">
+            <select v-model="mhA" class="input mh-sel">
+              <option value="">选 A / 我</option>
+              <option v-for="c in chars.characters" :key="`mha-${c.id}`" :value="c.id">{{ c.name }}</option>
+            </select>
+            <span style="color:var(--text-muted)">→</span>
+            <select v-model="mhB" class="input mh-sel">
+              <option value="">选 B / 目标</option>
+              <option v-for="c in chars.characters" :key="`mhb-${c.id}`" :value="c.id">{{ c.name }}</option>
+            </select>
+          </div>
+          <div class="mh-actions">
+            <button class="btn btn-ghost mh-btn" @click="runHubs">社交枢纽</button>
+            <button class="btn btn-ghost mh-btn" :disabled="!mhA || !mhB" @click="runIntermediaries">牵线人</button>
+            <button class="btn btn-ghost mh-btn" :disabled="!mhA || !mhB" @click="runPath">共同路径</button>
+            <button class="btn btn-ghost mh-btn" :disabled="!mhA" @click="runPropagation">立场传染(A)</button>
+            <button class="btn btn-ghost mh-btn" :disabled="!mhA" @click="runEvidenceChain">证据溯源(A)</button>
+          </div>
+          <div v-if="mhLoading" class="mh-hint">查询中…</div>
+          <div v-else-if="mhError" class="tag red" style="margin-top:8px">{{ mhError }}</div>
+          <div v-else-if="mhResult" class="mh-result">
+            <div class="mh-result-title">{{ mhResult.label }}</div>
+            <!-- 社交枢纽 -->
+            <div v-if="mhResult.kind === 'hubs'">
+              <div v-for="h in mhResult.data.hubs" :key="`hub-${h.person.id}`" class="mh-item">
+                <b>{{ h.person.name }}</b> · 连接 {{ h.degree }} 人 · 平均态度 {{ (h.avg_sentiment||0).toFixed(2) }}
+              </div>
+              <div v-if="!mhResult.data.hubs?.length" class="mh-hint">图谱里还没有关系数据</div>
+            </div>
+            <!-- 牵线人 -->
+            <div v-else-if="mhResult.kind === 'intermediaries'">
+              <div class="mh-hint">{{ mhResult.data.me.name }} 想认识 {{ mhResult.data.target.name }}，可经：</div>
+              <div v-for="m in mhResult.data.intermediaries" :key="`int-${m.person.id}`" class="mh-item">
+                <b>{{ m.person.name }}</b> 引荐（{{ m.my_rel }} / {{ m.target_rel }}）
+              </div>
+              <div v-if="!mhResult.data.intermediaries?.length" class="mh-hint">没找到中间人（可能已直接相连或暂无路径）</div>
+            </div>
+            <!-- 共同路径 -->
+            <div v-else-if="mhResult.kind === 'path'">
+              <div v-if="mhResult.data.path?.nodes" class="mh-item">
+                {{ mhResult.data.path.nodes.map(n => n.name).join('  →  ') }}
+                <span class="tag" style="font-size:10px;margin-left:6px">{{ mhResult.data.path.hops }} 跳</span>
+              </div>
+              <div v-else class="mh-hint">两人之间没有可达的关系链</div>
+            </div>
+            <!-- 立场传染 -->
+            <div v-else-if="mhResult.kind === 'propagation'">
+              <div class="mh-hint">{{ mhResult.data.me.name }} 的二度人脉态度推断：</div>
+              <div v-for="(l, i) in mhResult.data.links" :key="`prop-${i}`" class="mh-item">
+                经 <b>{{ l.via.name }}</b> → <b>{{ l.person.name }}</b>
+                <span class="tag" :class="l.predicted_stance==='倾向友好'?'green':(l.predicted_stance==='倾向戒备'?'red':'')" style="font-size:10px;margin-left:4px">{{ l.predicted_stance }}</span>
+              </div>
+              <div v-if="!mhResult.data.links?.length" class="mh-hint">暂无二度人脉</div>
+            </div>
+            <!-- 证据溯源 -->
+            <div v-else-if="mhResult.kind === 'evidence'">
+              <div v-for="(c, i) in mhResult.data.chains" :key="`ev-${i}`" class="mh-item">
+                {{ (c.memory.content || '').slice(0, 40) }} <span class="tag" style="font-size:10px">{{ c.evidence.length }} 条证据</span>
+              </div>
+              <div v-if="!mhResult.data.chains?.length" class="mh-hint">该角色暂无可溯源的记忆链</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- AI Analysis Result -->
@@ -908,6 +985,7 @@ const activeTab = ref('profile')
 // ── 参考资料库（RAG 上传） ──────────────────────────────────────
 const knowledgeFiles = ref([])
 const knowledgeUploading = ref(false)
+const enrichOnUpload = ref(true)  // 上传同时把资料抽取进立体档案
 async function loadKnowledge() {
   if (!activeChar.value) { knowledgeFiles.value = []; return }
   try {
@@ -920,10 +998,14 @@ async function handleUploadKnowledge(e) {
   if (!file || !activeChar.value) return
   knowledgeUploading.value = true
   try {
-    const res = await characterApi.uploadKnowledge(activeChar.value.id, file)
+    const res = await characterApi.uploadKnowledge(activeChar.value.id, file, enrichOnUpload.value)
     const d = res.data || {}
-    toast.success(`已入库 ${d.chunks_added} 块${d.embedded ? '（已向量化）' : '（未向量化，检查 embedding 配置）'}${d.hint ? '；' + d.hint : ''}`)
+    const parts = [`已入库 ${d.chunks_added} 块${d.embedded ? '（已向量化）' : '（未向量化，检查 embedding 配置）'}`]
+    if (d.profile_enriched) parts.push('并已充实立体档案')
+    if (d.hint) parts.push(d.hint)
+    toast.success(parts.join('；'))
     await loadKnowledge()
+    if (d.profile_enriched) { await chars.fetchAll(); await loadProfileView(activeChar.value.id) }  // 刷新档案视图
   } catch (err) {
     toast.error('上传失败：' + (err?.response?.data?.detail || err?.message || ''))
   } finally {
@@ -1059,6 +1141,31 @@ function hasRelAnalysis(rel) {
 const graphCanvas = ref(null)
 let animFrame = null
 const expandedBehaviorKeys = ref([])
+
+// ── 多跳推理（Neo4j）：牵线人 / 共同路径 / 立场传染 / 社交枢纽 / 证据溯源 ──
+const mhOpen = ref(false)
+const mhA = ref('')
+const mhB = ref('')
+const mhResult = ref(null)
+const mhLoading = ref(false)
+const mhError = ref('')
+async function mhRun(fn, kind, label) {
+  mhLoading.value = true; mhError.value = ''; mhResult.value = null
+  try {
+    const res = await fn()
+    mhResult.value = { kind, label, data: res.data }
+  } catch (e) {
+    const detail = e?.response?.data?.detail
+    mhError.value = (detail && (detail.message || detail)) || e?.message || '查询失败（请确认 Neo4j 已启动并同步）'
+  } finally {
+    mhLoading.value = false
+  }
+}
+const runHubs = () => mhRun(() => characterApi.graphHubs(), 'hubs', '社交枢纽')
+const runIntermediaries = () => mhRun(() => characterApi.graphIntermediaries(mhA.value, mhB.value), 'intermediaries', '牵线人 / 二度人脉')
+const runPath = () => mhRun(() => characterApi.graphPath(mhA.value, mhB.value), 'path', '共同路径')
+const runPropagation = () => mhRun(() => characterApi.graphSentimentPropagation(mhA.value), 'propagation', '立场传染')
+const runEvidenceChain = () => mhRun(() => characterApi.graphEvidenceChain(mhA.value), 'evidence', '证据溯源链')
 
 const tabs = [
   { key: 'profile', label: '角色档案' },
@@ -2046,6 +2153,19 @@ function renderGraph() {
 .graph-panel { width:320px; flex-shrink:0; display:flex; flex-direction:column; background:var(--bg-surface); position:relative; }
 .graph-canvas { flex:1; cursor:pointer; display:block; }
 .graph-empty { position:absolute; inset:60px 0 0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+.multihop { margin:8px; padding:0; border:1px solid var(--border); }
+.multihop-toggle { width:100%; display:flex; align-items:center; gap:6px; padding:8px 10px; background:none; border:none; cursor:pointer; color:var(--text-secondary); font-size:12px; font-weight:600; }
+.multihop-toggle:hover { color:var(--text-primary); }
+.mh-sub { font-weight:400; color:var(--text-muted); font-size:10px; }
+.multihop-body { padding:0 10px 10px; display:flex; flex-direction:column; gap:8px; }
+.mh-row { display:flex; align-items:center; gap:6px; }
+.mh-sel { flex:1; font-size:12px; padding:5px 8px; }
+.mh-actions { display:flex; flex-wrap:wrap; gap:6px; }
+.mh-btn { font-size:11px; padding:4px 9px; }
+.mh-hint { font-size:11px; color:var(--text-muted); }
+.mh-result { border-top:1px solid var(--border); padding-top:8px; max-height:240px; overflow-y:auto; }
+.mh-result-title { font-size:11px; font-weight:600; color:var(--cyan); margin-bottom:6px; }
+.mh-item { font-size:12px; color:var(--text-secondary); line-height:1.7; padding:3px 0; border-bottom:1px dashed var(--border); }
 .rel-analysis { position:absolute; bottom:16px; left:12px; right:12px; padding:12px 14px; }
 
 /* Modal */

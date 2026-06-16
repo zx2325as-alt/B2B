@@ -583,10 +583,49 @@ KNOWLEDGE_CHUNK_OVERLAP = 100
 KNOWLEDGE_MAX_CHUNKS = 80
 
 
+async def _enrich_profile_from_text(db: Session, char: Character, text: str, source_label: str) -> dict[str, Any]:
+    """把一段关于该人物的资料正文，抽取成结构化立体档案融合进角色（复用导入的融合管线）。
+    不只做可搜索碎片——让上传资料真正沉淀进档案，画像卡/应对建议随之受益。返回 {enriched, version}。"""
+    current = json.dumps({
+        "role": char.role or "", "background": char.background or "",
+        "personality_tags": char.personality_tags or [], "core_traits": char.core_traits or {},
+        "motivation": char.motivation or "", "weakness": char.weakness or "",
+        "speaking_style": char.speaking_style or "", "extended": char.profile_json or {},
+    }, ensure_ascii=False)
+    profile = await orchestrator.generate_import_profile(
+        name=char.name,
+        current_profile=current,
+        dialogue_samples=text[:8000],
+        event_samples="",
+        relationship_samples="",
+        rule_hints="这是一份关于该人物的资料文档（非对话）。请从中抽取其价值观/动机/弱点/恐惧/人际模式/语言风格/关键经历等，谨慎可解释，证据不足的维度留空。",
+    )
+    if not isinstance(profile, dict):
+        return {"enriched": False, "version": char.version}
+    changed = _apply_profile_candidate(
+        db, char, profile,
+        source=source_label,
+        evidence_note=f"从上传资料《{source_label}》自动抽取",
+        base_confidence=0.7,
+        merge_mode=True,
+    )
+    if changed:
+        db.commit()
+        db.refresh(char)
+        supporting = [
+            item.id for item in db.query(EvidenceSpan).filter(EvidenceSpan.character_id == char.id)
+            .order_by(EvidenceSpan.created_at.desc()).limit(20).all()
+        ]
+        _create_personality_snapshot(db, char, source=source_label, supporting_evidence=supporting)
+        db.commit()
+        db.refresh(char)
+    return {"enriched": bool(changed), "version": char.version}
+
+
 @router.post("/{character_id}/knowledge")
-async def upload_knowledge(character_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """给角色上传参考资料：抽取文本 → 切块 → 算向量 → 存为 reference 记忆。
-    这些块会被现有语义检索自动召回，作为对话/分析的依据。"""
+async def upload_knowledge(character_id: int, file: UploadFile = File(...), enrich_profile: bool = True, db: Session = Depends(get_db)):
+    """给角色上传参考资料：抽取文本 → 切块 → 算向量 → 存为 reference 记忆（供检索召回）；
+    同时（enrich_profile=True）把资料抽取成结构化立体档案融合进角色，不只做可搜索碎片。"""
     char = db.get(Character, character_id)
     if not char:
         raise HTTPException(404, "角色不存在")
@@ -624,13 +663,22 @@ async def upload_knowledge(character_id: int, file: UploadFile = File(...), db: 
         ))
         added += 1
     db.commit()
-    # 自主判断：短资料其实更适合走"导入→丰富档案"，给个提示但仍按资料入库
-    hint = ""
-    if len(text) < 400 and detect_import_type(file.filename, text) == "profile_document":
-        hint = "这份资料较短、像人物简介——若想直接丰富档案，可改用「导入」功能。"
+    # ① 自动充实档案：把资料抽取成立体档案融合进角色（不只做可搜索碎片）
+    profile_enriched = False
+    profile_version = char.version
+    enrich_warning = ""
+    if enrich_profile and len(text) >= 80:
+        try:
+            result = await _enrich_profile_from_text(db, char, text, source)
+            profile_enriched = result["enriched"]
+            profile_version = result["version"]
+        except Exception as exc:
+            import_logger.warning("上传资料充实档案失败 char=%s error=%s", char.name, exc)
+            enrich_warning = "资料已入库，但自动充实档案失败（可稍后用「AI 建议」重试）。"
     return {
         "ok": True, "source": source, "chunks_added": added, "chars": len(text),
-        "embedded": embedding_enabled(), "truncated": truncated, "hint": hint,
+        "embedded": embedding_enabled(), "truncated": truncated, "hint": enrich_warning,
+        "profile_enriched": profile_enriched, "profile_version": profile_version,
     }
 
 
@@ -3700,6 +3748,66 @@ def get_graph_context(speaker_id: int | None = None, listener_id: int | None = N
     if not health.get("available"):
         raise HTTPException(503, {"message": "Neo4j 当前不可用，请先启动图谱服务。", "health": health})
     return graph_store.get_graph_context(speaker_id, listener_id)
+
+
+# ── 多跳推理：关系之上再走几步（图数据库真正的强项）────────────────────────
+def _require_graph():
+    health = graph_store.health()
+    if not health.get("available"):
+        raise HTTPException(503, {"message": "Neo4j 当前不可用，请先在「关系图谱」启动图谱服务并同步。", "health": health})
+
+
+def _char_brief(db: Session, char_id: int) -> dict[str, Any]:
+    char = db.get(Character, char_id)
+    return {"id": char_id, "name": char.name if char else f"#{char_id}"}
+
+
+@router.get("/graph/multi-hop/intermediaries")
+def graph_intermediaries(me_id: int, target_id: int, limit: int = 10, db: Session = Depends(get_db)):
+    """牵线人/二度人脉：谁能把「我」引荐给「目标」。"""
+    _require_graph()
+    return {
+        "me": _char_brief(db, me_id), "target": _char_brief(db, target_id),
+        "intermediaries": graph_store.find_intermediaries(me_id, target_id, limit),
+    }
+
+
+@router.get("/graph/multi-hop/path")
+def graph_path(a_id: int, b_id: int, max_hops: int = 5, db: Session = Depends(get_db)):
+    """共同连接：两人之间最短的关系链。"""
+    _require_graph()
+    return {
+        "a": _char_brief(db, a_id), "b": _char_brief(db, b_id),
+        "path": graph_store.shortest_path(a_id, b_id, max_hops),
+    }
+
+
+@router.get("/graph/multi-hop/sentiment-propagation")
+def graph_sentiment_propagation(me_id: int, limit: int = 12, db: Session = Depends(get_db)):
+    """立场传染：经中间人传到二度人脉的态度（敌人的朋友 / 朋友的朋友）。"""
+    _require_graph()
+    rows = graph_store.propagate_sentiment(me_id, limit)
+    for row in rows:
+        s1, s2 = float(row.get("s1") or 0), float(row.get("s2") or 0)
+        product = s1 * s2
+        # 敌人的敌人是朋友：两段情绪同号→倾向友好，异号→倾向戒备
+        row["predicted_stance"] = "倾向友好" if product > 0.02 else ("倾向戒备" if product < -0.02 else "中性/不确定")
+        row["propagated_score"] = round(product, 3)
+    return {"me": _char_brief(db, me_id), "links": rows}
+
+
+@router.get("/graph/multi-hop/hubs")
+def graph_hubs(limit: int = 10):
+    """社交枢纽：关系数最多的连接者。"""
+    _require_graph()
+    return {"hubs": graph_store.central_hubs(limit)}
+
+
+@router.get("/graph/multi-hop/evidence-chain")
+def graph_evidence_chain(person_id: int, limit: int = 12, db: Session = Depends(get_db)):
+    """证据溯源链：某人的记忆各自由哪些原始证据支撑。"""
+    _require_graph()
+    return {"person": _char_brief(db, person_id), "chains": graph_store.evidence_chain(person_id, limit)}
 
 
 # ─── AI Suggestions ──────────────────────────────────────────────────────────

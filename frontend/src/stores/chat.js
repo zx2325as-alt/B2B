@@ -53,7 +53,7 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function sendMessage({ speaker, content, characterId, receiverName, activeCharacters }) {
+  async function sendMessage({ speaker, content, characterId, receiverName, activeCharacters, predictionId = null }) {
     if (streaming.value && streamController.value) {
       streamController.value.abort()
       streaming.value = false
@@ -66,27 +66,18 @@ export const useChatStore = defineStore('chat', () => {
 
     // Optimistic user message
     const tempId = Date.now()
+    // 真实对话分析器：只乐观插入「我手动输入的这句」，不再有 AI 模拟的对方回复气泡。
+    // 发送其实是"分析这句话"——分析完 reload，对方/自己的消息会带上洞察‖行动。
     messages.value.push({
       id: tempId,
       role: 'user',
       character_name: speaker,
       receiver_name: receiverName || '',
       content,
+      _analyzing: true,
       created_at: new Date().toISOString(),
     })
 
-    // Placeholder AI message（以接收方身份显示）
-    const aiPlaceholderId = tempId + 1
-    messages.value.push({
-      id: aiPlaceholderId,
-      role: 'assistant',
-      character_name: receiverName || '对方',
-      content: '',
-      _streaming: true,
-      created_at: new Date().toISOString(),
-    })
-
-    let finalResult = null
     let hadError = false
 
     await sendMessageStream(
@@ -97,49 +88,29 @@ export const useChatStore = defineStore('chat', () => {
         character_id: characterId || null,
         receiver_name: receiverName || null,
         active_characters: activeCharacters,
+        prediction_id: predictionId || null,
       },
       {
         signal: streamController.value.signal,
-        onDelta: (text) => {
-          streamBuffer.value += text
-          const aiMsg = messages.value.find(m => m.id === aiPlaceholderId)
-          if (aiMsg) aiMsg.content = streamBuffer.value
-        },
-        onDone: (result) => {
-          finalResult = result
-          const aiMsg = messages.value.find(m => m.id === aiPlaceholderId)
-          if (aiMsg) {
-            aiMsg.content = result.reply || streamBuffer.value
-            aiMsg.inner_monologue = result.inner_monologue_text || result.inner_monologue
-            aiMsg.emotion_label = result.emotion_label
-            aiMsg.emotion_score = result.emotion_score
-            aiMsg.subtext = result.subtext
-            aiMsg.psychological_tag = result.psychological_tag
-            aiMsg.analysis_json = result
-            aiMsg._streaming = false
-          }
-        },
+        onDelta: () => {},          // 不再有流式回复
+        onDone: () => {},
         onError: (err) => {
           hadError = true
-          toast.error(`发送失败：${err}`)
-          const aiMsg = messages.value.find(m => m.id === aiPlaceholderId)
-          if (aiMsg) {
-            aiMsg.content = `[分析出错: ${err}]`
-            aiMsg._streaming = false
-            aiMsg._error = true
-          }
+          toast.error(`分析失败：${err}`)
+          const um = messages.value.find(m => m.id === tempId)
+          if (um) um._analyzing = false
         },
       }
     )
 
-    // 出错时保留乐观消息与错误提示，避免 reload 后"消息凭空消失"
+    // 出错时保留乐观消息，避免 reload 后"消息凭空消失"
     if (activeConvId.value && !hadError) {
       await loadMessages(activeConvId.value)
     }
     streaming.value = false
     streamBuffer.value = ''
     streamController.value = null
-    return finalResult
+    return null
   }
 
   function cancelStreaming() {

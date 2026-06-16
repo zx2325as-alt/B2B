@@ -10,3 +10,7 @@ tes22t.txt
 backend/app/logs/
 backend/app/models/neo4j-community-5.18.1/
 frontend/dist/
+backend/app/conf/config.local.yaml
+.claude/launch.json
+backend/btb.db-wal
+backend/btb.db-shm

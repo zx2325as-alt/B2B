@@ -82,6 +82,9 @@ class Neo4jGraphStore:
                 self.uri,
                 auth=auth,
                 connection_timeout=2.0,
+                connection_acquisition_timeout=3.0,
+                # Neo4j 挂了时让 execute_read/write 快速失败（默认会重试 30s，会卡死聊天主链路）
+                max_transaction_retry_time=2.0,
                 max_connection_pool_size=4,
             )
         return self._driver
@@ -400,6 +403,83 @@ class Neo4jGraphStore:
             {"ids": [item for item in [speaker_id, listener_id] if item], "limit": limit},
         )
         return {"people": rows}
+
+    # ── 多跳推理：关系之上再走几步，图数据库真正的强项 ───────────────────
+    def find_intermediaries(self, me_id: int, target_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        """牵线人/二度人脉：同时认识「我」和「目标」的中间人（我不直接认识目标时谁能引荐）。"""
+        return self.run_read(
+            """
+            MATCH (me:Person {id:$me})-[r1:RELATES_TO]-(mid:Person)-[r2:RELATES_TO]-(t:Person {id:$target})
+            WHERE mid.id <> $me AND mid.id <> $target
+            WITH mid,
+                 max(coalesce(r1.strength,0) + coalesce(r2.strength,0)) AS combined,
+                 head(collect(r1.rel_type)) AS my_rel, head(collect(r1.sentiment)) AS my_sentiment,
+                 head(collect(r2.rel_type)) AS target_rel, head(collect(r2.sentiment)) AS target_sentiment
+            RETURN mid {.id, .name, .role} AS person,
+                   my_rel, my_sentiment, target_rel, target_sentiment, combined
+            ORDER BY combined DESC
+            LIMIT $limit
+            """,
+            {"me": me_id, "target": target_id, "limit": limit},
+        )
+
+    def shortest_path(self, a_id: int, b_id: int, max_hops: int = 5) -> dict[str, Any]:
+        """共同连接：两人之间最短的关系链（怎么从 A 一步步连到 B）。"""
+        rows = self.run_read(
+            f"""
+            MATCH (a:Person {{id:$a}}), (b:Person {{id:$b}}),
+                  p = shortestPath((a)-[:RELATES_TO*..{int(max_hops)}]-(b))
+            RETURN [n IN nodes(p) | n {{.id, .name}}] AS nodes,
+                   [r IN relationships(p) | {{rel_type:r.rel_type, sentiment:r.sentiment, strength:r.strength}}] AS rels,
+                   length(p) AS hops
+            """,
+            {"a": a_id, "b": b_id},
+        )
+        return rows[0] if rows else {}
+
+    def propagate_sentiment(self, me_id: int, limit: int = 12) -> list[dict[str, Any]]:
+        """立场传染：经由中间人传到二度人脉的态度（敌人的朋友可能戒备我、朋友的朋友更易亲近）。"""
+        return self.run_read(
+            """
+            MATCH (me:Person {id:$me})-[r1:RELATES_TO]-(mid:Person)-[r2:RELATES_TO]-(other:Person)
+            WHERE other.id <> $me AND mid.id <> other.id
+              AND NOT (me)-[:RELATES_TO]-(other)
+            RETURN other {.id, .name} AS person, mid {.id, .name} AS via,
+                   coalesce(r1.sentiment,0) AS s1, coalesce(r2.sentiment,0) AS s2,
+                   r1.rel_type AS t1, r2.rel_type AS t2
+            ORDER BY abs(coalesce(r1.sentiment,0) * coalesce(r2.sentiment,0)) DESC
+            LIMIT $limit
+            """,
+            {"me": me_id, "limit": limit},
+        )
+
+    def central_hubs(self, limit: int = 10) -> list[dict[str, Any]]:
+        """社交枢纽：关系数最多的人（圈子里的连接者，搞定他事半功倍）。"""
+        return self.run_read(
+            """
+            MATCH (p:Person)-[r:RELATES_TO]-(o:Person)
+            RETURN p {.id, .name, .role} AS person,
+                   count(DISTINCT o) AS degree,
+                   avg(coalesce(r.sentiment,0)) AS avg_sentiment
+            ORDER BY degree DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+    def evidence_chain(self, person_id: int, limit: int = 12) -> list[dict[str, Any]]:
+        """证据溯源链：某人的记忆/判断各自由哪些原始证据支撑（追到出处）。"""
+        return self.run_read(
+            """
+            MATCH (p:Person {id:$id})-[:HAS_MEMORY]->(m:Memory)
+            OPTIONAL MATCH (ev:Evidence)-[:SUPPORTS_MEMORY]->(m)
+            WITH m, collect(DISTINCT ev {.id, .quote, .interpretation, .confidence}) AS evidence
+            RETURN m {.id, .content, .memory_type, .confidence} AS memory, evidence
+            ORDER BY m.confidence DESC
+            LIMIT $limit
+            """,
+            {"id": person_id, "limit": limit},
+        )
 
 
 graph_store = Neo4jGraphStore()

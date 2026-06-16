@@ -35,9 +35,22 @@
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
             {{ advising ? `生成中… 剩${adviceRemaining}` : '生成应对建议' }}
           </button>
+          <button
+            v-if="visibleMessages.length && !currentConversation?.is_readonly"
+            class="btn btn-ghost" style="font-size:12px;padding:6px 12px"
+            :disabled="rollingBack || chat.streaming"
+            title="删除最近一轮「我方发言 + 对方回复」，回到上一轮"
+            @click="rollbackTurn">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+            {{ rollingBack ? '回退中…' : '回退上一轮' }}
+          </button>
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="handleArchiveConversation">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>
             一键归档
+          </button>
+          <button v-if="!currentConversation?.is_readonly" class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="openQuickIngest" title="把真实聊天记录整段粘贴，一次性导入并分析">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M9 12h6M9 16h4"/></svg>
+            粘贴整段
           </button>
           <button class="btn btn-ghost" style="font-size:12px;padding:6px 12px" @click="showRoleModal = true">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
@@ -61,7 +74,7 @@
         <TransitionGroup name="msg">
           <div v-for="msg in visibleMessages" :key="msg.id"
             :data-msg-id="msg.id"
-            class="msg-wrapper" :class="msg.role">
+            class="msg-wrapper" :class="[msg.role, { mine: isMine(msg) }]">
             <div class="msg-head">
             <!-- Avatar -->
             <div class="msg-avatar" :style="{ background: getCharacterColor(msg.character_name) }">
@@ -121,7 +134,7 @@
                   <template v-if="selfTwoCol(msg)">
                     <div class="duo">
                       <div class="duo-col insight">
-                        <div class="duo-head">洞察 · {{ msg.character_name }} 这句什么意思</div>
+                        <div class="duo-head">洞察 · {{ msg.character_name }} 怎么想</div>
                         <div v-if="cpIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpIntent(msg) }}</span></div>
                         <div v-if="cpEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpEmotion(msg) }}</span></div>
                         <div v-if="cpSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpSubtext(msg) }}</span></div>
@@ -136,6 +149,13 @@
                         </div>
                       </div>
                       <div class="duo-col action">
+                        <!-- 我怎么想：我（旁观）对这句话的内心解读 -->
+                        <div v-if="hasSelfRead(msg)" class="self-read">
+                          <div class="duo-head" style="color:#a78bfa">我怎么想</div>
+                          <div v-if="selfRead(msg).inner" class="analysis-row"><span class="a-label">第一反应</span><span class="a-value">{{ selfRead(msg).inner }}</span></div>
+                          <div v-if="selfRead(msg).subtext" class="analysis-row"><span class="a-label">我读到</span><span class="a-value">{{ selfRead(msg).subtext }}</span></div>
+                          <div v-if="selfRead(msg).emotion" class="analysis-row"><span class="a-label">我的情绪</span><span class="a-value">{{ selfRead(msg).emotion }}</span></div>
+                        </div>
                         <div class="duo-head">行动 · 我该怎么接</div>
                         <div v-if="selfMoves(msg).length" class="move-list">
                           <div v-for="(mv, i) in selfMoves(msg)" :key="`mv-${msg.id}-${i}`" class="move-card">
@@ -193,8 +213,19 @@
                     <span class="reply-text">{{ curUserPersp(msg).suggested_reply }}</span>
                     <button class="btn btn-ghost reply-use-btn" @click="useSuggestedReply(curUserPersp(msg))" title="以该角色身份采用这句回答">采用</button>
                   </div>
+                  <!-- 可信度（通用视角）：依据原文 / 把握程度 / AI 复核结论 -->
+                  <div v-if="curUserPersp(msg)" class="trust-strip">
+                    <div v-if="upEvidence(msg)" class="duo-evidence">依据：“{{ upEvidence(msg) }}”</div>
+                    <div v-else-if="!upGrounded(msg)" class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
+                    <span v-if="upConfidence(msg) !== null" class="tag" :class="confClass(upConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(upConfidence(msg)) }}</span>
+                    <div v-if="upCritic(msg)" class="critic-box">
+                      <span class="tag" :class="criticClass(upCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(upCritic(msg).verdict) }}</span>
+                      <div v-for="(iss, i) in upCritic(msg).issues" :key="`ucri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
+                      <div v-if="upCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ upCritic(msg).revised_subtext }}</div>
+                    </div>
+                  </div>
                   </template>
-                  <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+                  <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap">
                     <button
                       class="btn btn-ghost"
                       style="font-size:11px;padding:4px 10px"
@@ -211,6 +242,22 @@
                     >
                       {{ critiquingIds.has(msg.id) ? '复核中…' : '🔍 核验' }}
                     </button>
+                    <button
+                      class="btn btn-ghost"
+                      style="font-size:11px;padding:4px 10px"
+                      :disabled="diagnosingIds.has(msg.id)"
+                      title="结构化深度诊断：潜台词/人格信号/关系影响，带证据与复核"
+                      @click="runDiagnosis(msg)"
+                    >
+                      {{ diagnosingIds.has(msg.id) ? '诊断中…' : (diagnosisMap[msg.id] ? '重新诊断' : '深度诊断') }}
+                    </button>
+                  </div>
+                  <div v-if="diagnosisMap[msg.id]" class="diagnosis-box">
+                    <div class="diagnosis-head">
+                      <span class="tag" :class="diagnosisStatusClass(diagnosisMap[msg.id].status)">{{ diagnosisStatusLabel(diagnosisMap[msg.id].status) }}</span>
+                      <span class="a-pct">置信度 {{ Math.round((diagnosisMap[msg.id].confidence || 0) * 100) }}%</span>
+                    </div>
+                    <div class="diagnosis-summary">{{ diagnosisSummary(diagnosisMap[msg.id]) }}</div>
                   </div>
                 </div>
               </div>
@@ -235,8 +282,50 @@
                     补全分析
                   </button>
 
+                  <!-- 对方回复也出「洞察(他) ‖ 行动(我怎么接)」，与我发给他逻辑相同 -->
+                  <template v-if="selfTwoCol(msg)">
+                    <div class="duo">
+                      <div class="duo-col insight">
+                        <div class="duo-head">洞察 · {{ msg.character_name }} 这句什么意思</div>
+                        <div v-if="cpIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpIntent(msg) }}</span></div>
+                        <div v-if="cpEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpEmotion(msg) }}</span></div>
+                        <div v-if="cpSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpSubtext(msg) }}</span></div>
+                        <div v-if="cpEvidence(msg)" class="duo-evidence">依据：“{{ cpEvidence(msg) }}”</div>
+                        <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
+                        <span v-if="cpConfidence(msg) !== null" class="tag" :class="confClass(cpConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(cpConfidence(msg)) }}</span>
+                        <div v-if="cpCritic(msg)" class="critic-box">
+                          <span class="tag" :class="criticClass(cpCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(cpCritic(msg).verdict) }}</span>
+                          <div v-for="(iss, i) in cpCritic(msg).issues" :key="`acri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
+                          <div v-if="cpCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ cpCritic(msg).revised_subtext }}</div>
+                        </div>
+                      </div>
+                      <div class="duo-col action">
+                        <div class="duo-head">行动 · 我该怎么接</div>
+                        <div v-if="selfMoves(msg).length" class="move-list">
+                          <div v-for="(mv, i) in selfMoves(msg)" :key="`amv-${msg.id}-${i}`" class="move-card">
+                            <div class="move-top">
+                              <span class="move-label">{{ mv.label || ('策略' + (i + 1)) }}</span>
+                              <button class="btn btn-ghost reply-use-btn" @click="useMove(msg, mv.reply)">采用</button>
+                            </div>
+                            <div class="move-reply">{{ mv.reply }}</div>
+                            <div v-if="mv.consequence" class="move-conseq">→ {{ mv.consequence }}</div>
+                          </div>
+                        </div>
+                        <div v-else class="empty-hint" style="padding:8px 0;text-align:left">暂无应对建议，可点「刷新建议」</div>
+                      </div>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+                      <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" :disabled="advisingIds.has(msg.id)" @click="adviseMessage(msg)">
+                        {{ advisingIds.has(msg.id) ? '生成中…' : '刷新建议' }}
+                      </button>
+                      <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" :disabled="critiquingIds.has(msg.id)" @click="critiqueUserMessage(msg)">
+                        {{ critiquingIds.has(msg.id) ? '复核中…' : '🔍 核验' }}
+                      </button>
+                    </div>
+                  </template>
+
                   <!-- 多视角分析：在场每个角色站在自己立场看这句话 -->
-                  <template v-if="getPerspectives(msg).length">
+                  <template v-else-if="getPerspectives(msg).length">
                     <div class="persp-tabs">
                       <button
                         v-for="p in getPerspectives(msg)"
@@ -313,8 +402,39 @@
 
       <!-- Input Area -->
       <div class="input-area">
-        <!-- 阶段3/6：指定了「我」时出现的军师 + 预演面板 -->
-        <div v-if="isSelfMode && counterpartName" class="advisor-box">
+        <!-- 阶段3/6：指定了「我」时出现的军师 + 预演面板（可折叠，默认收起，不占页面） -->
+        <div v-if="isSelfMode && counterpartName" class="advisor-box" :class="{ collapsed: !advisorOpen }">
+          <button type="button" class="advisor-toggle" @click="advisorOpen = !advisorOpen">
+            <span class="advisor-toggle-caret">{{ advisorOpen ? '▾' : '▸' }}</span>
+            军师工具
+            <span class="advisor-toggle-sub">实时军师 · 发出前预演</span>
+            <span v-if="!advisorOpen" class="advisor-toggle-hint">点击展开</span>
+          </button>
+          <div v-show="advisorOpen" class="advisor-panel">
+          <!-- 目标进度：连续分段追踪对话有没有朝目标推进 -->
+          <div v-if="currentConversation?.goal" class="goal-progress-card">
+            <div class="gp-head">
+              <span class="advisor-title">目标进度</span>
+              <span class="gp-goal" :title="currentConversation.goal">{{ currentConversation.goal }}</span>
+              <button class="btn btn-ghost gp-refresh" :disabled="gpLoading || chat.streaming" @click="refreshGoalProgress">{{ gpLoading ? '评估中…' : '刷新' }}</button>
+            </div>
+            <template v-if="goalProgress && (goalProgress.segments||[]).length">
+              <div class="gp-bar-row">
+                <div class="gp-bar"><div class="gp-fill" :style="{ width: Math.round((goalProgress.score||0)*100)+'%' }"></div></div>
+                <span class="gp-pct">{{ Math.round((goalProgress.score||0)*100) }}%</span>
+                <span class="tag" :class="gpTrendClass(goalProgress.trend)" style="font-size:10px">{{ gpTrendLabel(goalProgress.trend) }}</span>
+              </div>
+              <div v-if="goalProgress.blocker" class="gp-line"><span class="gp-k">卡点</span>{{ goalProgress.blocker }}</div>
+              <div v-if="goalProgress.next_lever" class="gp-line" style="color:var(--cyan)"><span class="gp-k">下一步</span>{{ goalProgress.next_lever }}</div>
+              <div class="gp-timeline">
+                <span v-for="(s, i) in goalProgress.segments.slice(-14)" :key="`gp-${i}`" class="gp-seg" :class="s.direction"
+                  :title="s.summary + (s.reason ? (' — ' + s.reason) : '')">{{ gpSegMark(s.direction) }}</span>
+                <span class="gp-timeline-hint">推进▲ 停滞■ 倒退▼</span>
+              </div>
+            </template>
+            <div v-else class="gp-empty">还没评估过——发几轮、或点「刷新」看离目标多近。</div>
+          </div>
+
           <!-- 实时军师：粘贴对方的话即时分析（会发消息，仅非只读会话） -->
           <template v-if="!currentConversation?.is_readonly">
             <div class="advisor-head">
@@ -333,6 +453,9 @@
           <div class="advisor-head">
             <span class="advisor-title">发出前预演</span>
             <span class="advisor-sub">想好一句话，先看「{{ counterpartName }}」会怎么反应</span>
+            <span v-if="predictionStats && predictionStats.resolved" class="tag" :class="(predictionStats.hit_rate||0)>=0.6?'green':((predictionStats.hit_rate||0)>=0.4?'amber':'red')" style="font-size:10px;margin-left:auto" :title="`对「${counterpartName}」累计预演 ${predictionStats.total} 次，已对账 ${predictionStats.resolved} 次`">
+              命中率 {{ Math.round((predictionStats.hit_rate||0)*100) }}%（{{ predictionStats.hits }}/{{ predictionStats.resolved }}）
+            </span>
           </div>
           <div class="advisor-row">
             <textarea v-model="predictInput" class="chat-input" rows="1"
@@ -350,7 +473,24 @@
             <div v-if="prediction.inner_read" class="predict-sub">他心里：{{ prediction.inner_read }}</div>
             <div v-if="prediction.risk" class="predict-sub" style="color:var(--red)">风险：{{ prediction.risk }}</div>
             <div v-if="prediction.better_tip" class="predict-sub" style="color:var(--green)">更稳：{{ prediction.better_tip }}</div>
+            <div class="predict-actions">
+              <button class="btn btn-primary" style="font-size:11px;padding:4px 12px" :disabled="chat.streaming" @click="adoptAndSend"
+                title="把这句以「我」的身份发出去；对方真实回复后会和这条预测自动对账、回流学习">
+                采用并发送
+              </button>
+              <span class="predict-hint">发出后系统会拿对方的真实回复给这条预测打分，越用越准</span>
+            </div>
           </div>
+          <!-- 预演闭环：最近对账结果（现实验证过的教训，已回流到对这个人的建模） -->
+          <div v-if="!prediction && recentVerdict" class="predict-card" style="opacity:.92">
+            <div class="predict-top">
+              <span class="predict-sub" style="margin:0">上次预演对账</span>
+              <span class="tag" :class="verdictClass(recentVerdict.verdict)" style="font-size:10px">{{ verdictLabel(recentVerdict.verdict) }}</span>
+            </div>
+            <div v-if="recentVerdict.note" class="predict-sub">{{ recentVerdict.note }}</div>
+            <div v-if="recentVerdict.lesson" class="predict-sub" style="color:var(--cyan)">学到：{{ recentVerdict.lesson }}</div>
+          </div>
+          </div><!-- /advisor-panel -->
         </div>
 
         <!-- Role selector bar -->
@@ -634,6 +774,70 @@
         </div>
       </div>
     </Teleport>
+
+    <!-- 整段粘贴秒录入 -->
+    <Teleport to="body">
+      <div v-if="qi.open" class="modal-overlay" @click.self="qi.open = false">
+        <div class="modal card fade-up" style="width:600px;max-height:86vh;overflow-y:auto">
+          <div class="modal-header">
+            <span>粘贴整段聊天记录</span>
+            <button class="btn-close" @click="qi.open = false">✕</button>
+          </div>
+          <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+            <!-- 步骤1：粘贴 -->
+            <template v-if="qi.step === 'paste'">
+              <div class="label">把真实对话整段粘进来（一行一句，形如「昵称: 内容」识别最准；没标签也能解析）</div>
+              <textarea class="input" v-model="qi.text" rows="9"
+                placeholder="阿杰: 在吗&#10;小敏: 怎么了&#10;阿杰: 周末那个事还算数吗&#10;小敏: 随便吧 我无所谓"
+                style="resize:vertical;line-height:1.7;font-size:13px"></textarea>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn btn-ghost" @click="qi.open = false">取消</button>
+                <button class="btn btn-primary" :disabled="qi.loading || !qi.text.trim()" @click="qiPreview">
+                  {{ qi.loading ? '解析中…' : '解析预览' }}
+                </button>
+              </div>
+            </template>
+
+            <!-- 步骤2：预览 + 归位 + 设「我」 -->
+            <template v-else>
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span class="label" style="margin:0">我是：</span>
+                <select class="input" style="max-width:160px" v-model="qi.selfName">
+                  <option value="">未指定</option>
+                  <option v-for="s in qi.speakers" :key="`qself-${s}`" :value="s">{{ s }}</option>
+                </select>
+                <span style="font-size:11px;color:var(--text-tertiary)">
+                  共 {{ qi.segments.length }} 句 · {{ qi.method === 'ai' ? 'AI 解析' : '快速识别' }}
+                </span>
+                <label style="font-size:11px;color:var(--text-tertiary);margin-left:auto;display:flex;align-items:center;gap:6px">
+                  <input type="checkbox" v-model="qi.analyzeAll" /> 全部分析
+                  <template v-if="!qi.analyzeAll">
+                    · 最近 <input type="number" v-model.number="qi.analyzeLast" min="0" max="99" style="width:46px" class="input" /> 句
+                  </template>
+                </label>
+              </div>
+              <div class="qi-preview">
+                <div v-for="(seg, i) in qi.segments" :key="`qseg-${i}`" class="qi-row"
+                  :class="{ mine: qi.selfName && seg.speaker === qi.selfName }">
+                  <input class="input qi-spk" v-model="seg.speaker" placeholder="发言人" list="qi-speakers" />
+                  <input class="input qi-content" v-model="seg.content" />
+                  <button class="btn-close" style="flex:0 0 auto" @click="qi.segments.splice(i, 1)" title="删除这一句">✕</button>
+                </div>
+                <datalist id="qi-speakers">
+                  <option v-for="s in qi.speakers" :key="`qopt-${s}`" :value="s" />
+                </datalist>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:space-between">
+                <button class="btn btn-ghost" @click="qi.step = 'paste'">← 返回修改</button>
+                <button class="btn btn-primary" :disabled="qi.loading || !qi.segments.length" @click="qiCommit">
+                  {{ qi.loading ? '导入中…' : (qi.analyzeAll ? '确认导入并全部分析' : (qi.analyzeLast > 0 ? `确认导入并分析最近${qi.analyzeLast}句` : '确认导入')) }}
+                </button>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -704,7 +908,12 @@ const receiverOptions = computed(() => activeRoles.value.filter(r => r.name !== 
 // 只显示发言（user）消息；接收方的回复已并入多视角分析的"建议回答"，不再单独成气泡。
 // 流式占位（_streaming 的 assistant）也不显示——它会在加载时闪现、生成完后被过滤掉而消失，
 // 造成"先出现又消失"的割裂感。生成状态由发送按钮的停止图标（chat.streaming）反馈。
+// 默认只显示「我方/各角色发言」（user）；对方的 AI 回复一旦生成了「洞察‖行动」应对建议，
+// 也显示出来，让"他回完我"之后能看到他在想什么 + 我该怎么接（D）。无分析的旧 AI 回复仍隐藏（保持去重）。
+// 真实对话分析器：只显示手动输入的发言（user）。AI 不再模拟对方回复，旧的模拟 assistant 气泡一并隐藏。
 const visibleMessages = computed(() => chat.messages.filter(m => m.role === 'user'))
+// 微信式左右布局：是「我」说的靠右，对方靠左
+function isMine(msg) { return !!selfName.value && (msg.character_name || '') === selfName.value }
 
 watch(currentSpeaker, () => {
   // 发言人变化后，若接收方与发言人相同则重置为自动
@@ -872,6 +1081,22 @@ async function reanalyzeUserMessage(msg) {
     toast.success('已重新分析')
   } catch { /* 错误已由拦截器提示 */ }
 }
+// E：回退上一轮对话——删最近一次「我方发言 + 对方回复」整轮
+const rollingBack = ref(false)
+async function rollbackTurn() {
+  if (rollingBack.value || !chat.activeConvId) return
+  if (!await confirmDialog('回退上一轮？将删除最近一次「我方发言 + 对方回复」，不可恢复。')) return
+  rollingBack.value = true
+  try {
+    const res = await chatApi.rollbackConversation(chat.activeConvId)
+    await chat.loadMessages(chat.activeConvId)
+    toast.success(`已回退（删除 ${res.data.removed} 条）`)
+  } catch (e) {
+    toast.error('回退失败：' + (e?.response?.data?.detail || e?.message || ''))
+  } finally {
+    rollingBack.value = false
+  }
+}
 // 阶段5：LLM 复核员（critic-revise）——对这条已存分析逐视角审过度推断，下调置信、标推测
 const critiquingIds = ref(new Set())
 async function critiqueUserMessage(msg) {
@@ -888,6 +1113,22 @@ async function critiqueUserMessage(msg) {
     toast.error('复核失败：' + (e?.response?.data?.detail || e?.message || ''))
   } finally {
     const next = new Set(critiquingIds.value); next.delete(msg.id); critiquingIds.value = next
+  }
+}
+// A+D：手动为「对方」发言（含对方回复）生成/刷新「洞察 ‖ 行动」应对建议（自动流程已生成，这是保留的手动按钮）
+const advisingIds = ref(new Set())
+async function adviseMessage(msg) {
+  if (advisingIds.value.has(msg.id)) return
+  advisingIds.value = new Set(advisingIds.value).add(msg.id)
+  try {
+    await chatApi.adviseMessage(msg.id)
+    await chat.loadMessages(chat.activeConvId)
+    const s = new Set(expandedIds.value); s.add(msg.id); expandedIds.value = s
+    toast.success('应对建议已刷新')
+  } catch (e) {
+    toast.error('生成失败：' + (e?.response?.data?.detail || e?.message || ''))
+  } finally {
+    const next = new Set(advisingIds.value); next.delete(msg.id); advisingIds.value = next
   }
 }
 // 读取某视角的 critic 复核结果（无则 null）
@@ -939,11 +1180,30 @@ function cpConfidence(msg) {
   const c = cpPersp(msg)?.analysis_json?.confidence
   return (typeof c === 'number') ? c : null
 }
+// 通用视角（curUserPersp）的可信度：依据 / 把握 / 复核 —— 让非双栏视角也看得见信任信号
+function upEvidence(msg) { return (curUserPersp(msg)?.analysis_json?.evidence || '').trim() }
+function upConfidence(msg) {
+  const c = curUserPersp(msg)?.analysis_json?.confidence
+  return (typeof c === 'number') ? c : null
+}
+function upGrounded(msg) { return curUserPersp(msg)?.analysis_json?.grounded !== false }
+function upCritic(msg) { return perspCritic(curUserPersp(msg)) }
 function selfMoves(msg) {
   const moves = selfPersp(msg)?.analysis_json?.moves
   return Array.isArray(moves) ? moves.filter(m => m && m.reply) : []
 }
 function selfReply(msg) { return selfPersp(msg)?.suggested_reply || '' }
+// 「我怎么想」：我(旁观)对这句话的内心解读——第一反应/防御/倾向 + 我读到的潜台词 + 我的情绪
+function selfRead(msg) {
+  const p = selfPersp(msg)
+  if (!p) return null
+  const im = p.analysis_json?.inner_monologue
+  const inner = (im && typeof im === 'object')
+    ? [im.first_reaction, im.defense, im.tendency].filter(Boolean).join('；')
+    : (p.inner_monologue || '')
+  return { inner: inner || '', subtext: p.subtext || '', emotion: p.emotion_label || '' }
+}
+function hasSelfRead(msg) { const r = selfRead(msg); return !!(r && (r.inner || r.subtext || r.emotion)) }
 function confLabel(c) { return c >= 0.7 ? `把握高 ${Math.round(c*100)}%` : (c >= 0.5 ? `中等 ${Math.round(c*100)}%` : `推测 ${Math.round(c*100)}%`) }
 function confClass(c) { return c >= 0.7 ? 'green' : (c >= 0.5 ? 'amber' : 'red') }
 // 采用某条应对话术：切到「我」身份、对着「对方」、填入话术
@@ -963,9 +1223,19 @@ async function setSelfName(name) {
     const res = await chatApi.updateConversation(chat.activeConvId, { self_name: name || '' })
     const conv = chat.conversations.find(c => c.id === chat.activeConvId)
     if (conv) Object.assign(conv, res.data)
+    if (name) localStorage.setItem('btb_self_name', name)  // 记住「我」是谁，下次默认
     toast.success(name ? `已设定「${name}」为我；对方发言将给出我的应对建议` : '已取消「我」的指定')
   } catch { /* 拦截器已提示 */ }
 }
+// 默认「我是」：会话未指定 self_name 时，自动套用上次记住的「我」（默认 xxx），前提是该角色在场
+function ensureDefaultSelfName() {
+  const conv = currentConversation.value
+  if (!conv || (conv.self_name || '').trim()) return
+  const remembered = localStorage.getItem('btb_self_name') || 'xxx'
+  if (activeRoles.value.some(r => r.name === remembered)) setSelfName(remembered)
+}
+// 会话或在场角色就绪时，自动套用默认「我」
+watch([() => chat.activeConvId, activeRoles], () => ensureDefaultSelfName())
 // 设定「我的目标」——应对策略 moves 会围绕它排序，预演也按它评估达成率
 async function setGoal(val) {
   if (!chat.activeConvId) return
@@ -1022,6 +1292,8 @@ function cpDimText(key) {
   }).filter(Boolean).join('；')
 }
 
+// 军师工具折叠：默认收起、不占页面；用到（预演/分析）时自动展开看结果
+const advisorOpen = ref(false)
 // ── 阶段6：反事实预演（发出前看对方反应） ────────────────────
 const predictInput = ref('')
 const prediction = ref(null)
@@ -1033,10 +1305,57 @@ async function runPredict() {
   try {
     const res = await chatApi.predictReaction(chat.activeConvId, text, selfName.value, counterpartName.value)
     prediction.value = res.data
+    advisorOpen.value = true   // 出结果时自动展开
   } catch (e) { toast.error('预演失败：' + (e?.response?.data?.detail || e?.message || '')) }
   finally { predicting.value = false }
 }
 function reactionClass(t) { return ({ '暖化':'green','妥协':'green','激化':'red','回避':'amber','试探':'amber','无感':'' })[t] || '' }
+// 预演闭环：采用预演的话并发送，带上 prediction_id，发出后对方真实回复会与这条预测对账、回流学习
+const pendingPredictionId = ref(null)
+const predictionStats = ref(null)
+const recentVerdict = computed(() => (predictionStats.value?.recent || []).find(p => p.status === 'resolved' && p.verdict) || null)
+// 目标进度：连续分段追踪对话有没有朝目标推进
+const goalProgress = ref(null)
+const gpLoading = ref(false)
+async function loadGoalProgress() {
+  if (!chat.activeConvId || !currentConversation.value?.goal) { goalProgress.value = null; return }
+  try { const res = await chatApi.getGoalProgress(chat.activeConvId); goalProgress.value = res.data.progress || null }
+  catch { goalProgress.value = null }
+}
+async function refreshGoalProgress() {
+  if (!chat.activeConvId || gpLoading.value) return
+  gpLoading.value = true
+  try {
+    const res = await chatApi.refreshGoalProgress(chat.activeConvId)
+    goalProgress.value = res.data.progress || null
+    toast.success('目标进度已更新')
+  } catch (e) { toast.error('评估失败：' + (e?.response?.data?.detail || e?.message || '')) }
+  finally { gpLoading.value = false }
+}
+function gpTrendClass(t) { return ({ rising: 'green', stalled: 'amber', falling: 'red' })[t] || '' }
+function gpTrendLabel(t) { return ({ rising: '↑ 上升', stalled: '→ 停滞', falling: '↓ 下降' })[t] || t }
+function gpSegMark(d) { return ({ advance: '▲', stall: '■', regress: '▼' })[d] || '·' }
+async function loadPredictionStats() {
+  if (!chat.activeConvId || !counterpartName.value) { predictionStats.value = null; return }
+  try {
+    const res = await chatApi.getPredictionStats(chat.activeConvId, counterpartName.value)
+    predictionStats.value = res.data
+  } catch { predictionStats.value = null }
+}
+async function adoptAndSend() {
+  const p = prediction.value
+  if (!p || !p.candidate || chat.streaming) return
+  const meRole = activeRoles.value.find(r => r.name === selfName.value)
+  if (meRole) handleSelectSpeaker(meRole)
+  currentReceiver.value = counterpartName.value || ''
+  inputText.value = p.candidate
+  pendingPredictionId.value = p.prediction_id || null
+  prediction.value = null
+  await nextTick()
+  await handleSend()
+}
+function verdictClass(v) { return ({ hit:'green', partial:'amber', miss:'red' })[v] || '' }
+function verdictLabel(v) { return ({ hit:'命中', partial:'部分', miss:'落空' })[v] || v }
 
 // ── 阶段5：信息差 / 心智模型(ToM) ────────────────────────────
 const tom = ref(null)
@@ -1058,7 +1377,9 @@ const tomGroups = computed(() => {
   ].map(g => ({ ...g, items: tom.value[g.key] || [] })).filter(g => g.items.length)
 })
 // 切换会话时清空推演结果，避免串台
-watch(() => chat.activeConvId, () => { tom.value = null; prediction.value = null; predictInput.value = '' })
+watch(() => chat.activeConvId, () => { tom.value = null; prediction.value = null; predictInput.value = ''; pendingPredictionId.value = null; goalProgress.value = null; loadPredictionStats(); loadGoalProgress() })
+// 展开军师工具时拉一次命中率
+watch(advisorOpen, (open) => { if (open) { loadPredictionStats(); loadGoalProgress() } })
 async function askCounterpart() {
   const text = adviceInput.value.trim()
   if (!text) return
@@ -1174,6 +1495,64 @@ async function saveScene() {
   showScenarioModal.value = false
   toast.success('场景已更新，将对后续对话分析生效')
 }
+
+// ── 整段粘贴秒录入（P2）──────────────────────────────────────────────────
+const qi = ref({ open: false, step: 'paste', text: '', loading: false,
+  segments: [], speakers: [], method: '', selfName: '', analyzeAll: true, analyzeLast: 8 })
+
+async function openQuickIngest() {
+  if (!chat.activeConvId) {
+    await chat.newConversation('新对话 ' + new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }))
+  }
+  qi.value = { open: true, step: 'paste', text: '', loading: false,
+    segments: [], speakers: [], method: '', selfName: selfName.value || '', analyzeAll: true, analyzeLast: 8 }
+}
+
+async function qiPreview() {
+  if (!qi.value.text.trim()) return
+  qi.value.loading = true
+  try {
+    const res = await chatApi.quickIngestPreview(chat.activeConvId, qi.value.text)
+    qi.value.segments = (res.data.segments || []).map(s => ({ speaker: s.speaker || '', content: s.content || '' }))
+    qi.value.speakers = res.data.speakers || []
+    qi.value.method = res.data.method || ''
+    if (!qi.value.selfName) qi.value.selfName = res.data.self_name || ''
+    qi.value.step = 'review'
+  } finally {
+    qi.value.loading = false
+  }
+}
+
+async function qiCommit() {
+  const segments = qi.value.segments.filter(s => (s.content || '').trim())
+  if (!segments.length) { toast.error('没有可导入的内容'); return }
+  qi.value.loading = true
+  try {
+    const analyzeLast = qi.value.analyzeAll ? segments.length : (qi.value.analyzeLast || 0)
+    const res = await chatApi.quickIngestCommit(chat.activeConvId, {
+      segments, self_name: qi.value.selfName || null, analyze_last: analyzeLast,
+    })
+    qi.value.open = false
+    await chat.loadMessages(chat.activeConvId)
+    const n = res.data.created
+    const a = (res.data.analyzing || []).length
+    toast.success(`已导入 ${n} 句${a ? `，后台逐条分析 ${a} 句中…稍后自动显示` : ''}`)
+    // 后台分析较慢（每条 opus 分析+复核），按条数放大轮询次数让结果逐步浮现
+    if (a > 0) qiPollAnalysis(Math.min(40, a * 4 + 4))
+  } finally {
+    qi.value.loading = false
+  }
+}
+
+// 整段录入后后台逐条分析较慢，轮询刷新让结果逐步显示
+function qiPollAnalysis(times) {
+  if (times <= 0) return
+  setTimeout(async () => {
+    if (chat.activeConvId) await chat.loadMessages(chat.activeConvId)
+    qiPollAnalysis(times - 1)
+  }, 8000)
+}
+
 async function handleArchiveConversation() {
   if (!chat.activeConvId || !activeRoles.value.length) return
   const confirmed = await confirmDialog(`将当前对话归档到以下角色：${activeRoles.value.map(role => role.name).join('、')}。是否继续？`)
@@ -1207,22 +1586,28 @@ async function handleSend() {
     await chat.newConversation('新对话', currentScenario.value || 'general')
   }
 
+  const predictionId = pendingPredictionId.value
+  pendingPredictionId.value = null  // 一次性消费，避免误关联到后续消息
   await chat.sendMessage({
     speaker: currentSpeaker.value,
     content: text,
     characterId: currentCharId.value,
     receiverName: currentReceiver.value || null,
     activeCharacters: activeRoles.value.map(r => ({ id: r.id, name: r.name })),
+    predictionId,
   })
+  if (predictionId) loadPredictionStats()  // 发完后刷新命中率（对账在后台进行）
 }
 
 // ── 深度诊断（按需触发） ──────────────────────────────────────
 async function runDiagnosis(msg) {
-  if (!msg.parent_id || diagnosingIds.value.has(msg.id)) return
+  if (diagnosingIds.value.has(msg.id)) return
   diagnosingIds.value = new Set([...diagnosingIds.value, msg.id])
   try {
-    const res = await chatApi.diagnoseMessage(msg.parent_id)
+    const res = await chatApi.diagnoseMessage(msg.id)   // 诊断直接挂在用户消息上
     diagnosisMap.value = { ...diagnosisMap.value, [msg.id]: res.data }
+  } catch (e) {
+    toast.error('诊断失败：' + (e?.response?.data?.detail || e?.message || ''))
   } finally {
     const next = new Set(diagnosingIds.value)
     next.delete(msg.id)
@@ -1464,8 +1849,9 @@ function scrollToMessage(messageId) {
 
 .msg-wrapper { display:flex; flex-direction:column; gap:6px; }
 .msg-head { display:flex; gap:12px; align-items:flex-start; }
-.msg-wrapper.user .msg-head { flex-direction: row-reverse; }
-.msg-wrapper.user .msg-body { align-items: flex-end; }
+/* 微信式左右布局：是「我」说的靠右、对方靠左（按发言者，不按 role） */
+.msg-wrapper.mine .msg-head { flex-direction: row-reverse; }
+.msg-wrapper.mine .msg-body { align-items: flex-end; }
 /* 查看分析框：脱离 70% 气泡宽度限制，横向铺满整条消息区 */
 .analysis-full { width: 100%; }
 .analysis-full .analysis-content { width: 100%; }
@@ -1513,7 +1899,7 @@ function scrollToMessage(messageId) {
   word-break: break-word;
   transition: border-color .2s;
 }
-.msg-wrapper.user .msg-bubble { background: var(--cyan-dim); border-color: rgba(0,212,255,0.25); }
+.msg-wrapper.mine .msg-bubble { background: var(--cyan-dim); border-color: rgba(0,212,255,0.25); }
 .msg-bubble.streaming { border-color: var(--cyan); animation: pulse-cyan 1.5s infinite; }
 .msg-bubble.error { border-color: rgba(239,68,68,.4); background: rgba(239,68,68,.05); }
 .cursor-blink { animation: blink 1s step-end infinite; color: var(--cyan); }
@@ -1521,7 +1907,9 @@ function scrollToMessage(messageId) {
 .tag-btn { background: rgba(124,58,237,.12); border-color: rgba(124,58,237,.25); color:#c4b5fd; cursor:pointer; }
 
 /* Analysis Layer */
-.analysis-layer { margin-top: 4px; }
+/* 分析层跟随消息左右：「我」靠右、对方靠左，查看分析贴在气泡同侧（不再单独占左侧整行） */
+.analysis-layer { margin-top: 2px; display: flex; flex-direction: column; align-items: flex-start; }
+.msg-wrapper.mine .analysis-layer { align-items: flex-end; }
 .analysis-toggle {
   background: transparent;
   border: 1px solid var(--border);
@@ -1680,6 +2068,8 @@ function scrollToMessage(messageId) {
 .predict-succ { font-size:11px; font-family:var(--font-mono); color:var(--cyan); margin-left:auto; }
 .predict-reply { font-size:13px; color:var(--text-primary); line-height:1.6; }
 .predict-sub { font-size:11px; color:var(--text-muted); line-height:1.5; }
+.predict-actions { display:flex; align-items:center; gap:10px; margin-top:4px; flex-wrap:wrap; }
+.predict-hint { font-size:10px; color:var(--text-muted); }
 
 /* 阶段5 信息差/ToM */
 .tom-edge { font-size:12px; color:var(--amber); line-height:1.6; padding:6px 8px; background:rgba(245,158,11,.08); border-radius:6px; margin-bottom:8px; }
@@ -1761,6 +2151,7 @@ function scrollToMessage(messageId) {
 .duo-col { flex:1; min-width:240px; display:flex; flex-direction:column; gap:7px; padding:12px; border-radius:var(--radius-sm); border:1px solid var(--border); }
 .duo-col.insight { background:rgba(124,58,237,.06); border-color:rgba(124,58,237,.22); }
 .duo-col.action  { background:rgba(0,212,255,.05);  border-color:rgba(0,212,255,.2); }
+.self-read { padding:8px 10px; margin-bottom:4px; border-radius:6px; background:rgba(124,58,237,.06); border-left:2px solid rgba(124,58,237,.4); display:flex; flex-direction:column; gap:5px; }
 .duo-head { font-size:12px; font-weight:600; color:var(--text-primary); margin-bottom:2px; }
 .duo-col.insight .duo-head { color:#a78bfa; }
 .duo-col.action  .duo-head { color:var(--cyan); }
@@ -1779,6 +2170,31 @@ function scrollToMessage(messageId) {
 
 /* 阶段3：实时军师快捷输入 */
 .advisor-box { margin-bottom:10px; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--cyan-dim); }
+.advisor-box.collapsed { padding:0; background:transparent; border-color:var(--border); }
+.advisor-toggle { width:100%; display:flex; align-items:center; gap:8px; padding:7px 10px; background:none; border:none; cursor:pointer; color:var(--text-secondary); font-size:12px; font-weight:600; }
+.advisor-toggle:hover { color:var(--text-primary); }
+.advisor-toggle-caret { color:var(--cyan); font-size:11px; }
+.advisor-toggle-sub { font-weight:400; color:var(--text-muted); font-size:11px; }
+.advisor-toggle-hint { margin-left:auto; font-weight:400; color:var(--text-muted); font-size:11px; }
+.advisor-panel { padding-top:6px; }
+/* 目标进度卡 */
+.goal-progress-card { margin-bottom:10px; padding:9px 11px; border-radius:8px; border:1px solid var(--border-strong); background:rgba(0,212,255,.05); display:flex; flex-direction:column; gap:6px; }
+.gp-head { display:flex; align-items:center; gap:8px; }
+.gp-goal { flex:1; min-width:0; font-size:11px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.gp-refresh { font-size:11px; padding:3px 9px; }
+.gp-bar-row { display:flex; align-items:center; gap:8px; }
+.gp-bar { flex:1; height:7px; border-radius:4px; background:var(--bg-elevated); overflow:hidden; }
+.gp-fill { height:100%; background:linear-gradient(90deg,var(--cyan),#7dd3fc); border-radius:4px; transition:width .4s; }
+.gp-pct { font-size:12px; font-family:var(--font-mono); color:var(--text-primary); min-width:34px; text-align:right; }
+.gp-line { font-size:11px; color:var(--text-secondary); line-height:1.5; }
+.gp-k { display:inline-block; min-width:38px; color:var(--text-muted); }
+.gp-timeline { display:flex; align-items:center; gap:3px; flex-wrap:wrap; margin-top:2px; }
+.gp-seg { font-size:11px; cursor:default; }
+.gp-seg.advance { color:var(--green); }
+.gp-seg.stall { color:var(--text-muted); }
+.gp-seg.regress { color:var(--red); }
+.gp-timeline-hint { margin-left:6px; font-size:9px; color:var(--text-muted); }
+.gp-empty { font-size:11px; color:var(--text-muted); }
 .advisor-head { display:flex; align-items:baseline; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
 .advisor-title { font-size:12px; font-weight:600; color:var(--cyan); }
 .advisor-sub { font-size:11px; color:var(--text-muted); }
@@ -1808,6 +2224,19 @@ function scrollToMessage(messageId) {
 .scene-chip:hover { border-color:var(--border-strong); color:var(--text-primary); }
 .scene-chip.active { border-color:var(--cyan); color:var(--cyan); background:var(--cyan-dim); }
 .scene-hint { font-size:11px; color:var(--text-muted); line-height:1.6; margin-top:8px; }
+
+.scene-hint { font-size:11px; color:var(--text-muted); line-height:1.6; margin-top:8px; }
+
+/* 可信度信任条（通用视角） */
+.trust-strip { display:flex; flex-direction:column; gap:5px; margin-top:7px; padding-top:7px; border-top:1px dashed var(--border); }
+
+/* 整段粘贴预览 */
+.qi-preview { display:flex; flex-direction:column; gap:6px; max-height:46vh; overflow-y:auto; padding:4px; border:1px solid var(--border); border-radius:10px; background:var(--bg-1, rgba(0,0,0,.12)); }
+.qi-row { display:flex; align-items:center; gap:6px; }
+.qi-row.mine { flex-direction:row-reverse; }
+.qi-row.mine .qi-content { background:var(--cyan-dim); }
+.qi-spk { flex:0 0 84px; font-size:12px; text-align:center; }
+.qi-content { flex:1 1 auto; font-size:13px; }
 
 /* Transitions */
 .msg-enter-active { transition: all .3s ease; }
