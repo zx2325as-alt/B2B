@@ -158,22 +158,30 @@
                         <div class="duo-head">洞察 · {{ msg.character_name }} 怎么想</div>
                         <div v-if="cpIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpIntent(msg) }}</span></div>
                         <div v-if="cpEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpEmotion(msg) }}</span></div>
-                        <div v-if="cpSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpSubtext(msg) }}</span></div>
+                        <!-- 收敛后的单一结论：潜台词以 final 为准（复核纠偏 + 对抗调和后的版本） -->
+                        <div v-if="cpFinalSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpFinalSubtext(msg) }}</span></div>
                         <div v-if="cpEvidence(msg)" class="duo-evidence">依据：“{{ cpEvidence(msg) }}”</div>
-                        <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
-                        <span v-if="cpConfidence(msg) !== null" class="tag" :class="confClass(cpConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(cpConfidence(msg)) }}</span>
-                        <!-- 阶段5：LLM 复核员结论 -->
-                        <div v-if="cpCritic(msg)" class="critic-box">
-                          <span class="tag" :class="criticClass(cpCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(cpCritic(msg).verdict) }}</span>
-                          <div v-for="(iss, i) in cpCritic(msg).issues" :key="`cri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
-                          <div v-if="cpCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ cpCritic(msg).revised_subtext }}</div>
+                        <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 为推测</div>
+                        <div class="conclusion-trust">
+                          <span v-if="cpFinalConf(msg) !== null" class="tag" :class="confClass(cpFinalConf(msg))" style="font-size:10px">{{ confLabel(cpFinalConf(msg)) }}</span>
+                          <span v-if="cpFinal(msg) && cpFinal(msg).verdict && cpFinal(msg).verdict !== 'approved'" class="tag" :class="criticClass(cpFinal(msg).verdict)" style="font-size:10px">{{ criticLabel(cpFinal(msg).verdict) }}</span>
                         </div>
-                        <!-- Q1 多轮对抗：另一种可能 + 调和（防一条道走到黑） -->
-                        <div v-if="cpDebate(msg)" class="debate-box">
-                          <span class="tag" :class="debateClass(cpDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(cpDebate(msg).stronger) }}</span>
-                          <div v-if="cpDebate(msg).alternative && cpDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ cpDebate(msg).alternative.subtext }}</div>
-                          <div v-if="cpDebate(msg).reconciled && cpDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ cpDebate(msg).reconciled.subtext }}</div>
-                        </div>
+                        <div v-if="cpFinal(msg) && cpFinal(msg).alternative" class="duo-evidence" style="border-left-color:var(--violet,#a78bfa)">⚖ 也可能：{{ cpFinal(msg).alternative }}</div>
+                        <!-- 推演过程（复核 + 对抗）默认折叠，要看再展开，避免三块互相打架的观感 -->
+                        <button v-if="cpCritic(msg) || cpDebate(msg)" class="reasoning-toggle" @click="toggleReasoning(msg.id)">
+                          {{ reasoningOpen(msg.id) ? '▾' : '▸' }} 推演过程（复核·对抗）
+                        </button>
+                        <template v-if="reasoningOpen(msg.id)">
+                          <div v-if="cpCritic(msg)" class="critic-box">
+                            <span class="tag" :class="criticClass(cpCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(cpCritic(msg).verdict) }}</span>
+                            <div v-for="(iss, i) in cpCritic(msg).issues" :key="`cri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
+                          </div>
+                          <div v-if="cpDebate(msg)" class="debate-box">
+                            <span class="tag" :class="debateClass(cpDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(cpDebate(msg).stronger) }}</span>
+                            <div v-if="cpDebate(msg).alternative && cpDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ cpDebate(msg).alternative.subtext }}</div>
+                            <div v-if="cpDebate(msg).reconciled && cpDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ cpDebate(msg).reconciled.subtext }}</div>
+                          </div>
+                        </template>
                       </div>
                       <div class="duo-col action">
                         <!-- 我怎么想：我（旁观）对这句话的内心解读 -->
@@ -228,8 +236,8 @@
                   <div v-if="curUserPersp(msg)?.emotion_label" class="analysis-row">
                     <span class="a-label">情绪归因</span><span class="a-value">{{ curUserPersp(msg).emotion_label }}</span>
                   </div>
-                  <div v-if="curUserPersp(msg)?.subtext" class="analysis-row">
-                    <span class="a-label">策略动机</span><span class="a-value">{{ curUserPersp(msg).subtext }}</span>
+                  <div v-if="(upFinal(msg) && upFinal(msg).subtext) || curUserPersp(msg)?.subtext" class="analysis-row">
+                    <span class="a-label">策略动机</span><span class="a-value">{{ (upFinal(msg) && upFinal(msg).subtext) || curUserPersp(msg).subtext }}</span>
                   </div>
                   <div v-if="userPerspTags(msg).length" class="analysis-tags">
                     <span v-for="t in userPerspTags(msg)" :key="`upt-${t}`" class="tag">{{ t }}</span>
@@ -240,21 +248,29 @@
                     <span class="reply-text">{{ curUserPersp(msg).suggested_reply }}</span>
                     <button class="btn btn-ghost reply-use-btn" @click="useSuggestedReply(curUserPersp(msg))" title="以该角色身份采用这句回答">采用</button>
                   </div>
-                  <!-- 可信度（通用视角）：依据原文 / 把握程度 / AI 复核结论 -->
+                  <!-- 可信度（收敛后单一结论）：依据 + 置信 + verdict；推演过程默认折叠 -->
                   <div v-if="curUserPersp(msg)" class="trust-strip">
                     <div v-if="upEvidence(msg)" class="duo-evidence">依据：“{{ upEvidence(msg) }}”</div>
-                    <div v-else-if="!upGrounded(msg)" class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 以下为推测</div>
-                    <span v-if="upConfidence(msg) !== null" class="tag" :class="confClass(upConfidence(msg))" style="font-size:10px;align-self:flex-start">{{ confLabel(upConfidence(msg)) }}</span>
-                    <div v-if="upCritic(msg)" class="critic-box">
-                      <span class="tag" :class="criticClass(upCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(upCritic(msg).verdict) }}</span>
-                      <div v-for="(iss, i) in upCritic(msg).issues" :key="`ucri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
-                      <div v-if="upCritic(msg).revised_subtext" class="critic-revised">复核版潜台词：{{ upCritic(msg).revised_subtext }}</div>
+                    <div v-else-if="!upGrounded(msg)" class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 为推测</div>
+                    <div class="conclusion-trust">
+                      <span v-if="(upFinal(msg) ? upFinal(msg).confidence : upConfidence(msg)) !== null && (upFinal(msg) ? upFinal(msg).confidence : upConfidence(msg)) !== undefined" class="tag" :class="confClass(upFinal(msg) ? upFinal(msg).confidence : upConfidence(msg))" style="font-size:10px">{{ confLabel(upFinal(msg) ? upFinal(msg).confidence : upConfidence(msg)) }}</span>
+                      <span v-if="upFinal(msg) && upFinal(msg).verdict && upFinal(msg).verdict !== 'approved'" class="tag" :class="criticClass(upFinal(msg).verdict)" style="font-size:10px">{{ criticLabel(upFinal(msg).verdict) }}</span>
                     </div>
-                    <div v-if="upDebate(msg)" class="debate-box">
-                      <span class="tag" :class="debateClass(upDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(upDebate(msg).stronger) }}</span>
-                      <div v-if="upDebate(msg).alternative && upDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ upDebate(msg).alternative.subtext }}</div>
-                      <div v-if="upDebate(msg).reconciled && upDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ upDebate(msg).reconciled.subtext }}</div>
-                    </div>
+                    <div v-if="upFinal(msg) && upFinal(msg).alternative" class="duo-evidence" style="border-left-color:var(--violet,#a78bfa)">⚖ 也可能：{{ upFinal(msg).alternative }}</div>
+                    <button v-if="upCritic(msg) || upDebate(msg)" class="reasoning-toggle" @click="toggleReasoning(msg.id)">
+                      {{ reasoningOpen(msg.id) ? '▾' : '▸' }} 推演过程（复核·对抗）
+                    </button>
+                    <template v-if="reasoningOpen(msg.id)">
+                      <div v-if="upCritic(msg)" class="critic-box">
+                        <span class="tag" :class="criticClass(upCritic(msg).verdict)" style="font-size:10px">{{ criticLabel(upCritic(msg).verdict) }}</span>
+                        <div v-for="(iss, i) in upCritic(msg).issues" :key="`ucri-${msg.id}-${i}`" class="critic-issue">· {{ iss }}</div>
+                      </div>
+                      <div v-if="upDebate(msg)" class="debate-box">
+                        <span class="tag" :class="debateClass(upDebate(msg).stronger)" style="font-size:10px">{{ debateLabel(upDebate(msg).stronger) }}</span>
+                        <div v-if="upDebate(msg).alternative && upDebate(msg).alternative.subtext" class="debate-alt">另一种可能：{{ upDebate(msg).alternative.subtext }}</div>
+                        <div v-if="upDebate(msg).reconciled && upDebate(msg).reconciled.subtext" class="debate-recon">⚖ 调和：{{ upDebate(msg).reconciled.subtext }}</div>
+                      </div>
+                    </template>
                   </div>
                   </template>
                   <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap">
@@ -1182,6 +1198,15 @@ function perspDebate(persp) {
 function cpDebate(msg) { return perspDebate(cpPersp(msg)) }
 function debateClass(s) { return ({ original: 'green', alternative: 'red', both: 'amber' })[s] || '' }
 function debateLabel(s) { return ({ original: '已对抗 · 原判成立', alternative: '已对抗 · 改判', both: '已对抗 · 两种皆可能' })[s] || '已对抗' }
+// 三层收敛后的单一结论（final = 调和 > 复核修订 > 原始）
+function cpFinal(msg) { return cpPersp(msg)?.analysis_json?.final || null }
+function cpFinalSubtext(msg) { return cpFinal(msg)?.subtext || cpSubtext(msg) }
+function cpFinalConf(msg) { const f = cpFinal(msg); return (f && typeof f.confidence === 'number') ? f.confidence : cpConfidence(msg) }
+function upFinal(msg) { return curUserPersp(msg)?.analysis_json?.final || null }
+// 推演过程（复核+对抗）默认折叠，要看再展开
+const reasoningOpenIds = ref(new Set())
+function reasoningOpen(id) { return reasoningOpenIds.value.has(id) }
+function toggleReasoning(id) { const s = new Set(reasoningOpenIds.value); s.has(id) ? s.delete(id) : s.add(id); reasoningOpenIds.value = s }
 // 采用某视角的建议回答：切到该角色身份，并把建议回答填进输入框（用户可改后发送）
 function useSuggestedReply(persp) {
   if (!persp?.suggested_reply) return
@@ -2328,6 +2353,10 @@ function scrollToMessage(messageId) {
 
 /* 可信度信任条（通用视角） */
 .trust-strip { display:flex; flex-direction:column; gap:5px; margin-top:7px; padding-top:7px; border-top:1px dashed var(--border); }
+/* 收敛结论的信任行 + 推演过程折叠按钮 */
+.conclusion-trust { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+.reasoning-toggle { align-self:flex-start; background:none; border:none; color:var(--text-muted); font-size:11px; cursor:pointer; padding:2px 0; }
+.reasoning-toggle:hover { color:var(--text-secondary); }
 
 /* 整段粘贴预览 */
 .qi-preview { display:flex; flex-direction:column; gap:6px; max-height:46vh; overflow-y:auto; padding:4px; border:1px solid var(--border); border-radius:10px; background:var(--bg-1, rgba(0,0,0,.12)); }

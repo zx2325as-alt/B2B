@@ -7,6 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, or_, func
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..models.sql_models import (
@@ -1580,10 +1581,11 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
     _save_perspectives(db, conv.id, message, message.character_name or "", perspectives, primary_name, "")
     conv.updated_at = datetime.utcnow()
     db.commit()
-    # 不计成本：重分析后立即「复核 + 对抗」（显式动作，内联等待可接受）；深度诊断走后台
+    # 不计成本：重分析后立即「复核 + 对抗 + 收敛」（显式动作，内联等待可接受）；深度诊断走后台
     if perspectives:
         await _auto_critic_message(db, message)
         await _auto_debate_message(db, message)
+        _finalize_message(db, message)
         _spawn_auto_diagnosis(message.id)
     db.refresh(message)
     return message
@@ -1621,10 +1623,11 @@ async def _generate_counterpart_advice(db: Session, conv: Conversation, msg: Mes
     )
     saved = _save_perspectives(db, conv.id, msg, speaker, perspectives, self_nm, "")
     db.commit()
-    # 不计成本：对方发言的应对建议生成后立即「复核 + 对抗」；深度诊断走后台
+    # 不计成本：对方发言的应对建议生成后立即「复核 + 对抗 + 收敛」；深度诊断走后台
     if perspectives:
         await _auto_critic_message(db, msg)
         await _auto_debate_message(db, msg)
+        _finalize_message(db, msg)
         _spawn_auto_diagnosis(msg.id)
     return saved
 
@@ -1888,12 +1891,18 @@ async def _auto_debate_message(db: Session, message: Message) -> dict:
     if not persp:
         return {}
     aj = persp.analysis_json or {}
+    critic = aj.get("critic") or {}
     emo = (aj.get("emotions") or {}).get("deep") or {}
+    # 关键：用 critic 纠偏后的解读做调和，而非原始 over-read —— 否则 debate 会复读被 critic 否掉的脑补，三层打架
+    base_subtext = (critic.get("revised_subtext") or "").strip() or (persp.subtext or "")
+    verdict_hint = (f"（复核员已将原判定下调为 {critic.get('verdict')}，调和必须尊重证据边界、不要重新拔高）"
+                    if (critic.get("verdict") or "") in ("downgraded", "softened") else "")
     current_read = "\n".join(p for p in [
         f"真实意图/第一反应：{(aj.get('inner_monologue') or {}).get('first_reaction', '')}",
-        f"潜台词：{persp.subtext or ''}",
+        f"潜台词（已按复核收敛）：{base_subtext}",
         f"深层情绪：{emo.get('label', '')}({emo.get('score', '')})",
-    ] if not p.endswith("：") and not p.endswith("：()"))
+        verdict_hint,
+    ] if p and not p.endswith("：") and not p.endswith("：()"))
     conv = db.get(Conversation, message.conversation_id)
     evidence_block = ""
     try:
@@ -1939,6 +1948,37 @@ async def _auto_debate_message(db: Session, message: Message) -> dict:
     return new_aj["debate"]
 
 
+def _finalize_message(db: Session, message: Message) -> int:
+    """三层收敛：把「原始解读 → critic 纠偏 → debate 调和」收敛成每个视角的一个 final 结论，
+    供前端只显示一个干净答案（推理过程折叠）。final = 调和版 > 复核修订版 > 原始；置信取收敛后的值。"""
+    rows = db.query(MessagePerspective).filter(MessagePerspective.message_id == message.id).all()
+    n = 0
+    for p in rows:
+        aj = dict(p.analysis_json or {})
+        critic = aj.get("critic") or {}
+        debate = aj.get("debate") or {}
+        reconciled = debate.get("reconciled") or {}
+        final_subtext = ((reconciled.get("subtext") or "").strip()
+                         or (critic.get("revised_subtext") or "").strip()
+                         or (p.subtext or "").strip())
+        stronger = debate.get("stronger") or ""
+        aj["final"] = {
+            "subtext": final_subtext[:300],
+            "confidence": aj.get("confidence"),
+            "grounded": aj.get("grounded", True),
+            "verdict": (critic.get("verdict") or "approved"),
+            # 仅当对抗认为"另一种"势均力敌或更强时，才把它作为提醒挂出来
+            "alternative": (((debate.get("alternative") or {}).get("subtext") or "").strip()[:200]
+                            if stronger in ("both", "alternative") else ""),
+            "stronger": stronger,
+        }
+        p.analysis_json = aj
+        n += 1
+    if n:
+        db.commit()
+    return n
+
+
 _bg_critic_tasks: set = set()
 
 
@@ -1950,9 +1990,10 @@ def _spawn_post_analysis(message_id: int):
         try:
             m = db2.get(Message, message_id)
             if m:
-                await _auto_critic_message(db2, m)
-                await _auto_debate_message(db2, m)
-                await _maybe_auto_diagnose(db2, m)
+                await _auto_critic_message(db2, m)      # 1. 纠偏
+                await _auto_debate_message(db2, m)       # 2. 基于纠偏后的解读做调和
+                _finalize_message(db2, m)                # 3. 收敛成一个 final 结论
+                await _maybe_auto_diagnose(db2, m)       # 4. 深度诊断（独立）
         except Exception as exc:
             logger.warning("后台精修失败 msg=%s error=%s", message_id, exc)
         finally:
@@ -2479,8 +2520,18 @@ async def _refresh_goal_progress(conv_id: int) -> dict:
             "assessed_until_index": max_index,
             "updated_at": datetime.utcnow().isoformat(),
         }
-        conv.goal_progress_json = prog
-        db.add(conv); db.commit()
+        # 并发后台任务下 SQLite 偶发 database is locked：短退避重试几次再放弃
+        for _attempt in range(3):
+            try:
+                conv.goal_progress_json = prog
+                db.add(conv); db.commit()
+                break
+            except OperationalError as lock_exc:
+                db.rollback()
+                if "locked" not in str(lock_exc).lower() or _attempt == 2:
+                    raise
+                await asyncio.sleep(0.6 * (_attempt + 1))
+                conv = db.get(Conversation, conv_id)
         logger.info("目标进度刷新 conv=%s score=%s trend=%s", conv_id, prog["score"], prog["trend"])
         return prog
     except Exception as exc:

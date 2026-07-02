@@ -34,9 +34,9 @@ ai:
     context_summary: "deepseek"
   task_models:
     # 这些任务 latency 敏感（粘贴解析、冷启动画像内联在分析前），压回 sonnet 兼顾质量与速度
-    import_dialogue_parse: "claude-sonnet-4-6"
-    import_narrative_parse: "claude-sonnet-4-6"
-    quick_profile_infer: "claude-sonnet-4-6"
+    import_dialogue_parse: "deepseek-chat"
+    import_narrative_parse: "deepseek-chat"
+    quick_profile_infer: "deepseek-chat"
     import_commit_review: "deepseek-chat"
     interaction_analysis_rebuild: "deepseek-chat"
   task_max_tokens:
@@ -118,9 +118,10 @@ ai:
     # 分级：复杂深度任务用 claude-opus-4-8（心理/博弈推理最优），中等用 sonnet，简单用 deepseek。
     n1n:
       base_url: "https://hk.n1n.ai/v1"
+      # 密钥放 config.local.yaml（不入库），此处仅占位
       api_key: ""
       models:
-        # 不计成本·质量拉满：中等档也上 opus；latency 敏感的任务用 task_models 单独压回 sonnet
+        # 不计成本·质量拉满：复杂/中等档 opus，简单档 sonnet；latency 敏感任务用 task_models 压回 sonnet
         simple: "claude-sonnet-4-6"
         medium: "claude-opus-4-8"
         complex: "claude-opus-4-8"

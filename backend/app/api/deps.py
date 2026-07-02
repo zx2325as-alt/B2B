@@ -17,7 +17,9 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
     级联清理由删除端点显式完成（见 chat.py / characters.py 的 delete 实现）。"""
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=5000")
+    # 不计成本/全 opus 后，后台任务（复核/对抗/诊断/目标进度/摘要）并发写增多，
+    # 单写者持锁期可能超 5s；提到 15s 让写等待而非直接报 database is locked。
+    cursor.execute("PRAGMA busy_timeout=15000")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
