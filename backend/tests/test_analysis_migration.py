@@ -83,8 +83,10 @@ def test_diagnose_uses_user_message_perspectives(monkeypatch):
                                   result_json={"summary": "测试诊断"}, critic_json={})
         db.add(rep); db.commit(); db.refresh(rep)
         return rep
-    monkeypatch.setattr(chat, "_run_structured_diagnosis", fake_diag)
-    monkeypatch.setattr(chat, "build_evidence_pack", lambda *a, **k: {})
+    # 诊断已抽到 services/diagnosis_service：在那儿打桩（_run_diagnosis_for_message 在服务内构建 analysis_result 后调它）
+    import app.services.diagnosis_service as diagsvc
+    monkeypatch.setattr(diagsvc, "run_structured_diagnosis", fake_diag)
+    monkeypatch.setattr(diagsvc, "build_evidence_pack", lambda *a, **k: {})
 
     db = SessionLocal()
     conv, m = _setup(db)

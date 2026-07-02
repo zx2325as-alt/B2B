@@ -77,7 +77,7 @@ chmod +x start_frontend.sh
 ./start_frontend.sh
 ```
 
-前端运行在 `http://localhost:5173`
+前端运行在 `http://localhost:5174`
 
 ### 或使用 Docker Compose
 

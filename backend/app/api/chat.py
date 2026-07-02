@@ -31,6 +31,8 @@ from ..services.relationships import find_pair_relationship
 from ..services.identity import find_character_by_name
 from ..services.profiles import render_extended_profile
 from ..services.hypotheses import run_hypothesis_round
+from ..services.analysis_store import create_memory_item as _create_memory_item, create_evidence_span as _create_evidence_span
+from ..services.diagnosis_service import run_diagnosis_for_message as _run_diagnosis_for_message
 from .deps import get_db, SessionLocal
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -66,11 +68,6 @@ def _emotion_struct_for(message: Message) -> dict:
     return extract_emotion_struct(getattr(message, "analysis_json", None), message.emotion_label)
 
 
-def _strategy_struct_for(message: Message) -> dict:
-    """统一读取消息的策略结构：优先 analysis_json，历史数据回退文本解析"""
-    return extract_strategy_struct(getattr(message, "analysis_json", None), message.subtext)
-
-
 def _msg_emotion_strategy(db: Session, user_msg: Message) -> tuple[dict, dict]:
     """从一条用户发言的多视角分析取 (情绪结构, 策略结构)：
     情绪用接收方(观察者)视角，策略用发言者(自述)视角。
@@ -96,254 +93,6 @@ def _emotion_polarity(label: str) -> int:
     if label in negative:
         return -1
     return 0
-
-
-def _create_evidence_span(
-    db: Session,
-    *,
-    character_id: int | None,
-    source_type: str,
-    quote: str,
-    interpretation: str,
-    confidence: float,
-    supports_type: str = "memory",
-    supports_id: int | None = None,
-    source_id: int | None = None,
-    conversation_id: int | None = None,
-    message_id: int | None = None,
-    character_event_id: int | None = None,
-    relationship_id: int | None = None,
-    observation_id: int | None = None,
-    metadata: dict | None = None,
-) -> EvidenceSpan:
-    evidence = EvidenceSpan(
-        character_id=character_id,
-        source_type=source_type,
-        source_id=source_id,
-        conversation_id=conversation_id,
-        message_id=message_id,
-        character_event_id=character_event_id,
-        relationship_id=relationship_id,
-        observation_id=observation_id,
-        supports_type=supports_type,
-        supports_id=supports_id,
-        quote=(quote or "")[:2000],
-        interpretation=(interpretation or "")[:2000],
-        confidence=max(0.0, min(1.0, float(confidence or 0.0))),
-        metadata_json=metadata or {},
-    )
-    db.add(evidence)
-    db.flush()
-    graph_store.sync_evidence(evidence)
-    return evidence
-
-
-def _create_memory_item(
-    db: Session,
-    *,
-    character_id: int,
-    memory_type: str,
-    content: str,
-    confidence: float,
-    source: str,
-    evidence_ids: list[int] | None = None,
-) -> MemoryItem | None:
-    normalized = (content or "").strip()
-    if not normalized:
-        return None
-    existing = db.query(MemoryItem).filter(
-        MemoryItem.character_id == character_id,
-        MemoryItem.memory_type == memory_type,
-        MemoryItem.content == normalized,
-        MemoryItem.status == "active",
-    ).first()
-    if existing:
-        existing.evidence_ids = list(dict.fromkeys(list(existing.evidence_ids or []) + list(evidence_ids or [])))
-        existing.confidence = max(float(existing.confidence or 0.0), max(0.0, min(1.0, float(confidence or 0.0))))
-        existing.updated_at = datetime.utcnow()
-        db.flush()
-        graph_store.sync_memory(existing)
-        return existing
-    from ..harness.embeddings import embed_text
-    memory = MemoryItem(
-        character_id=character_id,
-        memory_type=memory_type,
-        content=normalized[:2000],
-        embedding=embed_text(normalized[:2000]),
-        confidence=max(0.0, min(1.0, float(confidence or 0.0))),
-        evidence_ids=list(evidence_ids or []),
-        source=source,
-        status="active",
-    )
-    db.add(memory)
-    db.flush()
-    graph_store.sync_memory(memory)
-    return memory
-
-
-def _compact_evidence_pack(evidence_pack: dict) -> dict:
-    if not evidence_pack:
-        return {}
-    return {
-        "query": evidence_pack.get("query", ""),
-        "person_profile": evidence_pack.get("person_profile", {}),
-        "relationship_context": evidence_pack.get("relationship_context", {}),
-        "graph_context": evidence_pack.get("graph_context", {}),
-        "memory_hits": (evidence_pack.get("memory_hits") or [])[:8],
-        "supporting_evidence": (evidence_pack.get("supporting_evidence") or [])[:8],
-        "conflicting_evidence": (evidence_pack.get("conflicting_evidence") or [])[:5],
-        "retrieval_notes": evidence_pack.get("retrieval_notes", {}),
-    }
-
-
-def _extract_evidence_ids(items: list[dict] | None) -> list[int]:
-    ids = []
-    for item in items or []:
-        value = item.get("evidence_id") or item.get("id")
-        try:
-            if value is not None:
-                ids.append(int(value))
-        except Exception:
-            continue
-    return list(dict.fromkeys(ids))
-
-
-def _diagnosis_status(diagnosis: dict, critic: dict) -> str:
-    final_status = (critic or {}).get("final_status") or ""
-    if final_status in {"approved", "downgraded", "insufficient", "rejected"}:
-        return final_status
-    if diagnosis.get("insufficient_evidence"):
-        return "insufficient"
-    recommendation = diagnosis.get("save_recommendation")
-    if recommendation == "save":
-        return "approved"
-    if recommendation == "discard":
-        return "rejected"
-    return "downgraded"
-
-
-def _diagnosis_confidence(diagnosis: dict, critic: dict) -> float:
-    base = float(diagnosis.get("confidence") or 0.0)
-    adjustment = float((critic or {}).get("confidence_adjustment") or 0.0)
-    return max(0.0, min(1.0, base + adjustment))
-
-
-def _profile_context(char: Character | None) -> dict:
-    if not char:
-        return {}
-    return {
-        "id": char.id,
-        "name": char.name,
-        "role": char.role or "",
-        "personality_tags": char.personality_tags or [],
-        "core_traits": char.core_traits or {},
-        "motivation": char.motivation or "",
-        "weakness": char.weakness or "",
-        "speaking_style": char.speaking_style or "",
-    }
-
-
-async def _run_structured_diagnosis(
-    db: Session,
-    *,
-    conv: Conversation,
-    user_msg: Message,
-    ai_msg: Message | None,
-    speaker_char: Character | None,
-    listener_char: Character | None,
-    analysis_result: dict,
-    evidence_pack: dict,
-) -> StructuredDiagnosis | None:
-    agent_run = AgentRun(
-        workflow_name="structured_diagnosis",
-        input_hash=f"message:{user_msg.id}:analysis:{getattr(ai_msg, 'id', None)}",
-        status="running",
-        model_used="ai-harness",
-        trace_json={
-            "conversation_id": conv.id,
-            "message_id": user_msg.id,
-            "steps": ["structured_diagnosis", "diagnosis_critic"],
-        },
-    )
-    db.add(agent_run)
-    db.flush()
-    compact_pack = _compact_evidence_pack(evidence_pack)
-    diagnosis_context = {
-        "conversation": {"id": conv.id, "scenario": conv.scenario},
-        "speaker": _profile_context(speaker_char),
-        "listener": _profile_context(listener_char),
-        "message": {
-            "id": user_msg.id,
-            "speaker": user_msg.character_name or "",
-            "receiver": user_msg.receiver_name or "",
-            "content": user_msg.content,
-        },
-        "analysis": analysis_result,
-        "evidence_pack": compact_pack,
-    }
-    try:
-        diagnosis = await orchestrator.structured_diagnosis(diagnosis_context)
-        critic = await orchestrator.critique_diagnosis(
-            diagnosis,
-            compact_pack,
-            {
-                "speaker": _profile_context(speaker_char),
-                "listener": _profile_context(listener_char),
-            },
-        )
-        evidence_ids = _extract_evidence_ids(diagnosis.get("supporting_evidence"))
-        conflicting_ids = _extract_evidence_ids(diagnosis.get("conflicting_evidence"))
-        status = _diagnosis_status(diagnosis, critic)
-        confidence = _diagnosis_confidence(diagnosis, critic)
-        report = StructuredDiagnosis(
-            conversation_id=conv.id,
-            message_id=user_msg.id,
-            analysis_message_id=ai_msg.id,
-            speaker_id=speaker_char.id if speaker_char else None,
-            listener_id=listener_char.id if listener_char else None,
-            diagnosis_type=diagnosis.get("diagnosis_type") or "subtext",
-            status=status,
-            confidence=confidence,
-            result_json=diagnosis,
-            critic_json=critic,
-            evidence_ids=evidence_ids,
-            conflicting_evidence_ids=conflicting_ids,
-            agent_run_id=agent_run.id,
-        )
-        db.add(report)
-        db.flush()
-        memory_candidate = diagnosis.get("memory_candidate") or {}
-        save_recommendation = (critic or {}).get("save_recommendation") or diagnosis.get("save_recommendation")
-        if listener_char and status == "approved" and save_recommendation == "save":
-            content = (memory_candidate.get("content") or critic.get("revised_summary") or diagnosis.get("summary") or "").strip()
-            if content:
-                _create_memory_item(
-                    db,
-                    character_id=listener_char.id,
-                    memory_type=memory_candidate.get("memory_type") or "diagnosis",
-                    content=content,
-                    confidence=confidence,
-                    source="结构化诊断",
-                    evidence_ids=evidence_ids,
-                )
-        agent_run.status = "completed"
-        agent_run.trace_json = {
-            **(agent_run.trace_json or {}),
-            "status": status,
-            "confidence": confidence,
-            "diagnosis_id": report.id,
-            "critic": critic,
-        }
-        agent_run.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(report)
-        return report
-    except Exception as exc:
-        agent_run.status = "failed"
-        agent_run.trace_json = {**(agent_run.trace_json or {}), "error": str(exc)}
-        agent_run.updated_at = datetime.utcnow()
-        db.commit()
-        return None
 
 
 def _find_or_create_character(db: Session, name: str) -> Character:
@@ -646,6 +395,22 @@ def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: st
         raw_conf = persp.get("confidence")
         confidence = float(raw_conf) if isinstance(raw_conf, (int, float)) else None
         grounded, confidence = _deterministic_grounding(evidence, user_msg.content, persp.get("grounded"), confidence)
+        # 单次推理已自带"自检+权衡反面+整合"，这里直接收成 final（终版结论），前端立即显示、无需后台覆盖
+        alt = (persp.get("alternative") or "").strip()
+        final = {
+            "intent": ((persp.get("tags") or {}).get("primary") or "").strip()[:200],
+            "inner_monologue": ((persp.get("final_thought") or persp.get("inner_monologue_text") or "").strip())[:600],
+            "emotion_label": persp.get("emotion_label") or "",
+            "deep_emotion": (emotions.get("deep") or {}),
+            "tags": _tags_list(persp.get("tags") or {}),
+            "subtext": (persp.get("subtext") or "").strip()[:300],
+            "confidence": confidence,
+            "grounded": grounded,
+            "verdict": "approved",
+            "alternative": alt[:200],
+            "stronger": ("both" if alt else "original"),
+            "synthesized": True,
+        }
         db.add(MessagePerspective(
             conversation_id=conv_id,
             message_id=user_msg.id,
@@ -669,6 +434,7 @@ def _save_perspectives(db: Session, conv_id: int, user_msg: Message, speaker: st
                 "evidence": evidence[:300],
                 "confidence": confidence,
                 "grounded": grounded,
+                "final": final,
             },
         ))
         saved += 1
@@ -1231,75 +997,6 @@ def list_message_diagnoses(message_id: int, db: Session = Depends(get_db)):
     ).order_by(StructuredDiagnosis.created_at.desc()).all()
 
 
-async def _run_diagnosis_for_message(db: Session, message: Message):
-    """对一条 user 消息跑结构化深度诊断（潜台词/人格信号/关系影响，带证据+复核）。
-    供诊断端点手动触发 + 主分析流后台自动触发复用。无视角/对话时返回 None。"""
-    if not message or message.role != "user":
-        return None
-    conv = db.get(Conversation, message.conversation_id)
-    if not conv:
-        return None
-    persps = db.query(MessagePerspective).filter(MessagePerspective.message_id == message.id).all()
-    if not persps:
-        return None
-    speaker = (message.character_name or "").strip()
-    receiver = (message.receiver_name or "").strip()
-    observers = [p for p in persps if not (p.stance == "speaker" or p.viewer_name == speaker)]
-    obs = (next((p for p in observers if p.viewer_name == receiver), None)
-           or next((p for p in observers if p.is_primary), None)
-           or (observers[0] if observers else persps[0]))
-    speaker_char = db.query(Character).filter(Character.name == speaker).first()
-    listener_char = db.get(Character, message.receiver_id) if message.receiver_id else None
-    evidence_pack = build_evidence_pack(
-        db, query_text=message.content, speaker=speaker_char, listener=listener_char, conversation=conv)
-    analysis_result = {
-        "reply": obs.suggested_reply or "",
-        "inner_monologue": obs.inner_monologue or "",
-        "emotion_label": obs.emotion_label or "",
-        "emotion_score": obs.emotion_score or 0.0,
-        "subtext": obs.subtext or "",
-        "psychological_tag": obs.psychological_tag or "",
-    }
-    return await _run_structured_diagnosis(
-        db, conv=conv, user_msg=message, ai_msg=None,
-        speaker_char=speaker_char, listener_char=listener_char,
-        analysis_result=analysis_result, evidence_pack=evidence_pack)
-
-
-async def _maybe_auto_diagnose(db: Session, message: Message):
-    """不计成本：对方发言且尚无诊断时，自动跑结构化深度诊断（理解对方是诊断主战场）。"""
-    conv = db.get(Conversation, message.conversation_id)
-    self_nm = (getattr(conv, "self_name", "") or "").strip()
-    speaker = (message.character_name or "").strip()
-    if self_nm and speaker == self_nm:   # 我自己的话不自动深度诊断
-        return None
-    if db.query(StructuredDiagnosis).filter(StructuredDiagnosis.message_id == message.id).first():
-        return None                       # 已有诊断，不重复
-    try:
-        return await _run_diagnosis_for_message(db, message)
-    except Exception as exc:
-        logger.warning("自动深度诊断失败 msg=%s error=%s", message.id, exc)
-        return None
-
-
-_bg_diag_tasks: set = set()
-
-
-def _spawn_auto_diagnosis(message_id: int):
-    """后台自动深度诊断（独立 session，不拖慢调用方）。"""
-    async def _run():
-        db2 = SessionLocal()
-        try:
-            m = db2.get(Message, message_id)
-            if m:
-                await _maybe_auto_diagnose(db2, m)
-        finally:
-            db2.close()
-    task = asyncio.create_task(_run())
-    _bg_diag_tasks.add(task)
-    task.add_done_callback(_bg_diag_tasks.discard)
-
-
 @router.post("/messages/{message_id}/diagnose", response_model=StructuredDiagnosisOut)
 async def diagnose_message(message_id: int, db: Session = Depends(get_db)):
     message = db.get(Message, message_id)
@@ -1444,9 +1141,8 @@ async def send_message(body: ChatMessage, db: Session = Depends(get_db)):
                 logger.warning("状态演化失败 conv=%s error=%s", conv.id, exc)
         conv.updated_at = datetime.utcnow()
         db.commit()
-        # 不计成本：每条分析后自动跑「复核 + 对抗分析」（后台，不拖慢发送）——每条洞察都被 vetted 且被反驳过
-        if perspectives:
-            _spawn_post_analysis(user_msg.id)
+        # 终版结论已在多视角一次推理里产出并由 _save_perspectives 直接落库（含 final）——
+        # 不再有后台 复核/对抗/综合 串行覆盖：前端这次加载看到的就是收敛后的最终思考。
         yield f"data: {json.dumps({'type': 'saved', 'user_message_id': user_msg.id}, ensure_ascii=False)}\n\n"
 
         # 预演闭环（手动模式）：采用预演发出的是「我」的话(标记 sent)；轮到对方真实回复时再对账
@@ -1581,12 +1277,7 @@ async def _reanalyze_user_message(db: Session, message: Message) -> Message:
     _save_perspectives(db, conv.id, message, message.character_name or "", perspectives, primary_name, "")
     conv.updated_at = datetime.utcnow()
     db.commit()
-    # 不计成本：重分析后立即「复核 + 对抗 + 收敛」（显式动作，内联等待可接受）；深度诊断走后台
-    if perspectives:
-        await _auto_critic_message(db, message)
-        await _auto_debate_message(db, message)
-        _finalize_message(db, message)
-        _spawn_auto_diagnosis(message.id)
+    # 终版已由单次推理产出并落库（_save_perspectives 写 final）；深度诊断保留为按需（深度诊断按钮）
     db.refresh(message)
     return message
 
@@ -1623,12 +1314,7 @@ async def _generate_counterpart_advice(db: Session, conv: Conversation, msg: Mes
     )
     saved = _save_perspectives(db, conv.id, msg, speaker, perspectives, self_nm, "")
     db.commit()
-    # 不计成本：对方发言的应对建议生成后立即「复核 + 对抗 + 收敛」；深度诊断走后台
-    if perspectives:
-        await _auto_critic_message(db, msg)
-        await _auto_debate_message(db, msg)
-        _finalize_message(db, msg)
-        _spawn_auto_diagnosis(msg.id)
+    # 终版已由单次推理产出并落库；不再叠后台 复核/对抗/综合
     return saved
 
 
@@ -1880,127 +1566,27 @@ async def _auto_critic_message(db: Session, message: Message) -> dict:
     return {"overall": (review.get("overall") or "").strip(), "corrections": corrections}
 
 
-async def _auto_debate_message(db: Session, message: Message) -> dict:
-    """对「发言者自述视角」(他这句话的真实意图——驱动一切的那条)跑一轮对抗分析(正方→魔鬼代言人→调和)，
-    把 debate 并入该视角 analysis_json。只跑这一个最关键视角，不是全部。返回 debate dict 或空。"""
-    speaker = (message.character_name or "").strip()
-    persp = (db.query(MessagePerspective).filter(
-                MessagePerspective.message_id == message.id, MessagePerspective.stance == "speaker").first()
-             or db.query(MessagePerspective).filter(
-                MessagePerspective.message_id == message.id, MessagePerspective.viewer_name == speaker).first())
-    if not persp:
-        return {}
-    aj = persp.analysis_json or {}
-    critic = aj.get("critic") or {}
-    emo = (aj.get("emotions") or {}).get("deep") or {}
-    # 关键：用 critic 纠偏后的解读做调和，而非原始 over-read —— 否则 debate 会复读被 critic 否掉的脑补，三层打架
-    base_subtext = (critic.get("revised_subtext") or "").strip() or (persp.subtext or "")
-    verdict_hint = (f"（复核员已将原判定下调为 {critic.get('verdict')}，调和必须尊重证据边界、不要重新拔高）"
-                    if (critic.get("verdict") or "") in ("downgraded", "softened") else "")
-    current_read = "\n".join(p for p in [
-        f"真实意图/第一反应：{(aj.get('inner_monologue') or {}).get('first_reaction', '')}",
-        f"潜台词（已按复核收敛）：{base_subtext}",
-        f"深层情绪：{emo.get('label', '')}({emo.get('score', '')})",
-        verdict_hint,
-    ] if p and not p.endswith("：") and not p.endswith("：()"))
-    conv = db.get(Conversation, message.conversation_id)
-    evidence_block = ""
-    try:
-        speaker_char = db.query(Character).filter(Character.name == speaker).first()
-        pack = build_evidence_pack(db, query_text=message.content, speaker=speaker_char, listener=None, conversation=conv)
-        evidence_block = render_evidence_pack(pack)
-    except Exception:
-        evidence_block = ""
-    try:
-        debate = await orchestrator.debate_perspective(speaker, message.content, current_read, evidence_block)
-    except Exception as exc:
-        logger.warning("对抗分析失败 msg=%s error=%s", message.id, exc)
-        return {}
-    reconciled = debate.get("reconciled") if isinstance(debate, dict) else None
-    if not isinstance(reconciled, dict):
-        return {}
-    alt = debate.get("alternative_read") or {}
-    stronger = (debate.get("stronger") or "original").strip().lower()
-    if stronger not in ("original", "alternative", "both"):
-        stronger = "original"
-    new_aj = dict(aj)
-    new_aj["debate"] = {
-        "alternative": {
-            "intent": (alt.get("intent") or "").strip()[:200],
-            "subtext": (alt.get("subtext") or "").strip()[:200],
-            "deep_emotion": alt.get("deep_emotion") or {},
-        },
-        "stronger": stronger,
-        "reconciled": {
-            "subtext": (reconciled.get("subtext") or "").strip()[:300],
-            "deep_emotion": reconciled.get("deep_emotion") or {},
-            "confidence": reconciled.get("confidence"),
-            "why": (reconciled.get("why") or "").strip()[:300],
-        },
-    }
-    # 主流解读被对抗推翻时，置信只降不升（保守）
-    if stronger == "alternative":
-        rc, cur = reconciled.get("confidence"), new_aj.get("confidence")
-        if isinstance(rc, (int, float)):
-            new_aj["confidence"] = round(min(cur, rc) if isinstance(cur, (int, float)) else rc, 2)
-    persp.analysis_json = new_aj
-    db.commit()
-    return new_aj["debate"]
+def _emotion_label_from(emotions: dict) -> str:
+    """把 4 段情绪 dict 拼成 '试图激发:X(n)｜表层:Y(m)｜深层:Z(k)｜压抑:W(j)'（与原始 emotion_label 同格式）。"""
+    if not isinstance(emotions, dict):
+        return ""
+    parts = []
+    for key, cn in _EMO_CN:
+        item = emotions.get(key) or {}
+        if isinstance(item, dict) and (item.get("label") or "").strip():
+            parts.append(f"{cn}:{item.get('label')}({item.get('score', 0)})")
+    return "｜".join(parts)
 
 
-def _finalize_message(db: Session, message: Message) -> int:
-    """三层收敛：把「原始解读 → critic 纠偏 → debate 调和」收敛成每个视角的一个 final 结论，
-    供前端只显示一个干净答案（推理过程折叠）。final = 调和版 > 复核修订版 > 原始；置信取收敛后的值。"""
-    rows = db.query(MessagePerspective).filter(MessagePerspective.message_id == message.id).all()
-    n = 0
-    for p in rows:
-        aj = dict(p.analysis_json or {})
-        critic = aj.get("critic") or {}
-        debate = aj.get("debate") or {}
-        reconciled = debate.get("reconciled") or {}
-        final_subtext = ((reconciled.get("subtext") or "").strip()
-                         or (critic.get("revised_subtext") or "").strip()
-                         or (p.subtext or "").strip())
-        stronger = debate.get("stronger") or ""
-        aj["final"] = {
-            "subtext": final_subtext[:300],
-            "confidence": aj.get("confidence"),
-            "grounded": aj.get("grounded", True),
-            "verdict": (critic.get("verdict") or "approved"),
-            # 仅当对抗认为"另一种"势均力敌或更强时，才把它作为提醒挂出来
-            "alternative": (((debate.get("alternative") or {}).get("subtext") or "").strip()[:200]
-                            if stronger in ("both", "alternative") else ""),
-            "stronger": stronger,
-        }
-        p.analysis_json = aj
-        n += 1
-    if n:
-        db.commit()
-    return n
-
-
-_bg_critic_tasks: set = set()
-
-
-def _spawn_post_analysis(message_id: int):
-    """发消息后异步精修：不拖慢发送（opus 分析本就慢），用独立 session 顺序跑「复核→对抗」，前端下次加载即见。
-    复核与对抗都改 analysis_json，必须同一 session 顺序执行，避免并发写互相覆盖。"""
-    async def _run():
-        db2 = SessionLocal()
-        try:
-            m = db2.get(Message, message_id)
-            if m:
-                await _auto_critic_message(db2, m)      # 1. 纠偏
-                await _auto_debate_message(db2, m)       # 2. 基于纠偏后的解读做调和
-                _finalize_message(db2, m)                # 3. 收敛成一个 final 结论
-                await _maybe_auto_diagnose(db2, m)       # 4. 深度诊断（独立）
-        except Exception as exc:
-            logger.warning("后台精修失败 msg=%s error=%s", message_id, exc)
-        finally:
-            db2.close()
-    task = asyncio.create_task(_run())
-    _bg_critic_tasks.add(task)
-    task.add_done_callback(_bg_critic_tasks.discard)
+def _tags_list(tags: dict) -> list:
+    if not isinstance(tags, dict):
+        return []
+    out = []
+    for key, cn in [("primary", "主"), ("secondary", "次"), ("relation", "关系")]:
+        v = (tags.get(key) or "").strip()
+        if v:
+            out.append(f"{cn}:{v}")
+    return out
 
 
 @router.post("/messages/{message_id}/critique-analysis")
@@ -2730,6 +2316,14 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
         parsed, _strat = _msg_emotion_strategy(db, user_message)
         if not (parsed.get("deep") or parsed.get("intended")):
             continue  # 没有分析（视角未生成）则跳过
+        # 停 AI 模拟后不再有 assistant 分析消息：归档用的潜台词/情绪/策略取自该发言的观察视角
+        _persps = db.query(MessagePerspective).filter(MessagePerspective.message_id == user_message.id).all()
+        _spk = (user_message.character_name or "").strip()
+        _obs = (next((p for p in _persps if not (p.stance == "speaker" or p.viewer_name == _spk)), None)
+                or (_persps[0] if _persps else None))
+        arch_subtext = ((_obs.subtext if _obs else "") or "").strip()
+        arch_emotion = ((_obs.emotion_label if _obs else "") or "").strip()
+        arch_long_term = (_strat.get("long_term", "") if isinstance(_strat, dict) else "")
         listeners = [name for name in role_names if name != user_message.character_name]
         if user_message.receiver_name and user_message.receiver_name in role_map:
             listeners = [user_message.receiver_name, *[name for name in listeners if name != user_message.receiver_name]]
@@ -2784,7 +2378,7 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
             supports_type="relationship",
             supports_id=relationship.id,
             quote=user_message.content,
-            interpretation=analysis.subtext or analysis.emotion_label or "归档对话中的关系变化证据",
+            interpretation=arch_subtext or arch_emotion or "归档对话中的关系变化证据",
             confidence=0.76,
             metadata={
                 "target_character_id": target_char.id,
@@ -2802,7 +2396,7 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
             evidence_ids=[relationship_evidence.id],
         )
 
-        long_term = _strategy_struct_for(analysis).get("long_term", "")
+        long_term = arch_long_term
         if long_term:
             existing_pattern = db.query(CharacterObservation).filter(
                 CharacterObservation.character_id == source_char.id,
@@ -2855,16 +2449,16 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
                 )
                 observations_created += 1
 
-        if analysis.subtext and "矛盾" in analysis.subtext:
+        if arch_subtext and "矛盾" in arch_subtext:
             observation = CharacterObservation(
                 character_id=source_char.id,
                 field="personality_tags",
                 old_value=json.dumps(source_char.personality_tags or [], ensure_ascii=False),
                 new_value=json.dumps(source_char.personality_tags or [], ensure_ascii=False),
-                reason=f"归档时检测到潜在角色冲突：{analysis.subtext}",
+                reason=f"归档时检测到潜在角色冲突：{arch_subtext}",
                 metadata_json={
                     "source": "会话归档",
-                    "evidence": f"归档时检测到潜在角色冲突：{(analysis.subtext or '')[:200]}",
+                    "evidence": f"归档时检测到潜在角色冲突：{arch_subtext[:200]}",
                     "confidence": 0.68,
                     "change_type": "新增",
                     "module": "人格模型",
@@ -2886,7 +2480,7 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
                 supports_type="personality_tags",
                 supports_id=observation.id,
                 quote=user_message.content,
-                interpretation=analysis.subtext,
+                interpretation=arch_subtext,
                 confidence=0.68,
                 metadata={"reason": "归档检测到潜在角色冲突"},
             )
@@ -2894,7 +2488,7 @@ async def archive_conversation(conv_id: int, payload: dict, db: Session = Depend
                 db,
                 character_id=source_char.id,
                 memory_type="diagnosis",
-                content=analysis.subtext,
+                content=arch_subtext,
                 confidence=0.68,
                 source="会话归档",
                 evidence_ids=[conflict_evidence.id],

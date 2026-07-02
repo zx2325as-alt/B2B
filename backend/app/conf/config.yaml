@@ -1,11 +1,11 @@
 ai:
-  default_provider: "deepseek"
+  default_provider: "n1n"
   # 主供应商连接/超时/限流/5xx 失败时，自动切到此 provider 重试一次（用其同级模型）。留空则不兜底。
-  fallback_provider: "deepseek"
+  fallback_provider: "n1n"
   task_providers:
     # ── 高价值深度任务 → n1n（claude-opus-4-8，心理/博弈推理）──
     multi_perspective_analysis: "n1n"      # 核心：每条消息的多视角分析 + 应对建议
-    perspective_critic_revise: "n1n"       # 在分析之上的 critic 复核
+    perspective_critic_revise: "n1n"       # 按需「核验」按钮用（核心读已单次出终版，不再有自动复核/对抗/综合）
     chat_analysis: "n1n"
     relationship_deep_analysis: "n1n"
     structured_diagnosis: "n1n"            # 深度诊断
@@ -25,13 +25,13 @@ ai:
     import_narrative_parse: "n1n"
     quick_profile_infer: "n1n"             # 冷启动临时画像（用 sonnet，见 task_models）
     # ── 高频/格式化 → deepseek（便宜够用，不影响体验）──
-    chat_surface_reply: "deepseek"
-    import_profile_document_parse: "deepseek"
-    import_commit_review: "deepseek"
-    interaction_analysis_rebuild: "deepseek"
-    interaction_batch_analysis: "deepseek"
-    emotion_curve: "deepseek"
-    context_summary: "deepseek"
+    chat_surface_reply: "n1n"
+    import_profile_document_parse: "n1n"
+    import_commit_review: "n1n"
+    interaction_analysis_rebuild: "n1n"
+    interaction_batch_analysis: "n1n"
+    emotion_curve: "n1n"
+    context_summary: "n1n"
   task_models:
     # 这些任务 latency 敏感（粘贴解析、冷启动画像内联在分析前），压回 sonnet 兼顾质量与速度
     import_dialogue_parse: "deepseek-chat"
@@ -41,8 +41,8 @@ ai:
     interaction_analysis_rebuild: "deepseek-chat"
   task_max_tokens:
     chat_analysis: 2048
-    multi_perspective_analysis: 6144     # 不计成本：给 opus 更大输出，分析更充分
-    perspective_critic_revise: 4096      # 自动复核留足空间
+    multi_perspective_analysis: 6144     # 核心读：一次推理直接出终版（含自检+反面+整合），给足输出
+    perspective_critic_revise: 4096      # 按需「核验」用
     import_dialogue_parse: 8192
     import_narrative_parse: 8192
     import_profile_document_parse: 8192
@@ -96,14 +96,14 @@ ai:
     context_summary: 90
 
   providers:
-    openai:
-      base_url: "https://api.openai.com/v1"
-      # 密钥放 config.local.yaml（不入库），此处仅占位
-      api_key: ""
-      models:
-        simple: "gpt-4o-mini"
-        medium: "gpt-4o"
-        complex: "gpt-4o"
+    # openai:
+    #   base_url: "https://api.openai.com/v1"
+    #   # 密钥放 config.local.yaml（不入库），此处仅占位
+    #   api_key: ""
+    #   models:
+    #     simple: "gpt-4o-mini"
+    #     medium: "gpt-4o"
+    #     complex: "gpt-4o"
 
     deepseek:
       base_url: "https://api.deepseek.com/v1"
@@ -117,12 +117,12 @@ ai:
     # n1n.ai 聚合网关：OpenAI 兼容，一个 key 通所有模型；密钥在 config.local.yaml。
     # 分级：复杂深度任务用 claude-opus-4-8（心理/博弈推理最优），中等用 sonnet，简单用 deepseek。
     n1n:
-      base_url: "https://hk.n1n.ai/v1"
+      base_url: "https://api.kunkunout.cn/v1"
       # 密钥放 config.local.yaml（不入库），此处仅占位
       api_key: ""
       models:
         # 不计成本·质量拉满：复杂/中等档 opus，简单档 sonnet；latency 敏感任务用 task_models 压回 sonnet
-        simple: "claude-sonnet-4-6"
+        simple: "claude-opus-4-8"
         medium: "claude-opus-4-8"
         complex: "claude-opus-4-8"
 

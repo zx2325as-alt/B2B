@@ -156,9 +156,10 @@
                     <div class="duo">
                       <div class="duo-col insight">
                         <div class="duo-head">洞察 · {{ msg.character_name }} 怎么想</div>
-                        <div v-if="cpIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpIntent(msg) }}</span></div>
-                        <div v-if="cpEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpEmotion(msg) }}</span></div>
-                        <!-- 收敛后的单一结论：潜台词以 final 为准（复核纠偏 + 对抗调和后的版本） -->
+                        <!-- 一段最终思考（综合 分析+复核+对抗 后的整合判断），其余为支撑结构 -->
+                        <div v-if="cpFinalMonologue(msg)" class="analysis-row final-think"><span class="a-label">最终思考</span><span class="a-value">{{ cpFinalMonologue(msg) }}</span></div>
+                        <div v-if="cpFinalIntent(msg)" class="analysis-row"><span class="a-label">真实意图</span><span class="a-value">{{ cpFinalIntent(msg) }}</span></div>
+                        <div v-if="cpFinalEmotion(msg)" class="analysis-row"><span class="a-label">情绪</span><span class="a-value">{{ cpFinalEmotion(msg) }}</span></div>
                         <div v-if="cpFinalSubtext(msg)" class="analysis-row"><span class="a-label">潜台词/动机</span><span class="a-value">{{ cpFinalSubtext(msg) }}</span></div>
                         <div v-if="cpEvidence(msg)" class="duo-evidence">依据：“{{ cpEvidence(msg) }}”</div>
                         <div v-else class="duo-evidence" style="color:var(--text-muted)">⚠ 无明确原文依据 · 为推测</div>
@@ -166,7 +167,7 @@
                           <span v-if="cpFinalConf(msg) !== null" class="tag" :class="confClass(cpFinalConf(msg))" style="font-size:10px">{{ confLabel(cpFinalConf(msg)) }}</span>
                           <span v-if="cpFinal(msg) && cpFinal(msg).verdict && cpFinal(msg).verdict !== 'approved'" class="tag" :class="criticClass(cpFinal(msg).verdict)" style="font-size:10px">{{ criticLabel(cpFinal(msg).verdict) }}</span>
                         </div>
-                        <div v-if="cpFinal(msg) && cpFinal(msg).alternative" class="duo-evidence" style="border-left-color:var(--violet,#a78bfa)">⚖ 也可能：{{ cpFinal(msg).alternative }}</div>
+                        <div v-if="cpFinalCaveat(msg)" class="duo-evidence" style="border-left-color:var(--violet,#a78bfa)">⚖ 也可能：{{ cpFinalCaveat(msg) }}</div>
                         <!-- 推演过程（复核 + 对抗）默认折叠，要看再展开，避免三块互相打架的观感 -->
                         <button v-if="cpCritic(msg) || cpDebate(msg)" class="reasoning-toggle" @click="toggleReasoning(msg.id)">
                           {{ reasoningOpen(msg.id) ? '▾' : '▸' }} 推演过程（复核·对抗）
@@ -185,11 +186,12 @@
                       </div>
                       <div class="duo-col action">
                         <!-- 我怎么想：我（旁观）对这句话的内心解读 -->
-                        <div v-if="hasSelfRead(msg)" class="self-read">
+                        <div v-if="hasSelfRead(msg) || selfFinalMonologue(msg)" class="self-read">
                           <div class="duo-head" style="color:#a78bfa">我怎么想</div>
-                          <div v-if="selfRead(msg).inner" class="analysis-row"><span class="a-label">第一反应</span><span class="a-value">{{ selfRead(msg).inner }}</span></div>
-                          <div v-if="selfRead(msg).subtext" class="analysis-row"><span class="a-label">我读到</span><span class="a-value">{{ selfRead(msg).subtext }}</span></div>
-                          <div v-if="selfRead(msg).emotion" class="analysis-row"><span class="a-label">我的情绪</span><span class="a-value">{{ selfRead(msg).emotion }}</span></div>
+                          <div v-if="selfFinalMonologue(msg)" class="analysis-row final-think"><span class="a-label">最终想法</span><span class="a-value">{{ selfFinalMonologue(msg) }}</span></div>
+                          <div v-else-if="selfRead(msg) && selfRead(msg).inner" class="analysis-row"><span class="a-label">第一反应</span><span class="a-value">{{ selfRead(msg).inner }}</span></div>
+                          <div v-if="selfFinalSubtext(msg)" class="analysis-row"><span class="a-label">我读到</span><span class="a-value">{{ selfFinalSubtext(msg) }}</span></div>
+                          <div v-if="selfFinalEmotion(msg)" class="analysis-row"><span class="a-label">我的情绪</span><span class="a-value">{{ selfFinalEmotion(msg) }}</span></div>
                         </div>
                         <div class="duo-head">行动 · 我该怎么接</div>
                         <div v-if="selfMoves(msg).length" class="move-list">
@@ -229,18 +231,18 @@
                         ? `${msg.character_name} 说这句话的目的`
                         : `${curUserPersp(msg)?.viewer_name} 看「${msg.character_name}」这句话` }}
                   </div>
-                  <div v-if="userPerspMonologue(msg)" class="analysis-row">
-                    <span class="a-label">内心独白</span>
-                    <span class="a-value">{{ userPerspMonologue(msg) }}</span>
+                  <div v-if="(upFinal(msg) && upFinal(msg).inner_monologue) || userPerspMonologue(msg)" class="analysis-row" :class="{ 'final-think': upFinal(msg) && upFinal(msg).inner_monologue }">
+                    <span class="a-label">{{ upFinal(msg) && upFinal(msg).inner_monologue ? '最终思考' : '内心独白' }}</span>
+                    <span class="a-value">{{ (upFinal(msg) && upFinal(msg).inner_monologue) || userPerspMonologue(msg) }}</span>
                   </div>
-                  <div v-if="curUserPersp(msg)?.emotion_label" class="analysis-row">
-                    <span class="a-label">情绪归因</span><span class="a-value">{{ curUserPersp(msg).emotion_label }}</span>
+                  <div v-if="upFinalEmotion(msg)" class="analysis-row">
+                    <span class="a-label">情绪归因</span><span class="a-value">{{ upFinalEmotion(msg) }}</span>
                   </div>
                   <div v-if="(upFinal(msg) && upFinal(msg).subtext) || curUserPersp(msg)?.subtext" class="analysis-row">
                     <span class="a-label">策略动机</span><span class="a-value">{{ (upFinal(msg) && upFinal(msg).subtext) || curUserPersp(msg).subtext }}</span>
                   </div>
-                  <div v-if="userPerspTags(msg).length" class="analysis-tags">
-                    <span v-for="t in userPerspTags(msg)" :key="`upt-${t}`" class="tag">{{ t }}</span>
+                  <div v-if="upFinalTags(msg).length" class="analysis-tags">
+                    <span v-for="t in upFinalTags(msg)" :key="`upt-${t}`" class="tag">{{ t }}</span>
                   </div>
                   <!-- 建议回答（仅旁观者视角；接收方回复已整体并入此处） -->
                   <div v-if="curUserPersp(msg)?.suggested_reply" class="persp-reply">
@@ -1198,11 +1200,23 @@ function perspDebate(persp) {
 function cpDebate(msg) { return perspDebate(cpPersp(msg)) }
 function debateClass(s) { return ({ original: 'green', alternative: 'red', both: 'amber' })[s] || '' }
 function debateLabel(s) { return ({ original: '已对抗 · 原判成立', alternative: '已对抗 · 改判', both: '已对抗 · 两种皆可能' })[s] || '已对抗' }
-// 三层收敛后的单一结论（final = 调和 > 复核修订 > 原始）
+// 收敛后的"一段最终思考"（final 由总编辑综合 分析+复核+对抗 而成；缺则确定性兜底）
 function cpFinal(msg) { return cpPersp(msg)?.analysis_json?.final || null }
 function cpFinalSubtext(msg) { return cpFinal(msg)?.subtext || cpSubtext(msg) }
+function cpFinalIntent(msg) { return cpFinal(msg)?.intent || cpIntent(msg) }
+function cpFinalMonologue(msg) { return (cpFinal(msg)?.inner_monologue || '').trim() }
+function cpFinalCaveat(msg) { const f = cpFinal(msg); return (f && (f.caveat || f.alternative)) || '' }
 function cpFinalConf(msg) { const f = cpFinal(msg); return (f && typeof f.confidence === 'number') ? f.confidence : cpConfidence(msg) }
 function upFinal(msg) { return curUserPersp(msg)?.analysis_json?.final || null }
+// 「我」视角的最终思考（我怎么想那栏）
+function selfFinal(msg) { return selfPersp(msg)?.analysis_json?.final || null }
+function selfFinalMonologue(msg) { return (selfFinal(msg)?.inner_monologue || '').trim() }
+function selfFinalSubtext(msg) { return selfFinal(msg)?.subtext || (selfRead(msg) && selfRead(msg).subtext) || '' }
+function selfFinalEmotion(msg) { return selfFinal(msg)?.emotion_label || (selfRead(msg) && selfRead(msg).emotion) || '' }
+// A：情绪/标签也以 final 为准（被降级/推测时随最终思考一起回落）
+function cpFinalEmotion(msg) { return cpFinal(msg)?.emotion_label || cpEmotion(msg) }
+function upFinalEmotion(msg) { return upFinal(msg)?.emotion_label || curUserPersp(msg)?.emotion_label || '' }
+function upFinalTags(msg) { const f = upFinal(msg); return (f && f.tags && f.tags.length) ? f.tags : userPerspTags(msg) }
 // 推演过程（复核+对抗）默认折叠，要看再展开
 const reasoningOpenIds = ref(new Set())
 function reasoningOpen(id) { return reasoningOpenIds.value.has(id) }
@@ -2353,6 +2367,9 @@ function scrollToMessage(messageId) {
 
 /* 可信度信任条（通用视角） */
 .trust-strip { display:flex; flex-direction:column; gap:5px; margin-top:7px; padding-top:7px; border-top:1px dashed var(--border); }
+/* 最终思考：整合后的那段,突出显示 */
+.final-think { background:rgba(34,211,238,.06); border-left:2px solid var(--cyan,#22d3ee); border-radius:4px; padding:6px 8px; }
+.final-think .a-value { color:var(--text-primary); line-height:1.65; }
 /* 收敛结论的信任行 + 推演过程折叠按钮 */
 .conclusion-trust { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
 .reasoning-toggle { align-self:flex-start; background:none; border:none; color:var(--text-muted); font-size:11px; cursor:pointer; padding:2px 0; }
